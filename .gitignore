@@ -1,0 +1,15 @@
+# build output
+build/
+.cache/
+build_*.log
+
+# local reference material
+*.mkv
+reference/
+
+# OS noise
+.DS_Store
+
+# runtime/backup droppings
+imgui.ini
+*.blend1
