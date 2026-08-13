@@ -11,6 +11,7 @@ bool uiWantsMouse();
 // Builds the look-dev panel for this frame. Sets wantScreenshot when the
 // user clicks the capture button.
 void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps,
-                float gpuTraceMs, float gpuPostMs, bool& wantScreenshot);
+                float gpuTraceMs, float gpuPostMs, const SplootStats& sploot,
+                bool& wantScreenshot);
 void uiRender(wgpu::RenderPassEncoder& pass);
 void uiShutdown();

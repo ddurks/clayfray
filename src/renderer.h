@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -7,6 +8,7 @@
 #include "brick.h"
 #include "camera.h"
 #include "gpu.h"
+#include "ground.h"
 #include "params.h"
 
 // Frame pipeline: brick edits (if any) -> trace (compute sphere tracer ->
@@ -15,6 +17,10 @@
 // stitched together by a //#include preprocessor (WGSL has none).
 class Renderer {
   public:
+    // Flip the alive sentinel so any MapAsync callback (pick, GPU timestamp)
+    // still queued at teardown bails before touching destroyed buffers.
+    ~Renderer() { *alive_ = false; }
+
     bool init(Gpu& gpu, int width, int height);
     void resize(int width, int height);
     bool reloadShadersIfChanged();
@@ -27,9 +33,12 @@ class Renderer {
     void setPickUV(float u, float v) { pickU_ = u; pickV_ = v; }
     bool pickValid() const { return pickValid_; }
     const float* pickPos() const { return pickPos_; }
-    void queueBrickEdit(const BrickEdit& e) { brick_.queueEdit(e); }
+    // snapshots the pick normal/albedo into the edit so conservation gobs
+    // launch outward from the wound wearing its color
+    void queueBrickEdit(BrickEdit e);
     BrickSystem& brick() { return brick_; }
     void setCharacter(CharacterAsset asset);
+    const SplootStats& sploot() const { return sploot_; }
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -44,8 +53,10 @@ class Renderer {
     void buildBindGroups();
     // 13 look + mouse + 8 marbles x2 + marbleMeta + capsMeta + capsCenter +
     // 16 capsules x2 + boneMeta + 16 pieces x12 (invSkin mat4, forward skin
-    // mat4, aabb lo/hi, rest capsule a/b)
-    static constexpr int kUniformSlots = 258;
+    // mat4, aabb lo/hi, rest capsule a/b) + gobMeta + 12 gobs x2 + groundMeta.
+    // MUST match the Uniforms struct in trace.wgsl AND pick.wgsl — and a
+    // mismatch only bites after a rebuild (shaders hot-load, binaries don't).
+    static constexpr int kUniformSlots = 284;
     void packUniforms(const OrbitCamera& cam, const LookParams& look,
                       const FrameInfo& frame, float out[kUniformSlots][4]) const;
     std::vector<MarbleProp> marbles_;
@@ -60,8 +71,26 @@ class Renderer {
     void encodePick(wgpu::CommandEncoder& enc);
     void pollPick();
 
+    // M4.6 conservation: carved volume -> ledger -> ballistic gobs ->
+    // ground splats / body re-sticks. Visual sim, non-deterministic side.
+    struct Gob {
+        float pos[3], vel[3], disp[3]; // disp = 12 Hz-stepped display pos
+        float radius, vol, grace;      // grace: skip body collision at launch
+        float col[3];
+    };
+    void updateConservation(const LookParams& look, const FrameInfo& frame);
+
     Gpu* gpu_ = nullptr;
     BrickSystem brick_;
+    GroundClay ground_;
+    std::vector<Gob> gobs_;
+    SplootStats sploot_;
+    float lastWound_[3] = {0, 0.5f, 0};
+    float woundDir_[3] = {0, 1, 0};
+    float woundCol_[3] = {0.024f, 0.19f, 0.25f};
+    bool haveWound_ = false;
+    float lastSimTime_ = -1.f, lastPoseTime_ = -1.f;
+    uint32_t gobSeed_ = 0x9e3779b9u;
     int width_ = 0, height_ = 0;
 
     wgpu::Texture hdrTex_, presentTex_;
@@ -78,6 +107,9 @@ class Renderer {
     float pickU_ = 0.5f, pickV_ = 0.5f;
     bool pickValid_ = false;
     float pickPos_[3] = {0, 0, 0};
+    float pickNormal_[3] = {0, 1, 0};
+    float pickAlbedo_[3] = {0.024f, 0.19f, 0.25f};
+    float pickMat_ = 0.f;
 
     long shaderDirStamp_ = 0;
 
@@ -85,4 +117,7 @@ class Renderer {
     wgpu::Buffer queryResolve_, queryRead_;
     bool queryMapPending_ = false;
     float traceMs_ = 0.f, postMs_ = 0.f;
+
+    // Shared with in-flight MapAsync callbacks; false once destroyed.
+    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 };

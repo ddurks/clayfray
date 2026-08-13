@@ -164,6 +164,65 @@ data is touched at pose steps: pose cost is O(bones).
 - [ ] Two fighters + arena in one traced scene at 60 fps, 1080p-class res on the dev Mac
 - Rig craft note: keep rest poses near the resting stance (warp does least where the player stares longest); set Inherit Scale consistently — the glTF exporter drops inherit-scale-off compensation tracks
 
+## Milestone 4.6 — Clay conservation ("sploot") (NEW, shipped)
+
+*Goal: carved clay goes somewhere. Total clay in the scene is conserved.*
+
+Architecture: measure → ledger → gobs → deposit.
+- [x] **Measure**: the edit fill pass accumulates per-voxel |occupancy delta|
+  (1-voxel linear ramp, unique 7³ voxels only; whole-cell swallows counted in
+  classify) into `counters[3]`, fixed-point ×1024. Copied per-op into a
+  grow-on-demand readback pool (CPU can run ~100 frames ahead of the GPU
+  headless; a dropped measurement is leaked clay). ~1–2 frame latency.
+- [x] **Ledger** (renderer, visual-sim side): carves add debt; debt spawns
+  gobs (2–35 ml each, ≤12 in flight); every deposit subtracts. Gob adds onto
+  the body reconcile through their own measurement (smin over/under-fill goes
+  back on the ledger). `--carve-test` balances exactly: carved 2294.4 ml =
+  landed 2294.4 ml.
+- [x] **Gobs**: ballistic CPU sim at frame rate, *display positions quantized
+  to the 12 Hz pose grid* (smooth droplets against stepped poses would break
+  the stop-motion frame). Launch along the pick normal wearing charAlbedo at
+  the wound (pick pass now returns pos+normal+material+albedo). Clay never
+  bounces: capsule hits deflect-and-slide (or stick as a mode-2 add when the
+  body is at rest — same rest-space rule the carve tool lives with), floor
+  contact splats.
+- [x] **Deposit**: `GroundClay` heightfield (512², x,z ∈ ±1.75 m) — clay
+  thickness ON TOP of a bisection-precomputed pebble-surface base (nothing
+  hides in mosaic cracks), per-texel color (carved cyan lands cyan), quartic
+  bump kernels with closed-form integral so deposited volume is exact by
+  construction; radius swells with local pile height (slump, not towers).
+  splat(pos, vol, color) is the contract — M7 chunk settling can swap the
+  backing store for a world brickmap without touching the ledger or gobs.
+- [x] Tracer: heightfield unioned into map/mapLoose/mapPenumbra (piles get
+  AO + shadows), body-style boil/detail normals + mottle, empty-field
+  sentinel short-circuits to zero cost pre-carve. ~8% frame cost with a
+  2.3 L splooted scene at 960×540.
+- [x] Lighting regression fixed (the M2 lesson, relearned): the MARCH gets
+  the conservative (Lipschitz-scaled, arenaFloor-style gated) distance;
+  AO/penumbra get a SMOOTH unscaled variant — feeding them the scaled one
+  reads as phantom occlusion and bands under the penumbra's stepping. And
+  the field's top bound must be the true tallest pile (a per-splat sum hit
+  the 0.5 m cap and became an invisible occluder plane at chest height:
+  scene-wide darkening + black scanlines where rays grazed it).
+- [x] Second lighting fix — whole-footprint tint on first sploot: a 2 mm
+  "skirt below the floor" was meant to hide the empty field, but after the
+  0.3× march scaling + hit-epsilon it still registered, so the instant the
+  first gob landed the ENTIRE floor shaded clay-cyan + darkened. Replaced
+  with a real thickness gate (`groundThicknessAt < G_THMIN` → yield to the
+  arena floor); the cutoff sits at a sub-mm pile lip, invisible. Rule: the
+  ground field must render clay ONLY where clay was deposited, never a
+  floor-wide sheet. Verify by eye: carve-test floor colors at --frames 8
+  (field off) must match --frames 60/300 (field on) everywhere except the
+  piles.
+- [x] Panel: sploot section (conserve toggle + live ledger readout);
+  `CLAYFRAY_DEBUG_LEDGER=1` prints per-op measurements + final balance.
+- [ ] Carving LANDED clay back up (heightfield subtract + pick routing) —
+  pairs with M8's chunk-reattach economy question
+- [ ] Wall-face sticking (V1: wall hits smear down to the floor at its base)
+- Note: `--carve-test` coordinates were retargeted to the imported fighter's
+  aabb — the old set was authored for the taller analytic blob and carved
+  air, which the ledger immediately exposed (measured 0 ml).
+
 ## Milestone 5 — Gameplay core (parallel track — no GPU dependency, start anytime)
 
 *Goal: a playable-if-ugly fighter with capsule debug rendering.*

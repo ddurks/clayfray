@@ -187,8 +187,9 @@ void BrickSystem::debugStats(const char* label) {
         }
     }
     std::printf("[brick %s] alloc=%u freshLeft=%u insideEmpty=%u maxIdx=%u "
-                "allocTop=%u freeTop=%u\n",
-                label, alloc, fresh, inside, maxIdx, d[cells], d[cells + 1]);
+                "allocTop=%u freeTop=%u volFp=%u\n",
+                label, alloc, fresh, inside, maxIdx, d[cells], d[cells + 1],
+                d[cells + 3]);
     rb.Unmap();
 }
 
@@ -586,26 +587,68 @@ void BrickSystem::encodeImport(wgpu::CommandEncoder& enc) {
     pass.End();
 }
 
-void BrickSystem::queueEdit(const BrickEdit& e) {
-    if (e.mode != 0) {
-        // brush influence (radius + band margin) must stay inside the volume:
-        // a blob clipped at the boundary renders as corruption
-        const float m = e.radius + 3.0f * kSpan;
-        for (int i = 0; i < 3; i++) {
-            if (e.pos[i] - m < kOrigin[i] || e.pos[i] + m > kOrigin[i] + kGrid * kSpan) {
-                return;
-            }
+bool BrickSystem::editInBounds(const BrickEdit& e) const {
+    if (e.mode == 0) return true;
+    // brush influence (radius + band margin) must stay inside the volume:
+    // a blob clipped at the boundary renders as corruption
+    const float m = e.radius + 3.0f * kSpan;
+    for (int i = 0; i < 3; i++) {
+        if (e.pos[i] - m < kOrigin[i] || e.pos[i] + m > kOrigin[i] + kGrid * kSpan) {
+            return false;
         }
     }
+    return true;
+}
+
+void BrickSystem::queueEdit(const BrickEdit& e) {
+    if (!editInBounds(e)) return;
     pending_.push_back(e);
+}
+
+void BrickSystem::pollVolumes() {
+    for (VolSlot& s : volSlots_) {
+        if (!s.copied || s.mapping) continue;
+        s.copied = false;
+        s.mapping = true;
+        auto alive = alive_;
+        s.buf.MapAsync(wgpu::MapMode::Read, 0, 4, wgpu::CallbackMode::AllowSpontaneous,
+                       [this, &s, alive](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                           if (!*alive) return; // object gone; &s/this dangle
+                           if (status == wgpu::MapAsyncStatus::Success) {
+                               uint32_t fp =
+                                   *(const uint32_t*)s.buf.GetConstMappedRange(0, 4);
+                               if (std::getenv("CLAYFRAY_DEBUG_LEDGER")) {
+                                   std::printf("[vol] raw fp=%u mode=%d\n", fp,
+                                               s.edit.mode);
+                               }
+                               MeasuredEdit m;
+                               m.edit = s.edit;
+                               // fixed-point voxels (x1024) -> m^3
+                               m.volume = (float)((double)fp / 1024.0 * (double)kVoxel *
+                                                  (double)kVoxel * (double)kVoxel);
+                               measured_.push_back(m);
+                               s.buf.Unmap();
+                           }
+                           s.mapping = false;
+                       });
+    }
+}
+
+bool BrickSystem::takeMeasured(MeasuredEdit& out) {
+    if (measured_.empty()) return false;
+    out = measured_.front();
+    measured_.erase(measured_.begin());
+    return true;
 }
 
 void BrickSystem::finishCapacityPoll() {
     if (!capPollArmed_ || capMapPending_) return;
     capPollArmed_ = false;
     capMapPending_ = true;
+    auto alive = alive_;
     capRead_.MapAsync(wgpu::MapMode::Read, 0, 16, wgpu::CallbackMode::AllowSpontaneous,
-                      [this](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                      [this, alive](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                          if (!*alive) return;
                           if (status == wgpu::MapAsyncStatus::Success) {
                               const uint32_t* c =
                                   (const uint32_t*)capRead_.GetConstMappedRange(0, 16);
@@ -735,9 +778,34 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
     if (!pending_.empty()) {
         BrickEdit e = pending_.front();
         pending_.erase(pending_.begin());
+        enc.ClearBuffer(counters_, 12, 4); // volume delta = 0
         encodeOp(enc, e);
         encodeJfa(enc);
         if (!std::getenv("CLAYFRAY_NO_REDIST")) encodeRedistance(enc);
+        // conservation: park the measured delta in a free pool slot; the
+        // renderer maps it after submit. Pool grows to cover however far the
+        // CPU runs ahead of the GPU — a dropped measurement is leaked clay.
+        {
+            VolSlot* slot = nullptr;
+            for (VolSlot& s : volSlots_) {
+                if (!s.copied && !s.mapping) {
+                    slot = &s;
+                    break;
+                }
+            }
+            if (!slot) {
+                volSlots_.emplace_back();
+                slot = &volSlots_.back();
+                wgpu::BufferDescriptor desc{};
+                desc.label = "edit volume readback";
+                desc.size = 4;
+                desc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+                slot->buf = gpu_->device.CreateBuffer(&desc);
+            }
+            enc.CopyBufferToBuffer(counters_, 12, slot->buf, 0, 4);
+            slot->edit = e;
+            slot->copied = true;
+        }
         if (++editsSinceCap_ >= 60 && !capMapPending_) {
             editsSinceCap_ = 0;
             if (!capRead_) {

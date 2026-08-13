@@ -27,7 +27,8 @@ bool uiWantsMouse() {
 }
 
 void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps,
-                float gpuTraceMs, float gpuPostMs, bool& wantScreenshot) {
+                float gpuTraceMs, float gpuPostMs, const SplootStats& sploot,
+                bool& wantScreenshot) {
     ImGui_ImplWGPU_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -51,6 +52,14 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
     if (ImGui::CollapsingHeader("animation", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("play clip (off = rest pose)", &look.animPlay);
         ImGui::SliderFloat("speed", &look.animSpeed, 0.f, 2.f);
+    }
+
+    if (ImGui::CollapsingHeader("sploot", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("conserve carved clay", &look.conserveClay);
+        ImGui::Text("carved %.0f ml   landed %.0f ml", sploot.carved * 1e6f,
+                    sploot.deposited * 1e6f);
+        ImGui::Text("in flight %d gob(s), %.1f ml   owed %.1f ml", sploot.gobs,
+                    sploot.inFlight * 1e6f, sploot.debt * 1e6f);
     }
 
     if (ImGui::CollapsingHeader("key light", ImGuiTreeNodeFlags_DefaultOpen)) {

@@ -35,18 +35,24 @@ struct Uniforms {
   boneMeta: vec4f,       // x = piece count, y = smin k, z = box margin,
                          // w = posed body bound radius
   pieces: array<Piece, 16>,
+  gobMeta: vec4f,        // x = in-flight gob count (M4.6 conservation)
+  gobs: array<vec4f, 24>, // 12 x {pos, radius}, {color, -}; 12 Hz stepped
+  groundMeta: vec4f,     // w = clay top bound y (0 = field empty)
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var hdrOut: texture_storage_2d<rgba16float, write>;
 
 //#include scene_common.wgsl
 //#include brick_read.wgsl
+//#include ground_read.wgsl
 
 const MAT_FLOOR: f32 = 1.0;
 const MAT_WALL: f32 = 2.0;
 const MAT_BODY: f32 = 3.0;
-const MAT_EYE: f32 = 4.0;
+const MAT_EYE: f32 = 4.0;   // + marble index (4..11)
 const MAT_PUPIL: f32 = 5.0;
+const MAT_GCLAY: f32 = 20.0;
+const MAT_GOB: f32 = 21.0;  // + gob index (21..32)
 
 // ---------- marbles: rigid glass beads, data-driven (never clay) ----------
 fn marblesDist(p: vec3f) -> f32 {
@@ -82,6 +88,20 @@ fn map(p: vec3f) -> vec2f {
       m = MAT_EYE + f32(i);
     }
   }
+  let dg = groundClayDist(p);
+  if (dg < d) {
+    d = dg;
+    m = MAT_GCLAY;
+  }
+  let gn = i32(u.gobMeta.x);
+  for (var i = 0; i < gn; i++) {
+    let gb = u.gobs[i * 2];
+    let gd = length(p - gb.xyz) - gb.w;
+    if (gd < d) {
+      d = gd;
+      m = MAT_GOB + f32(i);
+    }
+  }
   return vec2f(d, m);
 }
 
@@ -108,6 +128,7 @@ fn mapLoose(p: vec3f) -> f32 {
   var d = min(arenaFloor(p), arenaWall(p));
   d = min(d, charDistLoose(p));
   d = min(d, marblesDist(p));
+  d = min(d, groundClaySmooth(p)); // piles shade/occlude like set dressing
   return d;
 }
 
@@ -167,6 +188,7 @@ fn mapPenumbra(p: vec3f) -> f32 {
   var d = min(arenaFloor(p), arenaWall(p));
   d = min(d, max(charProxy(p), charDistLoose(p)));
   d = min(d, marblesDist(p));
+  d = min(d, groundClaySmooth(p));
   return d;
 }
 
@@ -212,6 +234,12 @@ fn albedoFor(p: vec3f, m: f32) -> vec3f {
   } else if (m < 3.5) {
     // per-voxel color from the brickmap (carve reveals, add stamps)
     return charAlbedo(p);
+  } else if (m > MAT_GOB - 0.5) {
+    // in-flight gob: the wound albedo it was torn with
+    let gi = clamp(i32(m - MAT_GOB + 0.5), 0, 11);
+    return u.gobs[gi * 2 + 1].rgb;
+  } else if (m > MAT_GCLAY - 0.5) {
+    return groundAlbedo(p);
   }
   // marble: per-prop color from the uniform (already linear)
   let idx = clamp(i32(m - MAT_EYE + 0.5), 0, 7);
@@ -248,7 +276,7 @@ fn shade(p: vec3f, rd: vec3f, m: f32) -> vec3f {
       vnoise((p + vec3f(0.0, 0.0, e2)) * 9.0 + seed2) - vnoise((p - vec3f(0.0, 0.0, e2)) * 9.0 + seed2)) /
       (2.0 * e2);
     n = normalize(n + u.material.x * (0.016 * g + 0.007 * g2));
-  } else if (m < 3.5) {
+  } else if (m < 3.5 || m > MAT_GCLAY - 0.5) {
     // body: dry-clay grain is sub-millimeter — sub-pixel — so its honest
     // rendering is decorrelated speckle, not a smooth noise gradient (any
     // band-limited gradient reads as fingerprint iso-bands under a key
@@ -295,7 +323,8 @@ fn shade(p: vec3f, rd: vec3f, m: f32) -> vec3f {
 
   col += alb * u.ambient.rgb * ao;
 
-  if (m > 3.5) {
+  if (m > 3.5 && m < MAT_GCLAY - 0.5) {
+    // glass glint: marbles only — landed clay stays matte
     col += u.keyColor.rgb * att * sh * pow(clamp(dot(n, hv), 0.0, 1.0), 60.0) * 0.5;
   }
   return col;

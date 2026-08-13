@@ -45,6 +45,19 @@ struct LookParams {
     // voxel body articulates in M4-P1.)
     bool animPlay = true;
     float animSpeed = 1.0f;
+
+    // M4.6 conservation: carved clay sploots onto the arena instead of
+    // vanishing. Off = the pre-conservation vanish behavior.
+    bool conserveClay = true;
+};
+
+// Conservation ledger readout for the panel (all volumes in m^3).
+struct SplootStats {
+    float carved = 0.f;    // total measured off the body
+    float deposited = 0.f; // total landed (splats + re-sticks)
+    float debt = 0.f;      // measured but not yet spawned as gobs
+    float inFlight = 0.f;  // riding gobs right now
+    int gobs = 0;
 };
 
 // Sculpt-mode UI state (windowed only).
