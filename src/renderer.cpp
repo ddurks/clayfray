@@ -501,8 +501,8 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // These slot indices are hand-mirrored in trace.wgsl AND pick.wgsl —
     // this static_assert catches only the C++ side overrunning the buffer;
     // the WGSL side has no compile-time link, so CLAUDE.md flags the mirror.
-    static_assert(kUniformSlots >= 284,
-                  "gob slots reach out[282], groundMeta out[283]; "
+    static_assert(kUniformSlots >= 287,
+                  "gobs reach out[282], groundMeta out[283], sword out[284-286]; "
                   "keep kUniformSlots and the Uniforms struct in trace.wgsl "
                   "+ pick.wgsl in sync");
     int gn = std::min((int)gobs_.size(), 12);
@@ -519,6 +519,33 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     out[283][1] = GroundClay::kTexel;
     out[283][2] = (float)GroundClay::kN;
     out[283][3] = ground_.maxTopY();
+
+    // M4.7 sword: emissive blade endpoints (radius 0 = inactive). memset above
+    // already zeroed the slots, so the disabled case needs no write.
+    if (look.sword.enabled && !bones_.empty()) {
+        float hilt[3], tip[3], gA[3], gB[3];
+        swordGeometry(look.sword, hilt, tip, gA, gB);
+        out[284][0] = hilt[0]; out[284][1] = hilt[1]; out[284][2] = hilt[2];
+        out[284][3] = look.sword.radius;
+        out[285][0] = tip[0]; out[285][1] = tip[1]; out[285][2] = tip[2];
+        out[286][0] = look.sword.color[0];
+        out[286][1] = look.sword.color[1];
+        out[286][2] = look.sword.color[2];
+    }
+}
+
+void Renderer::swordGeometry(const SwordParams& s, float hilt[3], float tip[3],
+                             float gripA[3], float gripB[3]) const {
+    // blade direction: +Z forward, pitched up toward +Y, then yawed about Y
+    float cp = std::cos(s.pitch), sp = std::sin(s.pitch);
+    float cy = std::cos(s.yaw), sy = std::sin(s.yaw);
+    float dir[3] = {cp * sy, sp, cp * cy};
+    for (int i = 0; i < 3; i++) {
+        hilt[i] = s.pos[i];
+        tip[i] = s.pos[i] + dir[i] * s.length;
+        gripA[i] = s.pos[i] + dir[i] * s.grip0; // near hilt (one hand)
+        gripB[i] = s.pos[i] + dir[i] * s.grip1; // stacked (other hand)
+    }
 }
 
 void Renderer::setCharacter(CharacterAsset asset) {
@@ -527,8 +554,44 @@ void Renderer::setCharacter(CharacterAsset asset) {
     clips_ = asset.clips;
     capsules_ = deriveCapsules(asset);
     evalPose(bones_, nullptr, 0.f, skinMats_); // identity: rest pose
-    std::printf("anim: %zu bones, %zu clip(s), %zu shadow capsules\n", bones_.size(),
-                clips_.size(), capsules_.size());
+
+    // M4.7: build the arm IK chains from bone names. Rig convention (see the
+    // .glb): humerus.<side> -> radius.<side> -> hand.<side> -> fingertips,
+    // with thumb.<side> also under radius. Subtrees carry the hand/fingers.
+    armIk_.clear();
+    const size_t nb = bones_.size();
+    std::vector<std::vector<int>> kids(nb);
+    for (size_t i = 0; i < nb; i++)
+        if (bones_[i].parent >= 0 && (size_t)bones_[i].parent < nb)
+            kids[bones_[i].parent].push_back((int)i);
+    auto findBone = [&](const std::string& nm) {
+        for (size_t i = 0; i < nb; i++)
+            if (bones_[i].name == nm) return (int)i;
+        return -1;
+    };
+    auto subtree = [&](int root, std::vector<int>& outv) {
+        std::vector<int> st{root};
+        while (!st.empty()) {
+            int b = st.back();
+            st.pop_back();
+            outv.push_back(b);
+            for (int c : kids[b]) st.push_back(c);
+        }
+    };
+    for (const char* side : {"l", "r"}) {
+        int sh = findBone(std::string("humerus.") + side);
+        int el = findBone(std::string("radius.") + side);
+        int wr = findBone(std::string("hand.") + side);
+        if (sh < 0 || el < 0 || wr < 0) continue;
+        ArmIkChain c;
+        c.shoulder = sh; c.elbow = el; c.wrist = wr;
+        subtree(sh, c.upperSubtree);
+        subtree(el, c.lowerSubtree);
+        c.pole[0] = 0.f; c.pole[1] = -0.5f; c.pole[2] = -1.f; // elbows bend down/back
+        armIk_.push_back(c);
+    }
+    std::printf("anim: %zu bones, %zu clip(s), %zu shadow capsules, %zu IK arm(s)\n",
+                bones_.size(), clips_.size(), capsules_.size(), armIk_.size());
     brick_.requestImport(std::move(asset));
 }
 
@@ -754,6 +817,20 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             animT_ = std::fmod(frame.poseTime * look.animSpeed, clip->duration);
         }
         evalPose(bones_, clip, animT_, skinMats_);
+
+        // M4.7: sword is master, arms follow. IK overrides the FK arm pose so
+        // each hand reaches its grip on the (debug-driven) sword; torso/head
+        // stay on the clip. Marbles/capsules below read the IK'd skinMats_.
+        if (look.sword.enabled && !armIk_.empty()) {
+            float hilt[3], tip[3], gA[3], gB[3];
+            swordGeometry(look.sword, hilt, tip, gA, gB);
+            for (ArmIkChain& c : armIk_) {
+                const std::string& nm = bones_[c.shoulder].name;
+                bool right = nm.size() >= 2 && nm.compare(nm.size() - 2, 2, ".r") == 0;
+                std::memcpy(c.target, right ? gA : gB, sizeof(c.target));
+            }
+            applyArmIk(bones_, armIk_, skinMats_);
+        }
     }
 
     // conservation runs before packing so this frame's uniforms carry fresh

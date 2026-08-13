@@ -53,10 +53,11 @@ class Renderer {
     void buildBindGroups();
     // 13 look + mouse + 8 marbles x2 + marbleMeta + capsMeta + capsCenter +
     // 16 capsules x2 + boneMeta + 16 pieces x12 (invSkin mat4, forward skin
-    // mat4, aabb lo/hi, rest capsule a/b) + gobMeta + 12 gobs x2 + groundMeta.
+    // mat4, aabb lo/hi, rest capsule a/b) + gobMeta + 12 gobs x2 + groundMeta
+    // + swordA/swordB/swordCol.
     // MUST match the Uniforms struct in trace.wgsl AND pick.wgsl — and a
     // mismatch only bites after a rebuild (shaders hot-load, binaries don't).
-    static constexpr int kUniformSlots = 284;
+    static constexpr int kUniformSlots = 288;
     void packUniforms(const OrbitCamera& cam, const LookParams& look,
                       const FrameInfo& frame, float out[kUniformSlots][4]) const;
     std::vector<MarbleProp> marbles_;
@@ -68,6 +69,11 @@ class Renderer {
     std::vector<BoneCapsule> capsules_;
     std::vector<float> skinMats_;
     float animT_ = 0.f;
+    // M4.7: arm IK chains (built at setCharacter from bone names), and the
+    // computed sword geometry for a frame (hilt/tip/two grips, world).
+    std::vector<ArmIkChain> armIk_;
+    void swordGeometry(const SwordParams& s, float hilt[3], float tip[3],
+                       float gripA[3], float gripB[3]) const;
     void encodePick(wgpu::CommandEncoder& enc);
     void pollPick();
 

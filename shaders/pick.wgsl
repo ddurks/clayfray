@@ -38,6 +38,9 @@ struct Uniforms {
   gobMeta: vec4f,
   gobs: array<vec4f, 24>,
   groundMeta: vec4f,
+  swordA: vec4f,
+  swordB: vec4f,
+  swordCol: vec4f,
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read_write> pickOut: array<vec4f>;

@@ -213,6 +213,169 @@ void evalPose(const std::vector<AssetBone>& bones, const AnimClip* clip, float t
     }
 }
 
+namespace {
+
+void v3sub(const float* a, const float* b, float* o) {
+    o[0] = a[0] - b[0]; o[1] = a[1] - b[1]; o[2] = a[2] - b[2];
+}
+float v3dot(const float* a, const float* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+void v3cross(const float* a, const float* b, float* o) {
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+float v3len(const float* a) { return std::sqrt(v3dot(a, a)); }
+void v3norm(float* a) {
+    float l = v3len(a);
+    if (l > 1e-9f) { a[0] /= l; a[1] /= l; a[2] /= l; }
+}
+
+// Rotation (column-major 3x3 in a padded [9]) taking unit-ish `from` to `to`.
+void rotationBetween(const float* fromIn, const float* toIn, float* R) {
+    float from[3] = {fromIn[0], fromIn[1], fromIn[2]};
+    float to[3] = {toIn[0], toIn[1], toIn[2]};
+    v3norm(from); v3norm(to);
+    float axis[3];
+    v3cross(from, to, axis);
+    float s = v3len(axis);
+    float c = v3dot(from, to);
+    if (s < 1e-6f) {
+        // parallel (c~1: identity) or antiparallel (c~-1: 180° about any perp)
+        if (c > 0.f) {
+            R[0] = 1; R[1] = 0; R[2] = 0;
+            R[3] = 0; R[4] = 1; R[5] = 0;
+            R[6] = 0; R[7] = 0; R[8] = 1;
+            return;
+        }
+        float t[3] = {1, 0, 0};
+        if (std::fabs(from[0]) > 0.9f) { t[0] = 0; t[1] = 1; }
+        v3cross(from, t, axis);
+        v3norm(axis);
+        s = 0.f; c = -1.f;
+    } else {
+        axis[0] /= s; axis[1] /= s; axis[2] /= s;
+    }
+    float angle = std::atan2(s, c);
+    float x = axis[0], y = axis[1], z = axis[2];
+    float ca = std::cos(angle), sa = std::sin(angle), t = 1.f - ca;
+    // column-major: R[col*3 + row]
+    R[0] = t * x * x + ca;     R[1] = t * x * y + sa * z; R[2] = t * x * z - sa * y;
+    R[3] = t * x * y - sa * z; R[4] = t * y * y + ca;     R[5] = t * y * z + sa * x;
+    R[6] = t * x * z + sa * y; R[7] = t * y * z - sa * x; R[8] = t * z * z + ca;
+}
+
+// 4x4 (column-major) applying R about `pivot`: x -> pivot + R*(x - pivot).
+void rotAboutPivot(const float* R, const float* pivot, float* m) {
+    for (int col = 0; col < 3; col++) {
+        for (int row = 0; row < 3; row++) m[col * 4 + row] = R[col * 3 + row];
+        m[col * 4 + 3] = 0.f;
+    }
+    // translation = pivot - R*pivot
+    float rp[3];
+    for (int row = 0; row < 3; row++)
+        rp[row] = R[row] * pivot[0] + R[3 + row] * pivot[1] + R[6 + row] * pivot[2];
+    m[12] = pivot[0] - rp[0];
+    m[13] = pivot[1] - rp[1];
+    m[14] = pivot[2] - rp[2];
+    m[15] = 1.f;
+}
+
+} // namespace
+
+void applyArmIk(const std::vector<AssetBone>& bones,
+                const std::vector<ArmIkChain>& chains, std::vector<float>& skinMats) {
+    const size_t n = bones.size();
+    if (skinMats.size() < n * 16 || chains.empty()) return;
+
+    // reconstruct world[j] = skinMats[j] * bind[j], bind = inv(invBind)
+    std::vector<float> world(n * 16);
+    for (size_t j = 0; j < n; j++) {
+        float bind[16];
+        matInvAffine(bones[j].invBind, bind);
+        matMul(&skinMats[j * 16], bind, &world[j * 16]);
+    }
+
+    std::vector<uint8_t> dirty(n, 0);
+    for (const ArmIkChain& ch : chains) {
+        if (ch.shoulder < 0 || ch.elbow < 0 || ch.wrist < 0) continue;
+        const float* S = &world[ch.shoulder * 16 + 12];
+        const float* E = &world[ch.elbow * 16 + 12];
+        const float* W = &world[ch.wrist * 16 + 12];
+        float SE[3], EW[3];
+        v3sub(E, S, SE);
+        v3sub(W, E, EW);
+        float L1 = v3len(SE), L2 = v3len(EW);
+        if (L1 < 1e-5f || L2 < 1e-5f) continue;
+
+        // target, clamped to the reachable annulus (arc-clamped-to-reach)
+        float toT[3];
+        v3sub(ch.target, S, toT);
+        float d = v3len(toT);
+        float dir[3] = {0, -1, 0};
+        if (d > 1e-6f) { dir[0] = toT[0] / d; dir[1] = toT[1] / d; dir[2] = toT[2] / d; }
+        float dmax = L1 + L2 - 0.005f, dmin = std::fabs(L1 - L2) + 0.005f;
+        float dc = std::min(std::max(d, dmin), dmax);
+
+        // elbow-bend plane: keep the FK pose's bend direction (perp component
+        // of the shoulder->elbow vector), fall back to the hint if straight
+        float along = v3dot(SE, dir);
+        float pole[3] = {SE[0] - dir[0] * along, SE[1] - dir[1] * along,
+                         SE[2] - dir[2] * along};
+        if (v3len(pole) < 1e-5f) {
+            float pa = v3dot(ch.pole, dir);
+            pole[0] = ch.pole[0] - dir[0] * pa;
+            pole[1] = ch.pole[1] - dir[1] * pa;
+            pole[2] = ch.pole[2] - dir[2] * pa;
+        }
+        v3norm(pole);
+
+        // law of cosines: elbow E' = S + dir*a + pole*h
+        float a = (L1 * L1 - L2 * L2 + dc * dc) / (2.f * dc);
+        float h = std::sqrt(std::max(L1 * L1 - a * a, 0.f));
+        float Ep[3] = {S[0] + dir[0] * a + pole[0] * h, S[1] + dir[1] * a + pole[1] * h,
+                       S[2] + dir[2] * a + pole[2] * h};
+        float Wp[3] = {S[0] + dir[0] * dc, S[1] + dir[1] * dc, S[2] + dir[2] * dc};
+
+        // q1: swing the whole arm so shoulder->elbow points at E'
+        float newSE[3];
+        v3sub(Ep, S, newSE);
+        float R1[9];
+        rotationBetween(SE, newSE, R1);
+        float M1[16];
+        rotAboutPivot(R1, S, M1);
+        // propagate the wrist through M1, then q2 about E' aims forearm at W'
+        float Wprop[3];
+        matTransformPoint(M1, W, Wprop);
+        float fwFrom[3], fwTo[3];
+        v3sub(Wprop, Ep, fwFrom);
+        v3sub(Wp, Ep, fwTo);
+        float R2[9];
+        rotationBetween(fwFrom, fwTo, R2);
+        float M2[16];
+        rotAboutPivot(R2, Ep, M2);
+
+        // upper subtree rotates about S; lower (a subset) additionally about E'
+        for (int b : ch.upperSubtree) {
+            float tmp[16];
+            matMul(M1, &world[b * 16], tmp);
+            std::memcpy(&world[b * 16], tmp, sizeof(tmp));
+            dirty[b] = 1;
+        }
+        for (int b : ch.lowerSubtree) {
+            float tmp[16];
+            matMul(M2, &world[b * 16], tmp);
+            std::memcpy(&world[b * 16], tmp, sizeof(tmp));
+            dirty[b] = 1;
+        }
+    }
+
+    for (size_t j = 0; j < n; j++) {
+        if (dirty[j]) matMul(&world[j * 16], bones[j].invBind, &skinMats[j * 16]);
+    }
+}
+
 std::vector<BoneCapsule> deriveCapsules(const CharacterAsset& asset) {
     std::vector<BoneCapsule> out;
     const size_t n = asset.bones.size();

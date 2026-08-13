@@ -38,6 +38,9 @@ struct Uniforms {
   gobMeta: vec4f,        // x = in-flight gob count (M4.6 conservation)
   gobs: array<vec4f, 24>, // 12 x {pos, radius}, {color, -}; 12 Hz stepped
   groundMeta: vec4f,     // w = clay top bound y (0 = field empty)
+  swordA: vec4f,         // M4.7: hilt xyz, w = blade radius (0 = no sword)
+  swordB: vec4f,         // tip xyz
+  swordCol: vec4f,       // emissive rgb
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var hdrOut: texture_storage_2d<rgba16float, write>;
@@ -53,6 +56,7 @@ const MAT_EYE: f32 = 4.0;   // + marble index (4..11)
 const MAT_PUPIL: f32 = 5.0;
 const MAT_GCLAY: f32 = 20.0;
 const MAT_GOB: f32 = 21.0;  // + gob index (21..32)
+const MAT_SWORD: f32 = 50.0; // M4.7: rigid emissive blade, never clay
 
 // ---------- marbles: rigid glass beads, data-driven (never clay) ----------
 fn marblesDist(p: vec3f) -> f32 {
@@ -100,6 +104,13 @@ fn map(p: vec3f) -> vec2f {
     if (gd < d) {
       d = gd;
       m = MAT_GOB + f32(i);
+    }
+  }
+  if (u.swordA.w > 0.0) {
+    let sd = sdCapsule(p, u.swordA.xyz, u.swordB.xyz, u.swordA.w);
+    if (sd < d) {
+      d = sd;
+      m = MAT_SWORD;
     }
   }
   return vec2f(d, m);
@@ -252,6 +263,13 @@ fn boilSeed() -> vec3f {
 }
 
 fn shade(p: vec3f, rd: vec3f, m: f32) -> vec3f {
+  if (m > MAT_SWORD - 0.5) {
+    // rigid emissive blade: unlit and bright, the bloom pass does the glow.
+    // a soft core-to-edge falloff keeps the debug line from banding.
+    let core = clamp(1.0 - sdCapsule(p, u.swordA.xyz, u.swordB.xyz, 0.0) /
+                             max(u.swordA.w, 1e-4), 0.0, 1.0);
+    return u.swordCol.rgb * (2.2 + 2.5 * core);
+  }
   // nGeo: macro shape, drives AO + shadow ray offset. n: micro detail on
   // top, drives lighting only — occluding along fake dimple normals stamps
   // dark pits over every textured surface.

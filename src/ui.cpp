@@ -54,6 +54,17 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
         ImGui::SliderFloat("speed", &look.animSpeed, 0.f, 2.f);
     }
 
+    if (ImGui::CollapsingHeader("sword / IK (M4.7)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        SwordParams& s = look.sword;
+        ImGui::Checkbox("hold sword (arms follow via IK)", &s.enabled);
+        ImGui::DragFloat3("hilt pos", s.pos, 0.005f, -1.f, 1.5f);
+        ImGui::SliderFloat("yaw", &s.yaw, -3.14f, 3.14f);
+        ImGui::SliderFloat("pitch", &s.pitch, -1.57f, 1.57f);
+        ImGui::SliderFloat("length", &s.length, 0.2f, 1.4f);
+        ImGui::SliderFloat("blade radius", &s.radius, 0.005f, 0.05f);
+        ImGui::ColorEdit3("blade glow", s.color);
+    }
+
     if (ImGui::CollapsingHeader("sploot", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("conserve carved clay", &look.conserveClay);
         ImGui::Text("carved %.0f ml   landed %.0f ml", sploot.carved * 1e6f,

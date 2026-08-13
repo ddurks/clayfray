@@ -1,5 +1,20 @@
 #pragma once
 
+// M4.7 sword prop + arm IK. Debug: the hilt transform is driven by these
+// panel controls so dragging it demonstrates the hands following via IK.
+// Later the swing/hold pose drives the transform instead.
+struct SwordParams {
+    bool enabled = true;             // hold the sword + run arm IK
+    float pos[3] = {0.f, 0.30f, 0.38f}; // hilt, world (in front of the chest)
+    float yaw = 0.f;                 // radians about world Y
+    float pitch = 0.7f;              // radians: +tilts blade up-forward from +Z
+    float length = 0.85f;            // hilt -> tip, meters
+    float radius = 0.018f;           // blade thickness
+    float grip0 = 0.03f;             // near-hilt grip (one hand), m along blade
+    float grip1 = 0.14f;             // stacked grip (other hand), m along blade
+    float color[3] = {0.35f, 0.85f, 1.0f}; // debug lightsaber cyan (emissive)
+};
+
 // Look-dev parameters, exposed in the ImGui panel and packed into the
 // uniform buffer by the renderer. Defaults target the Trap Door "day
 // dungeon" rig: warm amber key pooling to black, faint cool rim.
@@ -49,6 +64,9 @@ struct LookParams {
     // M4.6 conservation: carved clay sploots onto the arena instead of
     // vanishing. Off = the pre-conservation vanish behavior.
     bool conserveClay = true;
+
+    // M4.7 sword prop + arm IK (debug-controlled hilt transform).
+    SwordParams sword;
 };
 
 // Conservation ledger readout for the panel (all volumes in m^3).

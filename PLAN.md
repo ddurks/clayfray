@@ -248,27 +248,35 @@ renders the SDF around them; here the SWORD is master (driven by the swing or
 a hold pose) and the arms follow to grip it. IK is just another pose source
 writing into the same `skinMats_` the chunk articulation already reads.
 
-- [ ] 2-bone analytic IK per arm (shoulder→elbow→wrist): law-of-cosines elbow
-  angle + aim-at-target, pole/hint vector for elbow direction. Outputs local
-  bone rotations into `skinMats_`; the existing M4 LBS chunks render the posed
-  arms with no new SDF path
-- [ ] Grip-target data model: each hand holds an optional {prop, local grip
-  point, hand orientation}; a prop carries 1 OR 2 grips. Two-handed sword =
-  one prop / two grips; dual-wield later = two props / one grip each — the IK
-  code is identical either way (flexibility the user asked to preserve)
-- [ ] Sword as a rigid emissive prop (reuse the marble precedent: rigid,
-  non-clay, no carve/boil/detail). Debug form = a glowing "lightsaber" line/
-  capsule SDF hilt→tip, added to the tracer like a marble. Model swap later
-- [ ] Reachable envelope: clamp the sword transform so both grips stay within
-  arm reach → IK always solves, every pose reads as a real hold/swing. Torso
-  lean for out-of-reach deferred
-- [ ] IK layered over FK: arms driven by IK to the grips, torso/legs/head by
-  clips or the M5 state machine; blend so a slice can hand arm control to IK
-  for the swing and back
-- [ ] Debug harness: drag the sword transform in the panel, confirm both hands
-  stay glued and arms read naturally; |∇d| heatmap stays green (posed SDF
-  valid); wrist twist must not exceed the forearm chunk's warp range (M3.5
-  thin-limb caveat)
+Rig reality (from the .glb, NOT the stale build script): a real 3-joint arm
+chain per side — `humerus.<s>` → `radius.<s>` → `hand.<s>` → `fingertips`,
+thumb also under radius. So true 2-bone IK (shoulder=humerus, elbow=radius,
+wrist=hand) works; `applyArmIk` rotates the two subtrees so the hand reaches.
+
+- [x] 2-bone analytic IK per arm (anim.cpp `applyArmIk`): reconstruct world
+  from `skinMats_`, law-of-cosines elbow, rigidly rotate the shoulder subtree
+  about S then the elbow subtree about the solved E' (no per-bone locals
+  needed), rewrite affected skin mats. Elbow-bend plane taken from the FK pose
+  (falls back to a down/back hint). Existing M4 LBS renders it — no new SDF
+  path; |∇d| heatmap stays green (`lookdev/ik_grad.png`)
+- [x] Grip-target data model: `ArmIkChain` per arm with subtree lists; the
+  sword carries 2 grips (grip0/grip1 along the blade), hands assigned by
+  `.l`/`.r`. One-prop-two-grips now; per-hand props (dual-wield) drop in
+  without IK changes
+- [x] Sword as a rigid emissive prop (marble precedent): capsule SDF hilt→tip,
+  emissive lightsaber shading (bloom does the glow), `MAT_SWORD`; uniforms
+  swordA/B/Col. Model swap later
+- [x] Reachable envelope: per-hand target clamped to the arm's [|L1−L2|,
+  L1+L2] annulus so IK always solves and the arm reads as a real reach.
+  Sword-transform clamp / torso lean for gross out-of-reach still DEFERRED
+- [x] IK layered over FK: arms driven by IK to the grips, torso/head by the
+  clip — verified holding the guard identically across clip frames
+  (`lookdev/ik_anim.png` at t=2.4 vs rest)
+- [x] Debug harness: "sword / IK" panel drives the hilt transform live;
+  `lookdev/ik_test2.png` two-handed guard. Windowed smoke test clean
+- [ ] DEFERRED refinements: hand ORIENTATION to grip (wrist twist to align the
+  mitt with the handle — position-only for now), sword-transform reach clamp +
+  torso lean, and 12 Hz quantization of the swing (smooth for debug drag now)
 
 ## Milestone 5 — Dueling core (REVISED — was "Gameplay core")
 
