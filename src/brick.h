@@ -1,4 +1,6 @@
 #pragma once
+#include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -13,6 +15,20 @@ struct BrickEdit {
     float pos[3] = {0, 0, 0};
     float radius = 0.05f;
     float color[3] = {0.8f, 0.5f, 0.5f};
+    // Conservation metadata (rides along; the GPU op ignores it). outDir and
+    // srcColor snapshot the pick normal/albedo at queue time so gobs fly
+    // outward from the wound wearing its color.
+    float outDir[3] = {0.f, 1.f, 0.f};
+    float srcColor[3] = {0.024f, 0.19f, 0.25f}; // linear body cyan fallback
+    bool fromGob = false;  // deposit of a landed gob (ledger reconciles)
+    float gobVol = 0.f;    // the landed gob's intended volume, m^3
+};
+
+// One edit op's measured |volume change| (carve: removed, add: created),
+// delivered a frame or two after the op ran.
+struct MeasuredEdit {
+    BrickEdit edit;
+    float volume = 0.f; // m^3
 };
 
 class BrickSystem {
@@ -22,6 +38,10 @@ class BrickSystem {
     static constexpr float kSpan = 0.0191406f;
     static constexpr uint32_t kMaxBricks = 49152;
 
+    // Flip the alive sentinel so any MapAsync callback still queued at
+    // teardown bails before it touches destroyed buffers/members.
+    ~BrickSystem() { *alive_ = false; }
+
     bool init(Gpu& gpu, const std::string& editSrc, const std::string& jfaSrc,
               const std::string& redistSrc, const std::string& voxelizeSrc);
     // Replaces the analytic bake with a voxelized mesh. CPU side (binning,
@@ -30,6 +50,9 @@ class BrickSystem {
     // Drops edits that would cross the volume boundary (a clipped blob
     // renders as corruption).
     void queueEdit(const BrickEdit& e);
+    // Same clip test queueEdit applies, without queueing: lets gob landings
+    // pick "stick" vs "deflect" before committing.
+    bool editInBounds(const BrickEdit& e) const;
     // Rebuild the volume from its source. With an imported character the
     // mesh buffers persist on the GPU, so re-run the import passes; the
     // analytic bake would silently replace the fighter with the blob.
@@ -57,6 +80,11 @@ class BrickSystem {
 
     // Async pool watermark check; call after queue submit.
     void finishCapacityPoll();
+
+    // Conservation: arm MapAsync on completed volume copies (call after
+    // submit, like finishCapacityPoll) and drain finished measurements.
+    void pollVolumes();
+    bool takeMeasured(MeasuredEdit& out);
 
   private:
     void encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e);
@@ -88,4 +116,21 @@ class BrickSystem {
     wgpu::Buffer capRead_;
     int editsSinceCap_ = 0;
     bool capPollArmed_ = false, capMapPending_ = false, capWarned_ = false;
+
+    // Volume readback pool: one op measures per frame, but maps only
+    // complete once the GPU catches up — headless runs queue ~100 frames
+    // ahead, so the pool grows on demand (deque: stable element addresses
+    // for the MapAsync callbacks; slots are reused, never erased).
+    struct VolSlot {
+        wgpu::Buffer buf;
+        BrickEdit edit;
+        bool copied = false;  // encoded a copy this submit, map not yet armed
+        bool mapping = false; // MapAsync in flight
+    };
+    std::deque<VolSlot> volSlots_;
+    std::vector<MeasuredEdit> measured_;
+
+    // Shared with in-flight MapAsync callbacks; false once this object is
+    // gone. Heap-owned, so the flag outlives `this` for any late callback.
+    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 };

@@ -50,6 +50,15 @@ const CSG_SOFT: f32 = 1.5;
 fn softCarve(dOld: f32, ds: f32) -> f32 { return -smin(-dOld, ds, CSG_SOFT); }
 fn softAdd(dOld: f32, ds: f32) -> f32 { return smin(dOld, ds, CSG_SOFT); }
 
+// Conservation ledger: counters[3] accumulates |occupancy delta| of the op
+// in fixed-point voxels (x1024). Occupancy is a 1-voxel linear ramp across
+// the surface — consistent between carve and add, so removed == re-deposited
+// for mirror-image ops. Unique voxels only (v < 7): the overlap plane is the
+// neighbor brick's voxel 0.
+const VOL_FP: f32 = 1024.0;
+const CELL_VOX: u32 = 343u; // 7^3 unique voxels per whole-cell swallow
+fn occ01(d: f32) -> f32 { return clamp(0.5 - d, 0.0, 1.0); }
+
 // ---------- classify: allocate cells the op will cut a surface through ----------
 @compute @workgroup_size(4, 4, 4)
 fn classify(@builtin(global_invocation_id) gid: vec3u) {
@@ -89,6 +98,9 @@ fn classify(@builtin(global_invocation_id) gid: vec3u) {
     inside = true;
     if (!needs) {
       if (ds < -0.87 * SPAN) {
+        if ((e & IND_INSIDE) != 0u) {
+          atomicAdd(&counters[3], CELL_VOX * u32(VOL_FP)); // solid cell -> air
+        }
         bIndirection[ci] = 1u; // cell swallowed whole by the carve -> air
       }
       return;
@@ -100,6 +112,9 @@ fn classify(@builtin(global_invocation_id) gid: vec3u) {
     inside = false;
     if (!needs) {
       if (ds < -0.87 * SPAN && (e & IND_ALLOC) == 0u) {
+        if ((e & IND_INSIDE) == 0u) {
+          atomicAdd(&counters[3], CELL_VOX * u32(VOL_FP)); // air cell -> solid
+        }
         bIndirection[ci] = IND_INSIDE | 1u; // swallowed by the add -> clay
       }
       return;
@@ -129,6 +144,7 @@ fn classify(@builtin(global_invocation_id) gid: vec3u) {
 // ---------- fill: write voxels for every allocated cell in the region ----------
 var<workgroup> wgMin: atomic<i32>;
 var<workgroup> wgMax: atomic<i32>;
+var<workgroup> wgVol: atomic<u32>; // fixed-point |occupancy delta| this brick
 
 @compute @workgroup_size(8, 8, 4)
 fn fill(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: vec3u,
@@ -147,6 +163,7 @@ fn fill(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: ve
   if (li == 0u) {
     atomicStore(&wgMin, 100000);
     atomicStore(&wgMax, -100000);
+    atomicStore(&wgVol, 0u);
   }
   workgroupBarrier();
 
@@ -157,6 +174,7 @@ fn fill(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: ve
   let baseVoxel = vec3f(c) * BRICK_USABLE;
 
   // each thread does voxels (x,y,z) and (x,y,z+4)
+  var volLocal = 0.0; // this thread's |occupancy delta|, unique voxels only
   for (var zi = 0u; zi < 2u; zi++) {
     if (!alive) {
       break;
@@ -231,15 +249,33 @@ fn fill(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: ve
       bDist[brick * 256u + vi / 2u] = pack2x16float(vec2f(dNew, dNew2));
       atomicMin(&wgMin, i32(floor(min(dNew, dNew2) * 100.0)));
       atomicMax(&wgMax, i32(ceil(max(dNew, dNew2) * 100.0)));
+      // ledger: both pair voxels measured here (the odd thread never writes).
+      // Soft carve only grows d, soft add only shrinks it, so abs() is the
+      // op's one-sided volume.
+      if (mode != 0) {
+        if (all(v.yz < vec2i(7))) { // v.x even -> always < 7
+          volLocal += abs(occ01(dNew) - occ01(dOld));
+        }
+        if (v.x + 1 < 7 && all(v.yz < vec2i(7))) {
+          volLocal += abs(occ01(dNew2) - occ01(dOld2));
+        }
+      }
     }
     if (writeAlbedo) {
       bAlbedo[brick * 512u + vi] = pack4x8unorm(vec4f(albedo, 1.0));
     }
   }
+  if (alive && volLocal > 0.0) {
+    atomicAdd(&wgVol, u32(volLocal * VOL_FP + 0.5));
+  }
   workgroupBarrier();
 
   // brick emptied of surface? free it and restore an empty-cell entry
   if (alive && li == 0u) {
+    let wv = atomicLoad(&wgVol);
+    if (wv > 0u) {
+      atomicAdd(&counters[3], wv);
+    }
     let lo = atomicLoad(&wgMin);
     let hi = atomicLoad(&wgMax);
     if (lo > i32((BAND - 0.1) * 100.0)) {

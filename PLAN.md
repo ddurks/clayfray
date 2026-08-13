@@ -23,6 +23,7 @@ Art direction: *The Trap Door* (1984) — see [`reference/ART_DIRECTION.md`](ref
 | Eyes are marbles | Eyes are rigid glass props, never clay: no carve, no boil, no detail normals, hard glint (all true in the renderer today). When dislodged they're RIGID BODIES — sphere-vs-arena, they roll and bounce; never MPM particles | "They should behave like little marbles for effect." Also the stop-motion truth: real claymation eyes are glass beads pressed into plasticine |
 | Platform reach | macOS now; Windows/Linux next; **mobile is a declared target** | Dawn runs Metal-on-iOS and Vulkan-on-Android, SDL3 covers both; the tracer's cost scales with traced pixels, so the resolution-scale lever + M3 query diet are the path. Phone-class GPUs ran Claybook-likes; feasible if we stay disciplined |
 | Content pipeline | Blender → glTF → import into the engine (mesh + armature + clips) | Generalize beyond the hand-authored blob: voxelize any mesh into the brickmap, drive it with any armature. See "Blender pipeline" under M4 |
+| Gameplay shape (2026-08-13) | Third-person over-the-shoulder duel; **1 s simultaneous-commit ticks** (both pick Move/Block/Slice hidden, resolve together — it's about *predicting* the opponent); **slice = mouse-drag → sword swing**, arc clamped to arm reach | Turn-by-turn-ish cadence makes it a mind-game, not an execution test. The drag-authored swing *is* the swept-blade the locked sever design already wanted. Simultaneous commit keeps deterministic replay/netcode. See M4.7 (enabling IK) + revised M5 |
 
 Dependencies (vendored, full list): SDL3, Dawn, GLM, Dear ImGui, Tracy, stb, miniaudio.
 No physics engine — chunk-vs-floor collision is small enough to write ourselves.
@@ -160,26 +161,166 @@ data is touched at pose steps: pose cost is O(bones).
 - [x] Pose quantization: 12 Hz skeleton, smooth camera
 - [ ] Carve routing while posed: world hit → rest frame of the owning piece(s) (edits currently land in rest coords; pause anim to sculpt precisely)
 - [ ] Shape keys: per-piece morph distance layers, mix() blending (Lipschitz-1), weights from animation channels
-- [ ] Perf pass: charDist is ~2-3× pre-articulation cost (cell-field fetches × 2 chunkWarp refinements); profile + trim before M6
+- [~] Perf pass (profiled + first trim; deeper work deferred):
+  - PROFILED (wall-clock, GPU timestamps unreliable on this Metal driver):
+    articulation ~doubles trace cost — 960×540 aa1, `CLAYFRAY_NO_PIECES`
+    bypass, ~70 ms/frame → ~136 ms/frame (+66 ms, ×1.9). Confirms the 2-3×
+    estimate. At the game's 0.5 internal scale that's ~34 → ~66 ms/frame.
+  - TRIMMED: `charDist` ran the fixed-point warp refinement (2nd ~17-load
+    cell gather) on every contributing piece every march step. Gated it on
+    warp displacement (>0.006 m ≈ 0.3 span) — near-rigid regions converge in
+    one pass, bent joints keep both. ~10% render win at/near rest (the common
+    stance per the rig note), neutral when bent. Verified: posed body clean,
+    |∇d| heatmap still green (`lookdev/perf_grad.png`).
+  - DEFERRED: the remaining ~1.8× is structural (per-step cell-field gathers).
+    Real wins need Xcode GPU-capture profiling or an algorithmic change
+    (cache warps across steps / coarser influence field). Do before two
+    fighters at 1080p, not required for single-fighter M6 work.
 - [ ] Two fighters + arena in one traced scene at 60 fps, 1080p-class res on the dev Mac
 - Rig craft note: keep rest poses near the resting stance (warp does least where the player stares longest); set Inherit Scale consistently — the glTF exporter drops inherit-scale-off compensation tracks
 
-## Milestone 5 — Gameplay core (parallel track — no GPU dependency, start anytime)
+## Milestone 4.6 — Clay conservation ("sploot") (NEW, shipped)
 
-*Goal: a playable-if-ugly fighter with capsule debug rendering.*
+*Goal: carved clay goes somewhere. Total clay in the scene is conserved.*
 
-- [ ] Deterministic fixed 60 Hz tick, input ring buffer, 2 gamepads (or keyboard split)
-- [ ] Character state machine: idle / walk / jab / heavy / slice special / hitstun / knockdown
-- [ ] Capsule hitbox/hurtbox overlap tests, attack frame data on the 12 Hz grid
-- [ ] Per-bone damage state: mass notches (0–7, blunt hits shrink capsule radius) and length notches (full/stub/gone) — integers only
-- [ ] Sever ruling: CPU capsule-vs-swept-blade test, cut point quantized to notch boundaries; severed bone + children leave the hurtbox set
-- [ ] Damage consequences wired into movement/attacks: lighter = faster but weaker; severed arm disables that side's moves
-- [ ] Debug view: capsules + frame-data timeline in ImGui
-- [ ] Replay recording from input stream (doubles as determinism test)
+Architecture: measure → ledger → gobs → deposit.
+- [x] **Measure**: the edit fill pass accumulates per-voxel |occupancy delta|
+  (1-voxel linear ramp, unique 7³ voxels only; whole-cell swallows counted in
+  classify) into `counters[3]`, fixed-point ×1024. Copied per-op into a
+  grow-on-demand readback pool (CPU can run ~100 frames ahead of the GPU
+  headless; a dropped measurement is leaked clay). ~1–2 frame latency.
+- [x] **Ledger** (renderer, visual-sim side): carves add debt; debt spawns
+  gobs (2–35 ml each, ≤12 in flight); every deposit subtracts. Gob adds onto
+  the body reconcile through their own measurement (smin over/under-fill goes
+  back on the ledger). `--carve-test` balances exactly: carved 2294.4 ml =
+  landed 2294.4 ml.
+- [x] **Gobs**: ballistic CPU sim at frame rate, *display positions quantized
+  to the 12 Hz pose grid* (smooth droplets against stepped poses would break
+  the stop-motion frame). Launch along the pick normal wearing charAlbedo at
+  the wound (pick pass now returns pos+normal+material+albedo). Clay never
+  bounces: capsule hits deflect-and-slide (or stick as a mode-2 add when the
+  body is at rest — same rest-space rule the carve tool lives with), floor
+  contact splats.
+- [x] **Deposit**: `GroundClay` heightfield (512², x,z ∈ ±1.75 m) — clay
+  thickness ON TOP of a bisection-precomputed pebble-surface base (nothing
+  hides in mosaic cracks), per-texel color (carved cyan lands cyan), quartic
+  bump kernels with closed-form integral so deposited volume is exact by
+  construction; radius swells with local pile height (slump, not towers).
+  splat(pos, vol, color) is the contract — M7 chunk settling can swap the
+  backing store for a world brickmap without touching the ledger or gobs.
+- [x] Tracer: heightfield unioned into map/mapLoose/mapPenumbra (piles get
+  AO + shadows), body-style boil/detail normals + mottle, empty-field
+  sentinel short-circuits to zero cost pre-carve. ~8% frame cost with a
+  2.3 L splooted scene at 960×540.
+- [x] Lighting regression fixed (the M2 lesson, relearned): the MARCH gets
+  the conservative (Lipschitz-scaled, arenaFloor-style gated) distance;
+  AO/penumbra get a SMOOTH unscaled variant — feeding them the scaled one
+  reads as phantom occlusion and bands under the penumbra's stepping. And
+  the field's top bound must be the true tallest pile (a per-splat sum hit
+  the 0.5 m cap and became an invisible occluder plane at chest height:
+  scene-wide darkening + black scanlines where rays grazed it).
+- [x] Second lighting fix — whole-footprint tint on first sploot: a 2 mm
+  "skirt below the floor" was meant to hide the empty field, but after the
+  0.3× march scaling + hit-epsilon it still registered, so the instant the
+  first gob landed the ENTIRE floor shaded clay-cyan + darkened. Replaced
+  with a real thickness gate (`groundThicknessAt < G_THMIN` → yield to the
+  arena floor); the cutoff sits at a sub-mm pile lip, invisible. Rule: the
+  ground field must render clay ONLY where clay was deposited, never a
+  floor-wide sheet. Verify by eye: carve-test floor colors at --frames 8
+  (field off) must match --frames 60/300 (field on) everywhere except the
+  piles.
+- [x] Panel: sploot section (conserve toggle + live ledger readout);
+  `CLAYFRAY_DEBUG_LEDGER=1` prints per-op measurements + final balance.
+- [ ] Carving LANDED clay back up (heightfield subtract + pick routing) —
+  pairs with M8's chunk-reattach economy question
+- [ ] Wall-face sticking (V1: wall hits smear down to the floor at its base)
+- Note: `--carve-test` coordinates were retargeted to the imported fighter's
+  aabb — the old set was authored for the taller analytic blob and carved
+  air, which the ledger immediately exposed (measured 0 ml).
 
-## Milestone 6 — Impacts and slicing
+## Milestone 4.7 — IK arm rig + sword prop (NEW — enabling tech for M5)
 
-*Goal: hits leave marks; the sword means something.*
+*Goal: the fighter holds a sword and the arms follow it via IK. No gameplay
+logic yet — this is the rig the dueling core drives.*
+
+The control scheme inverts today's flow: clips pose the arms (FK) and LBS
+renders the SDF around them; here the SWORD is master (driven by the swing or
+a hold pose) and the arms follow to grip it. IK is just another pose source
+writing into the same `skinMats_` the chunk articulation already reads.
+
+Rig reality (from the .glb, NOT the stale build script): a real 3-joint arm
+chain per side — `humerus.<s>` → `radius.<s>` → `hand.<s>` → `fingertips`,
+thumb also under radius. So true 2-bone IK (shoulder=humerus, elbow=radius,
+wrist=hand) works; `applyArmIk` rotates the two subtrees so the hand reaches.
+
+- [x] 2-bone analytic IK per arm (anim.cpp `applyArmIk`): reconstruct world
+  from `skinMats_`, law-of-cosines elbow, rigidly rotate the shoulder subtree
+  about S then the elbow subtree about the solved E' (no per-bone locals
+  needed), rewrite affected skin mats. Elbow-bend plane taken from the FK pose
+  (falls back to a down/back hint). Existing M4 LBS renders it — no new SDF
+  path; |∇d| heatmap stays green (`lookdev/ik_grad.png`)
+- [x] Grip-target data model: `ArmIkChain` per arm with subtree lists; the
+  sword carries 2 grips (grip0/grip1 along the blade), hands assigned by
+  `.l`/`.r`. One-prop-two-grips now; per-hand props (dual-wield) drop in
+  without IK changes
+- [x] Sword as a rigid emissive prop (marble precedent): capsule SDF hilt→tip,
+  emissive lightsaber shading (bloom does the glow), `MAT_SWORD`; uniforms
+  swordA/B/Col. Model swap later
+- [x] Reachable envelope: per-hand target clamped to the arm's [|L1−L2|,
+  L1+L2] annulus so IK always solves and the arm reads as a real reach.
+  Sword-transform clamp / torso lean for gross out-of-reach still DEFERRED
+- [x] IK layered over FK: arms driven by IK to the grips, torso/head by the
+  clip — verified holding the guard identically across clip frames
+  (`lookdev/ik_anim.png` at t=2.4 vs rest)
+- [x] Debug harness: "sword / IK" panel drives the hilt transform live;
+  `lookdev/ik_test2.png` two-handed guard. Windowed smoke test clean
+- [ ] DEFERRED refinements: hand ORIENTATION to grip (wrist twist to align the
+  mitt with the handle — position-only for now), sword-transform reach clamp +
+  torso lean, and 12 Hz quantization of the swing (smooth for debug drag now)
+
+## Milestone 5 — Dueling core (REVISED — was "Gameplay core")
+
+*Goal: two fighters, 1 s predictive ticks, sword slicing. Playable-if-rough,
+capsule-debug visuals. Parallel track, but now gated on M4.7 for the sword.*
+
+Locked control scheme (2026-08-13, see top table): third-person
+over-the-shoulder; **1 s decision tick = 60 sim ticks = 12 pose steps**;
+**simultaneous commit** (both pick hidden, resolve together); three actions.
+
+- [ ] Deterministic 60 Hz core + 1 s commit cadence; one action committed per
+  tick, both revealed at tick start (replay/netcode-friendly by construction)
+- [ ] Three actions: MOVE (fixed step, auto-facing the opponent — toward/away/
+  around a dueling ring), BLOCK (raise sword to a guard arc via M4.7 IK;
+  negates slices whose swept arc crosses it), SLICE (mouse-drag → swing)
+- [ ] Slice authoring: capture the screen-space drag, project to a swing arc
+  CLAMPED to the arm-reach envelope (M4.7), sample on the 12 Hz grid; the
+  sword sweeps that arc over the tick
+- [ ] Swept-blade sever (PULLED FORWARD from M6 — it's the core verb now): CPU
+  capsule-vs-swept-blade test against where the opponent ACTUALLY moved this
+  tick → deterministic ruling, notch-quantized; bigger-than-fist = gameplay
+  tier (per the locked sever decision)
+- [ ] Block resolution: guard arc vs incoming swept blade → full/partial
+  negation; chip/stagger tuned in playtest
+- [ ] Simultaneous resolution: both actions animate on the 60 Hz core; a slice
+  tests against the opponent's tick-end capsule path (did they step into it?
+  did they block the arc you chose?) — this IS the mind-game
+- [ ] Per-bone damage state (unchanged from the original M5): mass notches
+  (0–7, blunt shrinks capsule radius) + length notches (full/stub/gone),
+  integers only; severed bone + children leave the hurtbox set
+- [ ] Damage consequences: lighter = faster but weaker; severed arm disables
+  that side's moves (and, with M4.7, that hand's grip → sword drops / one-hand)
+- [ ] Over-the-shoulder camera behind your fighter, opponent framed ahead;
+  drag maps onto the opponent's silhouette. (Supersedes M8's "fixed tabletop
+  camera" for PLAY; tabletop may return for intros/replays)
+- [ ] Capsule + frame-data debug view (ImGui) + replay recording from the
+  input stream (doubles as the determinism test)
+
+## Milestone 6 — Impacts and slicing (visuals)
+
+*Goal: hits leave marks; the sword means something.* NOTE: the gameplay-tier
+swept-blade **sever ruling moved to M5** (it's the core verb). M6 is now the
+VISUAL layer that conforms to M5's rulings — dents, contamination, the CSG
+cut, cosmetic-tier slices, chunk labeling.
 
 - [ ] Wire tick events → GPU edit queue (dent field edits from hit events, scaled by move weight)
 - [ ] Visual dents conform to mass notches: field edit depth driven by the notch change, so silhouette tracks hitbox
@@ -233,6 +374,12 @@ data is touched at pose steps: pose cost is O(bones).
 
 ## Order of play
 
-M0 → M1 (gate) → M2 → M3 → M4 (research) → M6 → M7 → M8, with M5 (gameplay core)
-running as a parallel track from day one. Nothing after M1 is worth building if the
-gate render doesn't look like the show.
+M0 → M1 (gate) → M2 → M3 → M4 (research) → **M4.6 (done)** → **M4.7 (IK, next)**
+→ **M5 (dueling core)** → M6 (impact visuals) → M7 → M8. The gameplay design
+(2026-08-13) makes M4.7 the enabling step for M5, and pulls the gameplay sever
+from M6 into M5. M5 no longer "starts anytime" — it needs the M4.7 sword rig.
+Nothing after M1 is worth building if the gate render doesn't look like the show.
+
+Also still open before layering gameplay: M4 leftovers (carve-while-posed,
+shape keys), M4.6 leftovers (scoop landed clay, wall sticking), and the deeper
+`charDist` perf pass — none block M4.7/M5, revisit as needed.

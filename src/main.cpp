@@ -86,23 +86,26 @@ int runHeadless(const std::string& outPath, int width, int height, int frames,
         }
     } else if (carveTest) {
         // scripted edits that exercise classify/alloc/fill/free/JFA without
-        // interaction: carve gouges, a slice-like drag, and an added blob
+        // interaction: carve gouges, a slice-like drag, and an added blob.
+        // Coordinates target the imported fighter (body aabb ~ +-0.64 x,
+        // 0..0.69 y, +-0.17 z) — the original set was authored for the taller
+        // analytic blob and carved air, which M4.6's ledger exposed.
         BrickEdit e;
         e.mode = 1;
-        e.pos[0] = 0.02f; e.pos[1] = 0.62f; e.pos[2] = 0.26f; e.radius = 0.07f;
+        e.pos[0] = 0.02f; e.pos[1] = 0.42f; e.pos[2] = 0.12f; e.radius = 0.07f;
         renderer.queueBrickEdit(e); // chest crater
-        e.pos[0] = -0.16f; e.pos[1] = 0.86f; e.pos[2] = 0.16f; e.radius = 0.055f;
+        e.pos[0] = -0.08f; e.pos[1] = 0.60f; e.pos[2] = 0.08f; e.radius = 0.055f;
         renderer.queueBrickEdit(e); // head gouge
         for (int i = 0; i < 6; i++) { // diagonal slice-ish drag across the arm
-            e.pos[0] = 0.30f + 0.04f * i;
-            e.pos[1] = 0.72f - 0.07f * i;
-            e.pos[2] = 0.10f;
+            e.pos[0] = 0.26f + 0.05f * i;
+            e.pos[1] = 0.50f - 0.04f * i;
+            e.pos[2] = 0.04f;
             e.radius = 0.035f;
             renderer.queueBrickEdit(e);
         }
         BrickEdit add;
         add.mode = 2;
-        add.pos[0] = -0.20f; add.pos[1] = 0.42f; add.pos[2] = 0.27f; add.radius = 0.05f;
+        add.pos[0] = -0.15f; add.pos[1] = 0.32f; add.pos[2] = 0.16f; add.radius = 0.05f;
         add.color[0] = 0.72f; add.color[1] = 0.45f; add.color[2] = 0.40f;
         renderer.queueBrickEdit(add); // terracotta blob stuck on the belly
     }
@@ -126,17 +129,46 @@ int runHeadless(const std::string& outPath, int width, int height, int frames,
     int total = frames + (carveTest ? 80 : 0);
     for (int i = 0; i < total; i++) {
         renderer.render(cam, look, makeFrameInfo(t, aa), nullptr, nullptr);
+        // headless still needs the event pump or async readbacks (volume
+        // ledger, capacity poll) starve until exit
+        gpu.processEvents();
         t += kTickDt;
     }
     if (std::getenv("CLAYFRAY_DEBUG_STATS")) {
         renderer.brick().debugStats("post-render");
         renderer.brick().debugScanField();
     }
+    const SplootStats& s = renderer.sploot();
+    if (std::getenv("CLAYFRAY_DEBUG_LEDGER")) {
+        std::printf("[sploot] final: carved %.1f ml, landed %.1f ml, "
+                    "in flight %.1f ml (%d gobs), owed %.1f ml\n",
+                    s.carved * 1e6f, s.deposited * 1e6f, s.inFlight * 1e6f, s.gobs,
+                    s.debt * 1e6f);
+    }
     if (renderer.traceMs() > 0.f) {
         std::printf("[gpu] trace %.2f ms  post %.2f ms (smoothed, %dx%d aa=%d)\n",
                     renderer.traceMs(), renderer.postMs(), width, height, aa);
     }
-    return renderer.screenshot(outPath) ? 0 : 1;
+    if (!renderer.screenshot(outPath)) return 1;
+
+    // Machine-checkable conservation gate: at any instant, carved clay is
+    // accounted for as landed + airborne + owed. A nonzero residual means a
+    // measurement or a gob was dropped — a real regression. Agents/CI can
+    // gate on this exit code instead of eyeballing the ledger line.
+    if (carveTest && look.conserveClay) {
+        float residual = s.carved - (s.deposited + s.inFlight + s.debt);
+        float tol = std::max(1e-6f, s.carved * 0.01f); // 1 ml or 1% of carved
+        if (std::fabs(residual) > tol) {
+            std::fprintf(stderr,
+                         "[sploot] CONSERVATION VIOLATION: carved %.1f ml != "
+                         "landed %.1f + inflight %.1f + owed %.1f (residual "
+                         "%.2f ml, tol %.2f ml)\n",
+                         s.carved * 1e6f, s.deposited * 1e6f, s.inFlight * 1e6f,
+                         s.debt * 1e6f, residual * 1e6f, tol * 1e6f);
+            return 3;
+        }
+    }
+    return 0;
 }
 
 int runWindowed(int exitAfterFrames) {
@@ -268,7 +300,7 @@ int runWindowed(int exitAfterFrames) {
 
         bool wantScreenshot = false;
         uiNewFrame(look, cam, brush, fps, renderer.traceMs(), renderer.postMs(),
-                   wantScreenshot);
+                   renderer.sploot(), wantScreenshot);
 
         wgpu::SurfaceTexture surfaceTex;
         gpu.surface.GetCurrentTexture(&surfaceTex);

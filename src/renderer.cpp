@@ -97,11 +97,11 @@ bool Renderer::init(Gpu& gpu, int width, int height) {
     uniformBuf_ = gpu_->device.CreateBuffer(&ubDesc);
 
     wgpu::BufferDescriptor pickDesc{};
-    pickDesc.size = 16;
+    pickDesc.size = 48; // pos+hit, normal+mat, albedo
     pickDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
     pickOut_ = gpu_->device.CreateBuffer(&pickDesc);
     wgpu::BufferDescriptor pickReadDesc{};
-    pickReadDesc.size = 16;
+    pickReadDesc.size = 48;
     pickReadDesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
     pickRead_ = gpu_->device.CreateBuffer(&pickReadDesc);
 
@@ -127,6 +127,7 @@ bool Renderer::init(Gpu& gpu, int width, int height) {
     if (!brick_.init(gpu, loadShader("edit.wgsl"), loadShader("jfa.wgsl"),
                      loadShader("redistance.wgsl"), loadShader("voxelize.wgsl")))
         return false;
+    if (!ground_.init(gpu, loadShader("ground.wgsl"))) return false;
 
     // default marbles = the classic hand-coded eyes (linearized colors)
     auto lin = [](float c) { return std::pow(c, 2.2f); };
@@ -251,7 +252,7 @@ void Renderer::buildBindGroups() {
         traceBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        wgpu::BindGroupEntry entries[7] = {};
+        wgpu::BindGroupEntry entries[9] = {};
         entries[0].binding = 0;
         entries[0].buffer = brick_.indirection;
         entries[1].binding = 1;
@@ -264,9 +265,15 @@ void Renderer::buildBindGroups() {
         entries[4].buffer = brick_.coarse;
         entries[5].binding = 6;
         entries[5].buffer = brick_.cellWeights;
+        entries[6].binding = 7;
+        entries[6].buffer = ground_.base;
+        entries[7].binding = 8;
+        entries[7].buffer = ground_.height;
+        entries[8].binding = 9;
+        entries[8].buffer = ground_.color;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = tracePipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 6;
+        desc.entryCount = 9;
         desc.entries = entries;
         traceBrickBind_ = dev.CreateBindGroup(&desc);
     }
@@ -283,20 +290,22 @@ void Renderer::buildBindGroups() {
         pickBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        // pick's charDist touches indirection + dist + seeds + weights; auto
-        // layout excludes the unused albedo/coarse bindings
+        // pick's charDist + charAlbedo touch indirection + dist + albedo +
+        // seeds + weights; auto layout excludes the unused coarse binding
         wgpu::BindGroupEntry entries[5] = {};
         entries[0].binding = 0;
         entries[0].buffer = brick_.indirection;
         entries[1].binding = 1;
         entries[1].buffer = brick_.distPool;
-        entries[2].binding = 3;
-        entries[2].buffer = brick_.seeds;
-        entries[3].binding = 6;
-        entries[3].buffer = brick_.cellWeights;
+        entries[2].binding = 2;
+        entries[2].buffer = brick_.albedoPool;
+        entries[3].binding = 3;
+        entries[3].buffer = brick_.seeds;
+        entries[4].binding = 6;
+        entries[4].buffer = brick_.cellWeights;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = pickPipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 4;
+        desc.entryCount = 5;
         desc.entries = entries;
         pickBrickBind_ = dev.CreateBindGroup(&desc);
     }
@@ -333,6 +342,7 @@ bool Renderer::reloadShadersIfChanged() {
     if (stamp == shaderDirStamp_) return false;
     shaderDirStamp_ = stamp;
     std::printf("reloading shaders\n");
+    ground_.rebuildPipelines(loadShader("ground.wgsl"));
     if (buildPipelines()) buildBindGroups();
     // character source may have changed; rebuild the volume from it
     brick_.requestBake();
@@ -485,6 +495,57 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     out[65][1] = 0.008f;
     out[65][2] = 0.06f; // box test margin: sample within, bound outside
     out[65][3] = bodyBoundR + 0.05f;
+
+    // M4.6 conservation: in-flight gobs (12 Hz-stepped positions) + the
+    // ground field's clay top bound (0 disables the field in the tracer).
+    // These slot indices are hand-mirrored in trace.wgsl AND pick.wgsl —
+    // this static_assert catches only the C++ side overrunning the buffer;
+    // the WGSL side has no compile-time link, so CLAUDE.md flags the mirror.
+    static_assert(kUniformSlots >= 287,
+                  "gobs reach out[282], groundMeta out[283], sword out[284-286]; "
+                  "keep kUniformSlots and the Uniforms struct in trace.wgsl "
+                  "+ pick.wgsl in sync");
+    int gn = std::min((int)gobs_.size(), 12);
+    for (int i = 0; i < gn; i++) {
+        const Gob& g = gobs_[i];
+        float* slotA = out[259 + i * 2];
+        float* slotB = out[260 + i * 2];
+        slotA[0] = g.disp[0]; slotA[1] = g.disp[1]; slotA[2] = g.disp[2];
+        slotA[3] = g.radius;
+        slotB[0] = g.col[0]; slotB[1] = g.col[1]; slotB[2] = g.col[2];
+    }
+    out[258][0] = (float)gn;
+    out[283][0] = GroundClay::kOrigin;
+    out[283][1] = GroundClay::kTexel;
+    out[283][2] = (float)GroundClay::kN;
+    out[283][3] = ground_.maxTopY();
+
+    // M4.7 sword: emissive blade endpoints (radius 0 = inactive). memset above
+    // already zeroed the slots, so the disabled case needs no write.
+    if (look.sword.enabled && !bones_.empty()) {
+        float hilt[3], tip[3], gA[3], gB[3];
+        swordGeometry(look.sword, hilt, tip, gA, gB);
+        out[284][0] = hilt[0]; out[284][1] = hilt[1]; out[284][2] = hilt[2];
+        out[284][3] = look.sword.radius;
+        out[285][0] = tip[0]; out[285][1] = tip[1]; out[285][2] = tip[2];
+        out[286][0] = look.sword.color[0];
+        out[286][1] = look.sword.color[1];
+        out[286][2] = look.sword.color[2];
+    }
+}
+
+void Renderer::swordGeometry(const SwordParams& s, float hilt[3], float tip[3],
+                             float gripA[3], float gripB[3]) const {
+    // blade direction: +Z forward, pitched up toward +Y, then yawed about Y
+    float cp = std::cos(s.pitch), sp = std::sin(s.pitch);
+    float cy = std::cos(s.yaw), sy = std::sin(s.yaw);
+    float dir[3] = {cp * sy, sp, cp * cy};
+    for (int i = 0; i < 3; i++) {
+        hilt[i] = s.pos[i];
+        tip[i] = s.pos[i] + dir[i] * s.length;
+        gripA[i] = s.pos[i] + dir[i] * s.grip0; // near hilt (one hand)
+        gripB[i] = s.pos[i] + dir[i] * s.grip1; // stacked (other hand)
+    }
 }
 
 void Renderer::setCharacter(CharacterAsset asset) {
@@ -493,8 +554,59 @@ void Renderer::setCharacter(CharacterAsset asset) {
     clips_ = asset.clips;
     capsules_ = deriveCapsules(asset);
     evalPose(bones_, nullptr, 0.f, skinMats_); // identity: rest pose
-    std::printf("anim: %zu bones, %zu clip(s), %zu shadow capsules\n", bones_.size(),
-                clips_.size(), capsules_.size());
+
+    // M4.7: build the arm IK chains from bone names. Rig convention (see the
+    // .glb): humerus.<side> -> radius.<side> -> hand.<side> -> fingertips,
+    // with thumb.<side> also under radius. Subtrees carry the hand/fingers.
+    armIk_.clear();
+    const size_t nb = bones_.size();
+    std::vector<std::vector<int>> kids(nb);
+    for (size_t i = 0; i < nb; i++)
+        if (bones_[i].parent >= 0 && (size_t)bones_[i].parent < nb)
+            kids[bones_[i].parent].push_back((int)i);
+    auto findBone = [&](const std::string& nm) {
+        for (size_t i = 0; i < nb; i++)
+            if (bones_[i].name == nm) return (int)i;
+        return -1;
+    };
+    auto subtree = [&](int root, std::vector<int>& outv) {
+        std::vector<int> st{root};
+        while (!st.empty()) {
+            int b = st.back();
+            st.pop_back();
+            outv.push_back(b);
+            for (int c : kids[b]) st.push_back(c);
+        }
+    };
+    auto restOrigin = [&](int b, float* o) {
+        float inv[16];
+        matInvAffine(bones_[b].invBind, inv);
+        o[0] = inv[12]; o[1] = inv[13]; o[2] = inv[14];
+    };
+    for (const char* side : {"l", "r"}) {
+        int sh = findBone(std::string("humerus.") + side);
+        int el = findBone(std::string("radius.") + side);
+        int wr = findBone(std::string("hand.") + side);
+        if (sh < 0 || el < 0 || wr < 0) continue;
+        ArmIkChain c;
+        c.shoulder = sh; c.elbow = el; c.wrist = wr;
+        subtree(sh, c.upperSubtree);
+        subtree(el, c.lowerSubtree);
+        c.pole[0] = 0.f; c.pole[1] = -0.5f; c.pole[2] = -1.f; // elbows bend down/back
+        // palm offset: wrist -> fingertips rest length (grip sits mid-mitt, so
+        // ~70% of it). Falls back to 0 (wrist on grip) if no fingertip bone.
+        int ft = findBone(std::string("fingertips.") + side);
+        if (ft >= 0) {
+            float w[3], f[3];
+            restOrigin(wr, w);
+            restOrigin(ft, f);
+            float dx = f[0] - w[0], dy = f[1] - w[1], dz = f[2] - w[2];
+            c.handLen = 0.7f * std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        armIk_.push_back(c);
+    }
+    std::printf("anim: %zu bones, %zu clip(s), %zu shadow capsules, %zu IK arm(s)\n",
+                bones_.size(), clips_.size(), capsules_.size(), armIk_.size());
     brick_.requestImport(std::move(asset));
 }
 
@@ -506,26 +618,206 @@ void Renderer::encodePick(wgpu::CommandEncoder& enc) {
     pass.DispatchWorkgroups(1);
     pass.End();
     if (!pickMapPending_) {
-        enc.CopyBufferToBuffer(pickOut_, 0, pickRead_, 0, 16);
+        enc.CopyBufferToBuffer(pickOut_, 0, pickRead_, 0, 48);
     }
 }
 
 void Renderer::pollPick() {
     if (pickMapPending_) return;
     pickMapPending_ = true;
-    pickRead_.MapAsync(wgpu::MapMode::Read, 0, 16, wgpu::CallbackMode::AllowSpontaneous,
-                       [this](wgpu::MapAsyncStatus status, wgpu::StringView) {
+    auto alive = alive_;
+    pickRead_.MapAsync(wgpu::MapMode::Read, 0, 48, wgpu::CallbackMode::AllowSpontaneous,
+                       [this, alive](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                           if (!*alive) return;
                            if (status == wgpu::MapAsyncStatus::Success) {
                                const float* d =
-                                   (const float*)pickRead_.GetConstMappedRange(0, 16);
+                                   (const float*)pickRead_.GetConstMappedRange(0, 48);
                                pickPos_[0] = d[0];
                                pickPos_[1] = d[1];
                                pickPos_[2] = d[2];
                                pickValid_ = d[3] > 0.5f;
+                               pickNormal_[0] = d[4];
+                               pickNormal_[1] = d[5];
+                               pickNormal_[2] = d[6];
+                               pickMat_ = d[7];
+                               pickAlbedo_[0] = d[8];
+                               pickAlbedo_[1] = d[9];
+                               pickAlbedo_[2] = d[10];
                                pickRead_.Unmap();
                            }
                            pickMapPending_ = false;
                        });
+}
+
+void Renderer::queueBrickEdit(BrickEdit e) {
+    // snapshot the wound's facing + material color for the gobs this edit
+    // will tear off (measurement arrives frames later; pick moves on)
+    if (pickValid_ && !e.fromGob) {
+        std::memcpy(e.outDir, pickNormal_, sizeof(e.outDir));
+        if (pickMat_ > 2.5f && pickMat_ < 3.5f) {
+            std::memcpy(e.srcColor, pickAlbedo_, sizeof(e.srcColor));
+        }
+    }
+    brick_.queueEdit(e);
+}
+
+void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame) {
+    // Measurements from ops that ran 1-2 frames ago. Always drained — even
+    // with conservation off — or a measurement queued while ON but arriving
+    // while OFF would desync the ledger the next time it's toggled back on.
+    // The toggle gates SPAWNING (below), not accounting.
+    MeasuredEdit m;
+    while (brick_.takeMeasured(m)) {
+        if (std::getenv("CLAYFRAY_DEBUG_LEDGER")) {
+            std::printf("[sploot] mode %d measured %.1f ml\n", m.edit.mode,
+                        m.volume * 1e6f);
+        }
+        if (m.edit.mode == 1) {
+            sploot_.carved += m.volume;
+            sploot_.debt += m.volume;
+            std::memcpy(lastWound_, m.edit.pos, sizeof(lastWound_));
+            std::memcpy(woundDir_, m.edit.outDir, sizeof(woundDir_));
+            std::memcpy(woundCol_, m.edit.srcColor, sizeof(woundCol_));
+            haveWound_ = true;
+        } else if (m.edit.mode == 2 && m.edit.fromGob) {
+            // a landed gob became body clay; smin over/under-fill goes back
+            // on the ledger so nothing is created or destroyed
+            sploot_.deposited += m.volume;
+            sploot_.debt += m.edit.gobVol - m.volume;
+        }
+    }
+    // conservation off = pre-M4.6 vanish behavior: stop spawning and shed the
+    // debt (so a later re-enable doesn't erupt a backlog of gobs at once)
+    if (!look.conserveClay) {
+        sploot_.debt = 0.f;
+        haveWound_ = false;
+    }
+
+    float dt = 0.f;
+    if (lastSimTime_ >= 0.f)
+        dt = std::min(std::max(frame.time - lastSimTime_, 0.f), 0.05f);
+    lastSimTime_ = frame.time;
+    bool poseStep = frame.poseTime != lastPoseTime_;
+    lastPoseTime_ = frame.poseTime;
+
+    // spawn gobs while the ledger owes clay: 2..35 ml each (r ~ 8..20 mm)
+    const float kMinGob = 2.0e-6f, kMaxGob = 3.5e-5f;
+    auto rnd = [this]() {
+        gobSeed_ = gobSeed_ * 1664525u + 1013904223u;
+        return (float)(gobSeed_ >> 8) * (1.f / 16777216.f);
+    };
+    while (haveWound_ && sploot_.debt > kMinGob && (int)gobs_.size() < 12) {
+        float v = std::min(sploot_.debt, kMaxGob);
+        sploot_.debt -= v;
+        Gob g{};
+        g.vol = v;
+        g.radius = std::cbrt(v * 3.f / (4.f * 3.14159265f));
+        for (int i = 0; i < 3; i++)
+            g.pos[i] = lastWound_[i] + woundDir_[i] * (g.radius + 0.02f);
+        float s = 0.5f + 0.45f * rnd();
+        g.vel[0] = woundDir_[0] * s + (rnd() - 0.5f) * 0.35f;
+        g.vel[1] = woundDir_[1] * s + 0.5f + (rnd() - 0.5f) * 0.2f;
+        g.vel[2] = woundDir_[2] * s + (rnd() - 0.5f) * 0.35f;
+        std::memcpy(g.col, woundCol_, sizeof(g.col));
+        std::memcpy(g.disp, g.pos, sizeof(g.disp));
+        g.grace = 0.22f; // clear the wound before body collision arms
+        gobs_.push_back(g);
+    }
+
+    // posed shadow capsules double as gob colliders
+    struct PosedCap {
+        float a[3], b[3], r;
+    };
+    std::vector<PosedCap> caps;
+    caps.reserve(capsules_.size());
+    for (const BoneCapsule& c : capsules_) {
+        PosedCap pc;
+        std::memcpy(pc.a, c.a, sizeof(pc.a));
+        std::memcpy(pc.b, c.b, sizeof(pc.b));
+        pc.r = c.r;
+        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
+            matTransformPoint(&skinMats_[c.bone * 16], c.a, pc.a);
+            matTransformPoint(&skinMats_[c.bone * 16], c.b, pc.b);
+        }
+        caps.push_back(pc);
+    }
+    // sticking writes rest-space voxels, so only an un-posed body may catch
+    // gobs (same "pause to sculpt" rule the carve tool lives with)
+    bool resting = !look.animPlay || bones_.empty();
+
+    for (auto it = gobs_.begin(); it != gobs_.end();) {
+        Gob& g = *it;
+        g.grace -= dt;
+        g.vel[1] -= 5.5f * dt; // hair under g: reads better at tabletop scale
+        for (int i = 0; i < 3; i++) g.pos[i] += g.vel[i] * dt;
+
+        // back wall: clay doesn't bounce, it smears down
+        if (g.pos[2] - g.radius < -2.3f + 0.10f) {
+            g.pos[2] = -2.3f + 0.10f + g.radius;
+            if (g.vel[2] < 0.f) g.vel[2] = 0.f;
+        }
+
+        bool gone = false;
+        if (g.grace <= 0.f) {
+            for (const PosedCap& pc : caps) {
+                float ab[3] = {pc.b[0] - pc.a[0], pc.b[1] - pc.a[1], pc.b[2] - pc.a[2]};
+                float ap[3] = {g.pos[0] - pc.a[0], g.pos[1] - pc.a[1],
+                               g.pos[2] - pc.a[2]};
+                float abLen2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                float t = abLen2 > 1e-9f ? (ap[0] * ab[0] + ap[1] * ab[1] +
+                                            ap[2] * ab[2]) / abLen2
+                                         : 0.f;
+                t = std::min(std::max(t, 0.f), 1.f);
+                float cp[3] = {pc.a[0] + ab[0] * t, pc.a[1] + ab[1] * t,
+                               pc.a[2] + ab[2] * t};
+                float d[3] = {g.pos[0] - cp[0], g.pos[1] - cp[1], g.pos[2] - cp[2]};
+                float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                if (dist >= g.radius + pc.r) continue;
+                if (resting) {
+                    BrickEdit e;
+                    e.mode = 2;
+                    e.fromGob = true;
+                    e.gobVol = g.vol;
+                    e.radius = g.radius * 1.1f;
+                    std::memcpy(e.pos, g.pos, sizeof(e.pos));
+                    std::memcpy(e.color, g.col, sizeof(e.color));
+                    if (brick_.editInBounds(e)) {
+                        brick_.queueEdit(e);
+                        gone = true; // ledger settles when its measurement lands
+                        break;
+                    }
+                }
+                // deflect: push out, kill the normal velocity, slide off
+                float inv = dist > 1e-6f ? 1.f / dist : 0.f;
+                float n[3] = {d[0] * inv, d[1] * inv, d[2] * inv};
+                float push = g.radius + pc.r - dist;
+                for (int i = 0; i < 3; i++) g.pos[i] += n[i] * push;
+                float vn = g.vel[0] * n[0] + g.vel[1] * n[1] + g.vel[2] * n[2];
+                if (vn < 0.f)
+                    for (int i = 0; i < 3; i++) g.vel[i] -= n[i] * vn;
+            }
+        }
+        if (gone) {
+            it = gobs_.erase(it);
+            continue;
+        }
+
+        // landing: floor mosaic or an existing pile (coarse CPU mirror)
+        float top = ground_.approxTopAt(g.pos[0], g.pos[2]);
+        if ((g.pos[1] - 0.4f * g.radius < top && g.vel[1] <= 0.f) ||
+            g.pos[1] < -0.1f) {
+            ground_.splat(g.pos[0], g.pos[2], g.vol, g.col);
+            sploot_.deposited += g.vol;
+            it = gobs_.erase(it);
+            continue;
+        }
+        if (poseStep) std::memcpy(g.disp, g.pos, sizeof(g.disp));
+        ++it;
+    }
+
+    sploot_.inFlight = 0.f;
+    for (const Gob& g : gobs_) sploot_.inFlight += g.vol;
+    sploot_.gobs = (int)gobs_.size();
 }
 
 void Renderer::render(const OrbitCamera& cam, const LookParams& look,
@@ -540,7 +832,25 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             animT_ = std::fmod(frame.poseTime * look.animSpeed, clip->duration);
         }
         evalPose(bones_, clip, animT_, skinMats_);
+
+        // M4.7: sword is master, arms follow. IK overrides the FK arm pose so
+        // each hand reaches its grip on the (debug-driven) sword; torso/head
+        // stay on the clip. Marbles/capsules below read the IK'd skinMats_.
+        if (look.sword.enabled && !armIk_.empty()) {
+            float hilt[3], tip[3], gA[3], gB[3];
+            swordGeometry(look.sword, hilt, tip, gA, gB);
+            for (ArmIkChain& c : armIk_) {
+                const std::string& nm = bones_[c.shoulder].name;
+                bool right = nm.size() >= 2 && nm.compare(nm.size() - 2, 2, ".r") == 0;
+                std::memcpy(c.target, right ? gA : gB, sizeof(c.target));
+            }
+            applyArmIk(bones_, armIk_, skinMats_);
+        }
     }
+
+    // conservation runs before packing so this frame's uniforms carry fresh
+    // gob positions and the ground bound
+    updateConservation(look, frame);
 
     float uniforms[kUniformSlots][4];
     packUniforms(cam, look, frame, uniforms);
@@ -548,6 +858,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
 
     wgpu::CommandEncoder encoder = gpu_->device.CreateCommandEncoder();
     brick_.encode(encoder);
+    ground_.encode(encoder);
 
     {
         wgpu::PassTimestampWrites tsw{};
@@ -614,11 +925,14 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     wgpu::CommandBuffer cmd = encoder.Finish();
     gpu_->queue.Submit(1, &cmd);
     brick_.finishCapacityPoll();
+    brick_.pollVolumes();
     if (queryThisFrame) {
         queryMapPending_ = true;
+        auto alive = alive_;
         queryRead_.MapAsync(wgpu::MapMode::Read, 0, 4 * 8,
                             wgpu::CallbackMode::AllowSpontaneous,
-                            [this](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                            [this, alive](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                                if (!*alive) return;
                                 if (status == wgpu::MapAsyncStatus::Success) {
                                     const uint64_t* t =
                                         (const uint64_t*)queryRead_.GetConstMappedRange(

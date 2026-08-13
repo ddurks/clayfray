@@ -16,6 +16,26 @@ void matTransformPoint(const float* m, const float* p, float* out);
 void evalPose(const std::vector<AssetBone>& bones, const AnimClip* clip, float t,
               std::vector<float>& skinMats);
 
+// 2-bone IK (M4.7): rotate a shoulder->elbow->wrist chain so `wrist` reaches
+// `target` (world), the elbow biased toward `pole`. Runs as a post-pass over
+// evalPose's skin matrices: reconstruct world transforms, rotate the two
+// subtrees rigidly (shoulder subtree about the shoulder, elbow subtree about
+// the solved elbow), rewrite the affected skin mats. Subtree bone lists are
+// precomputed by the caller so the hand/fingers/thumb ride along.
+struct ArmIkChain {
+    int shoulder = -1, elbow = -1, wrist = -1;
+    std::vector<int> upperSubtree; // shoulder + all descendants
+    std::vector<int> lowerSubtree; // elbow + all descendants
+    float target[3] = {0, 0, 0};   // world grip position (where the PALM sits)
+    float pole[3] = {0, -0.5f, -1.f}; // world-ish elbow-bend hint (fallback)
+    // wrist-to-palm reach: the hand mesh extends past the wrist joint, so the
+    // wrist is aimed short of the grip by this much (along shoulder->grip) to
+    // land the palm on the grip instead of the wrist. Rest hand->fingertips.
+    float handLen = 0.f;
+};
+void applyArmIk(const std::vector<AssetBone>& bones,
+                const std::vector<ArmIkChain>& chains, std::vector<float>& skinMats);
+
 // Per-bone capsule + chunk data, fitted at import in rest space.
 // - a/b/r: shadow-proxy capsule (radius hugs the clay, 80th percentile of
 //   the bone's dominant-weight vertices); posed rigidly by skin matrices.
