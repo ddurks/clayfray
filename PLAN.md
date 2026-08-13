@@ -160,7 +160,21 @@ data is touched at pose steps: pose cost is O(bones).
 - [x] Pose quantization: 12 Hz skeleton, smooth camera
 - [ ] Carve routing while posed: world hit → rest frame of the owning piece(s) (edits currently land in rest coords; pause anim to sculpt precisely)
 - [ ] Shape keys: per-piece morph distance layers, mix() blending (Lipschitz-1), weights from animation channels
-- [ ] Perf pass: charDist is ~2-3× pre-articulation cost (cell-field fetches × 2 chunkWarp refinements); profile + trim before M6
+- [~] Perf pass (profiled + first trim; deeper work deferred):
+  - PROFILED (wall-clock, GPU timestamps unreliable on this Metal driver):
+    articulation ~doubles trace cost — 960×540 aa1, `CLAYFRAY_NO_PIECES`
+    bypass, ~70 ms/frame → ~136 ms/frame (+66 ms, ×1.9). Confirms the 2-3×
+    estimate. At the game's 0.5 internal scale that's ~34 → ~66 ms/frame.
+  - TRIMMED: `charDist` ran the fixed-point warp refinement (2nd ~17-load
+    cell gather) on every contributing piece every march step. Gated it on
+    warp displacement (>0.006 m ≈ 0.3 span) — near-rigid regions converge in
+    one pass, bent joints keep both. ~10% render win at/near rest (the common
+    stance per the rig note), neutral when bent. Verified: posed body clean,
+    |∇d| heatmap still green (`lookdev/perf_grad.png`).
+  - DEFERRED: the remaining ~1.8× is structural (per-step cell-field gathers).
+    Real wins need Xcode GPU-capture profiling or an algorithmic change
+    (cache warps across steps / coarser influence field). Do before two
+    fighters at 1080p, not required for single-fighter M6 work.
 - [ ] Two fighters + arena in one traced scene at 60 fps, 1080p-class res on the dev Mac
 - Rig craft note: keep rest poses near the resting stance (warp does least where the player stares longest); set Inherit Scale consistently — the glTF exporter drops inherit-scale-off compensation tracks
 

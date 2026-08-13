@@ -370,9 +370,15 @@ fn charDist(p: vec3f) -> f32 {
     }
     let bone = u32(u.pieces[i].capB.w);
     // fixed-point refinement: influences read at the rigid guess are off by
-    // the warp displacement, so re-evaluate at the blended location once
+    // the warp displacement, so re-evaluate at the blended location. But the
+    // correction is proportional to that displacement — near-rigid regions
+    // (small joint angle, the bulk of the body most frames) converge in one
+    // pass, so skip the second ~17-load cell gather where the blend barely
+    // moved the sample. Bent joints (large displacement) keep both passes.
     var w = chunkWarp(p, qs[i], i, bone, &qs, &boneToPiece);
-    w = chunkWarp(p, w.q, i, bone, &qs, &boneToPiece);
+    if (distance(w.q, qs[i]) > 0.006) { // ~0.3 cell spans
+      w = chunkWarp(p, w.q, i, bone, &qs, &boneToPiece);
+    }
     if (forwardResid(p, w.q, &boneToPiece) > 0.05) {
       continue; // vacated-space sample: LBS puts that surface elsewhere
     }
