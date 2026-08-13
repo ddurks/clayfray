@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+
+#include "snapshot.h"
 
 namespace {
 
@@ -33,7 +36,8 @@ bool GroundClay::init(Gpu& gpu, const std::string& src) {
         wgpu::BufferDescriptor desc{};
         desc.label = label;
         desc.size = size;
-        desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+        desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst |
+                     wgpu::BufferUsage::CopySrc; // CopySrc: snapshot readback
         return dev.CreateBuffer(&desc);
     };
     base = storage(texels * 4, "ground base");
@@ -141,6 +145,52 @@ float GroundClay::approxTopAt(float x, float z) const {
     // mid-pebble base guess: gobs sink a hair into the mosaic before the
     // splat pops in, which reads as impact squash at 12 Hz anyway
     return 0.015f + thicknessAt(x, z);
+}
+
+bool GroundClay::save(SnapWriter& w) {
+    const uint64_t texels = (uint64_t)kN * kN;
+    uint32_t meta[4] = {kN, kMirror, basePending_ ? 1u : 0u, 0};
+    w.section("GMET", meta, sizeof(meta));
+    struct Sect {
+        const char* tag;
+        wgpu::Buffer buf;
+    };
+    const Sect sects[] = {{"GBAS", base}, {"GHGT", height}, {"GCOL", color}};
+    for (const Sect& s : sects) {
+        std::vector<uint8_t> data = readbackBuffer(*gpu_, s.buf, texels * 4);
+        if (data.empty()) return false;
+        w.section(s.tag, data.data(), data.size());
+    }
+    w.section("GMAX", &maxH_, sizeof(maxH_));
+    w.section("GMIR", mirror_, sizeof(mirror_));
+    return true;
+}
+
+bool GroundClay::load(SnapReader& r) {
+    const uint64_t texels = (uint64_t)kN * kN;
+    uint32_t meta[4];
+    if (!r.read("GMET", meta, sizeof(meta)) || meta[0] != kN || meta[1] != kMirror) {
+        std::fprintf(stderr, "[snap] ground field mismatch\n");
+        return false;
+    }
+    struct Sect {
+        const char* tag;
+        wgpu::Buffer buf;
+    };
+    const Sect sects[] = {{"GBAS", base}, {"GHGT", height}, {"GCOL", color}};
+    for (const Sect& s : sects) {
+        std::vector<uint8_t> data = r.blob(s.tag);
+        if (data.size() != texels * 4) {
+            std::fprintf(stderr, "[snap] ground section %s wrong size\n", s.tag);
+            return false;
+        }
+        gpu_->queue.WriteBuffer(s.buf, 0, data.data(), data.size());
+    }
+    if (!r.read("GMAX", &maxH_, sizeof(maxH_))) return false;
+    if (!r.read("GMIR", mirror_, sizeof(mirror_))) return false;
+    basePending_ = meta[2] != 0;
+    pending_.clear();
+    return true;
 }
 
 void GroundClay::encode(wgpu::CommandEncoder& enc) {

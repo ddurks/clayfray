@@ -7,6 +7,9 @@
 #include "asset.h"
 #include "gpu.h"
 
+class SnapWriter;
+class SnapReader;
+
 // Sparse brickmap for the carveable character body. Owns the GPU volume
 // (indirection grid + brick pools + freelist) and the bake/edit/JFA passes.
 // One edit op is consumed per frame (uniform buffer contents are per-submit).
@@ -85,6 +88,15 @@ class BrickSystem {
     // submit, like finishCapacityPoll) and drain finished measurements.
     void pollVolumes();
     bool takeMeasured(MeasuredEdit& out);
+    // No volume copies queued or mapping (measured_ may still hold results).
+    bool measurementsIdle() const;
+
+    // Snapshot the full carveable state (indirection, pools up to the brick
+    // high-water mark, allocator, JFA seeds, coarse field, queued edits).
+    // Load restores it and cancels any pending bake/import — the snapshot IS
+    // the volume. Blocking; dev tooling only.
+    bool save(SnapWriter& w);
+    bool load(SnapReader& r);
 
   private:
     void encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e);
@@ -126,9 +138,13 @@ class BrickSystem {
         BrickEdit edit;
         bool copied = false;  // encoded a copy this submit, map not yet armed
         bool mapping = false; // MapAsync in flight
+        uint32_t gen = 0;     // snapshot generation the copy belongs to
     };
     std::deque<VolSlot> volSlots_;
     std::vector<MeasuredEdit> measured_;
+    // Bumped by load(): measurements from the pre-load volume complete
+    // against a state that no longer exists, so their callbacks drop them.
+    uint32_t snapGen_ = 0;
 
     // Shared with in-flight MapAsync callbacks; false once this object is
     // gone. Heap-owned, so the flag outlives `this` for any late callback.

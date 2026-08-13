@@ -1,5 +1,7 @@
 #include "brick.h"
 
+#include "snapshot.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -615,18 +617,23 @@ void BrickSystem::pollVolumes() {
                        [this, &s, alive](wgpu::MapAsyncStatus status, wgpu::StringView) {
                            if (!*alive) return; // object gone; &s/this dangle
                            if (status == wgpu::MapAsyncStatus::Success) {
-                               uint32_t fp =
-                                   *(const uint32_t*)s.buf.GetConstMappedRange(0, 4);
-                               if (std::getenv("CLAYFRAY_DEBUG_LEDGER")) {
-                                   std::printf("[vol] raw fp=%u mode=%d\n", fp,
-                                               s.edit.mode);
+                               // stale generation: measured against a volume a
+                               // snapshot load replaced — drop, don't ledger it
+                               if (s.gen == snapGen_) {
+                                   uint32_t fp =
+                                       *(const uint32_t*)s.buf.GetConstMappedRange(0, 4);
+                                   if (std::getenv("CLAYFRAY_DEBUG_LEDGER")) {
+                                       std::printf("[vol] raw fp=%u mode=%d\n", fp,
+                                                   s.edit.mode);
+                                   }
+                                   MeasuredEdit m;
+                                   m.edit = s.edit;
+                                   // fixed-point voxels (x1024) -> m^3
+                                   m.volume = (float)((double)fp / 1024.0 *
+                                                      (double)kVoxel * (double)kVoxel *
+                                                      (double)kVoxel);
+                                   measured_.push_back(m);
                                }
-                               MeasuredEdit m;
-                               m.edit = s.edit;
-                               // fixed-point voxels (x1024) -> m^3
-                               m.volume = (float)((double)fp / 1024.0 * (double)kVoxel *
-                                                  (double)kVoxel * (double)kVoxel);
-                               measured_.push_back(m);
                                s.buf.Unmap();
                            }
                            s.mapping = false;
@@ -638,6 +645,117 @@ bool BrickSystem::takeMeasured(MeasuredEdit& out) {
     if (measured_.empty()) return false;
     out = measured_.front();
     measured_.erase(measured_.begin());
+    return true;
+}
+
+bool BrickSystem::measurementsIdle() const {
+    for (const VolSlot& s : volSlots_) {
+        if (s.copied || s.mapping) return false;
+    }
+    return true;
+}
+
+bool BrickSystem::save(SnapWriter& w) {
+    const uint32_t cells = kGrid * kGrid * kGrid;
+    std::vector<uint8_t> ind = readbackBuffer(*gpu_, indirection, cells * 4ull);
+    if (ind.empty()) return false;
+    // pools are saved as a dense prefix up to the brick high-water mark:
+    // alloc is counter-based so live indices are packed low, and freed holes
+    // inside the prefix are rewritten in full on realloc (harmless garbage)
+    const uint32_t* ip = (const uint32_t*)ind.data();
+    uint32_t hi = 0;
+    bool any = false;
+    for (uint32_t i = 0; i < cells; i++) {
+        if (ip[i] & 0x80000000u) {
+            any = true;
+            hi = std::max(hi, ip[i] & 0x000FFFFFu);
+        }
+    }
+    const uint32_t bricks = any ? hi + 1 : 0;
+    uint32_t meta[4] = {kGrid, kMaxBricks, bricks, (uint32_t)pending_.size()};
+    w.section("BMET", meta, sizeof(meta));
+    w.section("BIND", ind.data(), ind.size());
+
+    struct Sect {
+        const char* tag;
+        wgpu::Buffer buf;
+        uint64_t size;
+    };
+    const Sect sects[] = {
+        {"BCLW", cellWeights, cells * 8ull},
+        {"BCNT", counters_, 16},
+        {"BFRE", freelist_, kMaxBricks * 4ull},
+        {"BJFA", jfaA_, cells * 4ull},   // seeds; jfaB_ is per-pass scratch
+        {"BCRS", coarse, cells * 4ull},  // coarseB_ likewise
+        {"BDST", distPool, bricks * 256ull * 4ull},
+        {"BALB", albedoPool, bricks * 512ull * 4ull},
+        {"BWGT", weightPool, bricks * 512ull * 4ull},
+    };
+    for (const Sect& s : sects) {
+        if (s.size == 0) {
+            w.section(s.tag, nullptr, 0);
+            continue;
+        }
+        std::vector<uint8_t> data = readbackBuffer(*gpu_, s.buf, s.size);
+        if (data.empty()) return false;
+        w.section(s.tag, data.data(), data.size());
+    }
+    w.section("BPND", pending_.data(), pending_.size() * sizeof(BrickEdit));
+    return true;
+}
+
+bool BrickSystem::load(SnapReader& r) {
+    const uint32_t cells = kGrid * kGrid * kGrid;
+    uint32_t meta[4];
+    if (!r.read("BMET", meta, sizeof(meta))) {
+        std::fprintf(stderr, "[snap] missing/short BMET section\n");
+        return false;
+    }
+    if (meta[0] != kGrid || meta[1] != kMaxBricks) {
+        std::fprintf(stderr, "[snap] grid mismatch: file %ux%u, build %dx%u\n",
+                     meta[0], meta[1], kGrid, kMaxBricks);
+        return false;
+    }
+    const uint32_t bricks = meta[2];
+    struct Sect {
+        const char* tag;
+        wgpu::Buffer buf;
+        uint64_t size;
+    };
+    const Sect sects[] = {
+        {"BIND", indirection, cells * 4ull},
+        {"BCLW", cellWeights, cells * 8ull},
+        {"BCNT", counters_, 16},
+        {"BFRE", freelist_, kMaxBricks * 4ull},
+        {"BJFA", jfaA_, cells * 4ull},
+        {"BCRS", coarse, cells * 4ull},
+        {"BDST", distPool, bricks * 256ull * 4ull},
+        {"BALB", albedoPool, bricks * 512ull * 4ull},
+        {"BWGT", weightPool, bricks * 512ull * 4ull},
+    };
+    for (const Sect& s : sects) {
+        if (s.size == 0) continue;
+        std::vector<uint8_t> data = r.blob(s.tag);
+        if (data.size() != s.size) {
+            std::fprintf(stderr, "[snap] section %s: %zu bytes, expected %llu\n",
+                         s.tag, data.size(), (unsigned long long)s.size);
+            return false;
+        }
+        gpu_->queue.WriteBuffer(s.buf, 0, data.data(), data.size());
+    }
+    pending_.resize(meta[3]);
+    if (meta[3] &&
+        !r.read("BPND", pending_.data(), meta[3] * sizeof(BrickEdit))) {
+        pending_.clear();
+    }
+    // the snapshot IS the volume: cancel any queued bake/import, and poison
+    // in-flight volume measurements (they measured the replaced state)
+    bakePending_ = false;
+    importPending_ = false;
+    measured_.clear();
+    snapGen_++;
+    for (VolSlot& s : volSlots_) s.copied = false;
+    editsSinceCap_ = 0;
     return true;
 }
 
@@ -805,6 +923,7 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
             enc.CopyBufferToBuffer(counters_, 12, slot->buf, 0, 4);
             slot->edit = e;
             slot->copied = true;
+            slot->gen = snapGen_;
         }
         if (++editsSinceCap_ >= 60 && !capMapPending_) {
             editsSinceCap_ = 0;

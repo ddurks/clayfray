@@ -1,6 +1,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -8,9 +9,12 @@
 #include <fstream>
 #include <imgui.h>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "asset.h"
 #include "camera.h"
+#include "ctl.h"
 #include "gpu.h"
 #include "params.h"
 #include "renderer.h"
@@ -22,7 +26,8 @@ constexpr double kTickRate = 60.0;
 constexpr double kTickDt = 1.0 / kTickRate;
 
 // Deterministic gameplay core stub. Grows a real state machine in M5;
-// for M0/M1 it only advances time.
+// for M0/M1 it only advances time. (After a snapshot load its tick count
+// is resynced to the restored sim time.)
 struct GameState {
     uint64_t tickCount = 0;
     void tick() { tickCount++; }
@@ -36,6 +41,24 @@ FrameInfo makeFrameInfo(double t, int aa) {
     f.grainFrame = (float)std::floor(t * 25.0);        // film frames (PAL)
     f.aaSamples = aa;
     return f;
+}
+
+long poseTickOf(double t) { return (long)std::floor(t * 12.0 + 1e-9); }
+
+// break-on-condition (ctl `break ledger T`): pause instead of exiting so
+// the state is inspectable via stats/shot/snap. One-shot; re-arm to renew.
+void checkBreak(CtlServer& ctl, const Renderer& renderer, SimClock& clock) {
+    if (ctl.breakLedgerTol < 0.f) return;
+    const SplootStats& s = renderer.sploot();
+    float res = (s.carved - (s.deposited + s.inFlight + s.debt)) * 1e6f;
+    if (std::fabs(res) > ctl.breakLedgerTol) {
+        clock.paused = true;
+        std::fprintf(stderr,
+                     "[break] ledger residual %.2f ml > %.2f ml — paused "
+                     "(inspect via ctl; re-arm with `break ledger`)\n",
+                     res, ctl.breakLedgerTol);
+        ctl.breakLedgerTol = -1.f;
+    }
 }
 
 std::string gCharacterPath; // --character; empty = built-in analytic fighter
@@ -55,15 +78,25 @@ bool loadCharacterInto(Renderer& renderer) {
     return true;
 }
 
-int runHeadless(const std::string& outPath, int width, int height, int frames,
-                double startTime, int aa, bool carveTest) {
+struct RunOpts {
+    std::string screenshotPath;
+    int width = 1280, height = 720, frames = 8, aa = 2;
+    double startTime = 2.0;
+    bool carveTest = false;
+    bool serve = false;          // headless, loop until ctl `quit`
+    std::string replayPath;      // headless journal replay
+    std::string loadName;        // snapshot to restore at launch
+    int exitAfter = 0;           // windowed smoke test
+};
+
+int runHeadless(const RunOpts& o) {
     Gpu gpu;
     if (!gpu.init(nullptr)) return 1;
     Renderer renderer;
-    if (!renderer.init(gpu, width, height)) return 1;
+    if (!renderer.init(gpu, o.width, o.height)) return 1;
     if (!loadCharacterInto(renderer)) return 1;
 
-    if (carveTest && std::getenv("CLAYFRAY_TEST_ADDSTRESS")) {
+    if (o.carveTest && std::getenv("CLAYFRAY_TEST_ADDSTRESS")) {
         // far-from-body adds: pool stress + volume-boundary rejection test
         for (int i = 0; i < 60; i++) {
             BrickEdit e;
@@ -76,7 +109,7 @@ int runHeadless(const std::string& outPath, int width, int height, int frames,
             e.color[0] = 0.72f; e.color[1] = 0.45f; e.color[2] = 0.40f;
             renderer.queueBrickEdit(e);
         }
-    } else if (carveTest && std::getenv("CLAYFRAY_TEST_NULLEDITS")) {
+    } else if (o.carveTest && std::getenv("CLAYFRAY_TEST_NULLEDITS")) {
         // ops that touch nothing — but still trigger the per-edit JFA re-run
         for (int i = 0; i < 9; i++) {
             BrickEdit e;
@@ -84,7 +117,7 @@ int runHeadless(const std::string& outPath, int width, int height, int frames,
             e.pos[0] = 0.f; e.pos[1] = 2.5f; e.pos[2] = 0.f; e.radius = 0.03f;
             renderer.queueBrickEdit(e);
         }
-    } else if (carveTest) {
+    } else if (o.carveTest) {
         // scripted edits that exercise classify/alloc/fill/free/JFA without
         // interaction: carve gouges, a slice-like drag, and an added blob.
         // Coordinates target the imported fighter (body aabb ~ +-0.64 x,
@@ -124,15 +157,99 @@ int runHeadless(const std::string& outPath, int width, int height, int frames,
     if (const char* k = std::getenv("CLAYFRAY_SHADOWK")) look.shadowSoft = (float)atof(k);
     if (const char* a = std::getenv("CLAYFRAY_AO")) look.aoStrength = (float)atof(a);
     if (const char* d = std::getenv("CLAYFRAY_DETAIL")) look.detailAmount = (float)atof(d);
-    double t = startTime;
+
+    double t = o.startTime;
+    SimClock clock;
+    bool quit = false;
+    float fps = 0.f;
+    CtlServer ctl;
+    CtlRefs refs;
+    refs.look = &look;
+    refs.cam = &cam;
+    refs.renderer = &renderer;
+    refs.clock = &clock;
+    refs.simT = &t;
+    refs.fps = &fps;
+    refs.wantQuit = &quit;
+    refs.charPath = gCharacterPath;
+    ctl.init(o.serve ? "ctl" : "", refs);
+
+    std::vector<JournalEntry> journal;
+    size_t ji = 0;
+    if (!o.replayPath.empty() && !loadJournal(o.replayPath, journal)) return 2;
+    if (!o.loadName.empty() &&
+        !renderer.loadSnapshot(snapFilePath(o.loadName), &t, gCharacterPath)) {
+        return 2;
+    }
+
+    if (o.serve) {
+        renderer.setAlwaysPick(true); // ctl probe/pickuv work headless
+        std::printf("[ctl] serving on ctl/ at %dx%d aa=%d — drive with "
+                    "tools/ctl.sh, stop with `quit`\n",
+                    o.width, o.height, o.aa);
+        int warm = 3; // render the bake/import + first visible frames
+        while (!quit) {
+            long tick = poseTickOf(t);
+            ctl.poll(tick);
+            int n = clock.ticksToRun(kTickDt);
+            if (n > 15) n = 15;
+            bool active = n > 0 || ctl.activity() || warm > 0 ||
+                          renderer.brick().hasPendingWork();
+            if (active) {
+                if (warm > 0) warm--;
+                t += n * kTickDt;
+                auto t0 = std::chrono::steady_clock::now();
+                renderer.render(cam, look, makeFrameInfo(t, o.aa), nullptr, nullptr);
+                gpu.processEvents();
+                double dt = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+                if (dt > 1e-6) fps = fps * 0.9f + (float)(1.0 / dt) * 0.1f;
+            } else {
+                // idle: keep async maps, the inbox, and the ledger alive
+                // without burning the GPU (a paused session would otherwise
+                // never absorb an in-flight measurement into stats)
+                gpu.processEvents();
+                renderer.pumpLedger();
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            ctl.finishFrame();
+            checkBreak(ctl, renderer, clock);
+        }
+        renderer.syncMeasurements();
+        return 0;
+    }
+
     // one queued edit drains per frame; +80 covers the longest test script
-    int total = frames + (carveTest ? 80 : 0);
+    int total = o.frames + (o.carveTest ? 80 : 0);
+    if (!journal.empty()) {
+        // enough frames to reach one pose tick past the last journal entry
+        double tEnd = (double)(journal.back().tick + 1) / 12.0;
+        total += std::max(0, (int)std::ceil((tEnd - o.startTime) * kTickRate) + 1);
+    }
     for (int i = 0; i < total; i++) {
-        renderer.render(cam, look, makeFrameInfo(t, aa), nullptr, nullptr);
+        long tick = poseTickOf(t);
+        while (ji < journal.size() && journal[ji].tick <= tick) {
+            std::string resp;
+            if (!ctl.execute(journal[ji].cmd, tick, resp)) {
+                std::fprintf(stderr, "[replay] entry %zu failed: %s", ji + 1,
+                             resp.c_str());
+            }
+            ji++;
+        }
+        renderer.render(cam, look, makeFrameInfo(t, o.aa), nullptr, nullptr);
         // headless still needs the event pump or async readbacks (volume
         // ledger, capacity poll) starve until exit
         gpu.processEvents();
+        // replay is the regression harness: pin measurement arrival to the
+        // frame after its edit so reruns are bit-for-bit repeatable
+        if (!journal.empty()) renderer.syncMeasurements();
+        ctl.finishFrame(); // flush journal `shot` lines
         t += kTickDt;
+    }
+    if (ji < journal.size()) {
+        std::fprintf(stderr, "[replay] %zu entr(y/ies) past end of run\n",
+                     journal.size() - ji);
     }
     if (std::getenv("CLAYFRAY_DEBUG_STATS")) {
         renderer.brick().debugStats("post-render");
@@ -147,15 +264,15 @@ int runHeadless(const std::string& outPath, int width, int height, int frames,
     }
     if (renderer.traceMs() > 0.f) {
         std::printf("[gpu] trace %.2f ms  post %.2f ms (smoothed, %dx%d aa=%d)\n",
-                    renderer.traceMs(), renderer.postMs(), width, height, aa);
+                    renderer.traceMs(), renderer.postMs(), o.width, o.height, o.aa);
     }
-    if (!renderer.screenshot(outPath)) return 1;
+    if (!o.screenshotPath.empty() && !renderer.screenshot(o.screenshotPath)) return 1;
 
     // Machine-checkable conservation gate: at any instant, carved clay is
     // accounted for as landed + airborne + owed. A nonzero residual means a
     // measurement or a gob was dropped — a real regression. Agents/CI can
     // gate on this exit code instead of eyeballing the ledger line.
-    if (carveTest && look.conserveClay) {
+    if ((o.carveTest || !journal.empty()) && look.conserveClay) {
         float residual = s.carved - (s.deposited + s.inFlight + s.debt);
         float tol = std::max(1e-6f, s.carved * 0.01f); // 1 ml or 1% of carved
         if (std::fabs(residual) > tol) {
@@ -171,7 +288,7 @@ int runHeadless(const std::string& outPath, int width, int height, int frames,
     return 0;
 }
 
-int runWindowed(int exitAfterFrames) {
+int runWindowed(const RunOpts& o) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -200,14 +317,36 @@ int runWindowed(int exitAfterFrames) {
     LookParams look;
     BrushState brush;
 
-    uint64_t prevNs = SDL_GetTicksNS();
-    double accumulator = 0.0;
+    SimClock clock;
+    double simT = 0.0;
+    bool ctlQuit = false;
     float fps = 0.f;
+    CtlServer ctl;
+    CtlRefs refs;
+    refs.look = &look;
+    refs.cam = &cam;
+    refs.brush = &brush;
+    refs.renderer = &renderer;
+    refs.clock = &clock;
+    refs.simT = &simT;
+    refs.fps = &fps;
+    refs.wantQuit = &ctlQuit;
+    refs.charPath = gCharacterPath;
+    ctl.init("ctl", refs);
+
+    if (!o.loadName.empty()) {
+        if (!renderer.loadSnapshot(snapFilePath(o.loadName), &simT, gCharacterPath)) {
+            return 2;
+        }
+        game.tickCount = (uint64_t)std::llround(simT * kTickRate);
+    }
+
+    uint64_t prevNs = SDL_GetTicksNS();
     int frameCounter = 0;
     int screenshotCounter = 0;
     bool running = true;
 
-    while (running) {
+    while (running && !ctlQuit) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             uiProcessEvent(&ev);
@@ -255,19 +394,21 @@ int runWindowed(int exitAfterFrames) {
             }
         }
 
+        long tickNow = poseTickOf(simT);
+        ctl.poll(tickNow); // before sim/render: same-frame set -> shot
+
         uint64_t nowNs = SDL_GetTicksNS();
         double frameDt = (double)(nowNs - prevNs) * 1e-9;
         prevNs = nowNs;
         if (frameDt > 0.25) frameDt = 0.25; // debugger/stall clamp
-        accumulator += frameDt;
-        while (accumulator >= kTickDt) {
-            game.tick();
-            accumulator -= kTickDt;
-        }
+        int ticks = clock.ticksToRun(frameDt);
+        if (ticks > 15) ticks = 15;
+        for (int k = 0; k < ticks; k++) game.tick();
+        simT += ticks * kTickDt;
         fps = fps * 0.95f + (float)(1.0 / (frameDt > 1e-6 ? frameDt : 1e-6)) * 0.05f;
 
         if (++frameCounter % 30 == 0) renderer.reloadShadersIfChanged();
-        if (exitAfterFrames > 0 && frameCounter >= exitAfterFrames) running = false;
+        if (o.exitAfter > 0 && frameCounter >= o.exitAfter) running = false;
 
         // internal resolution scale (throttled so slider drags don't thrash
         // target recreation)
@@ -295,7 +436,9 @@ int runWindowed(int exitAfterFrames) {
             e.color[0] = brush.color[0];
             e.color[1] = brush.color[1];
             e.color[2] = brush.color[2];
-            renderer.queueBrickEdit(e);
+            // pick-resolved edit recorded so replay doesn't need a cursor
+            BrickEdit resolved = renderer.queueBrickEdit(e);
+            if (ctl.recording()) ctl.recordEdit(resolved, tickNow);
         }
 
         bool wantScreenshot = false;
@@ -307,7 +450,7 @@ int runWindowed(int exitAfterFrames) {
         if (surfaceTex.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
             surfaceTex.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
             wgpu::TextureView view = surfaceTex.texture.CreateView();
-            renderer.render(cam, look, makeFrameInfo(game.timeSeconds(), 1), view,
+            renderer.render(cam, look, makeFrameInfo(simT, 1), view,
                             [](wgpu::RenderPassEncoder& pass) { uiRender(pass); });
             gpu.surface.Present();
         } else {
@@ -322,6 +465,8 @@ int runWindowed(int exitAfterFrames) {
             renderer.screenshot(path);
         }
         gpu.processEvents();
+        ctl.finishFrame();
+        checkBreak(ctl, renderer, clock);
     }
 
     uiShutdown();
@@ -333,11 +478,8 @@ int runWindowed(int exitAfterFrames) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string screenshotPath;
-    int width = 1280, height = 720, frames = 8, aa = 2;
-    int exitAfter = 0;
-    bool carveTest = false;
-    double startTime = 2.0;
+    RunOpts o;
+    bool sizeSet = false, aaSet = false;
 
     for (int i = 1; i < argc; i++) {
         auto arg = std::string(argv[i]);
@@ -349,34 +491,51 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (arg == "--screenshot") {
-            screenshotPath = next("--screenshot");
+            o.screenshotPath = next("--screenshot");
         } else if (arg == "--size") {
-            if (std::sscanf(next("--size"), "%dx%d", &width, &height) != 2) {
+            if (std::sscanf(next("--size"), "%dx%d", &o.width, &o.height) != 2) {
                 std::fprintf(stderr, "--size expects WxH\n");
                 return 2;
             }
+            sizeSet = true;
         } else if (arg == "--frames") {
-            frames = std::atoi(next("--frames"));
+            o.frames = std::atoi(next("--frames"));
         } else if (arg == "--time") {
-            startTime = std::atof(next("--time"));
+            o.startTime = std::atof(next("--time"));
         } else if (arg == "--aa") {
-            aa = std::atoi(next("--aa"));
+            o.aa = std::atoi(next("--aa"));
+            aaSet = true;
         } else if (arg == "--exit-after") {
-            exitAfter = std::atoi(next("--exit-after"));
+            o.exitAfter = std::atoi(next("--exit-after"));
         } else if (arg == "--carve-test") {
-            carveTest = true;
+            o.carveTest = true;
         } else if (arg == "--character") {
             gCharacterPath = next("--character");
+        } else if (arg == "--serve") {
+            o.serve = true;
+        } else if (arg == "--replay") {
+            o.replayPath = next("--replay");
+        } else if (arg == "--load") {
+            o.loadName = next("--load");
         } else {
             std::fprintf(stderr,
                          "usage: clayfray [--screenshot out.png] [--size WxH] "
-                         "[--frames N] [--time T] [--aa N]\n");
+                         "[--frames N] [--time T] [--aa N] [--character f.glb]\n"
+                         "  [--serve]        headless ctl session (tools/ctl.sh)\n"
+                         "  [--replay f]     headless journal replay (deterministic)\n"
+                         "  [--load name]    restore a snapshot at launch\n"
+                         "  [--carve-test] [--exit-after N]\n");
             return 2;
         }
     }
-
-    if (!screenshotPath.empty()) {
-        return runHeadless(screenshotPath, width, height, frames, startTime, aa, carveTest);
+    if (o.serve) {
+        // serve is an interactive sim console: default to a fast trace
+        if (!sizeSet) { o.width = 960; o.height = 540; }
+        if (!aaSet) o.aa = 1;
     }
-    return runWindowed(exitAfter);
+
+    if (!o.screenshotPath.empty() || o.serve || !o.replayPath.empty()) {
+        return runHeadless(o);
+    }
+    return runWindowed(o);
 }

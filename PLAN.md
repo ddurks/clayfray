@@ -278,6 +278,36 @@ wrist=hand) works; `applyArmIk` rotates the two subtrees so the hand reaches.
   mitt with the handle — position-only for now), sword-transform reach clamp +
   torso lean, and 12 Hz quantization of the swing (smooth for debug drag now)
 
+## Milestone DEV — Agent iteration loop (NEW, shipped 2026-08-13)
+
+Not a game milestone: tooling that collapses the edit→rebuild→relaunch→
+re-pose→screenshot loop, designed agent-first (every knob commandable, every
+state dumpable, every regression exit-code gateable). Shaders already
+hot-load; this adds the rest. See CLAUDE.md "Agent dev loop" for commands.
+
+- [x] **ctl port**: file inbox `ctl/in/` polled per frame (windowed AND
+  `--serve` headless); `tools/ctl.sh` client. set/get over a registry of all
+  LookParams/SwordParams/camera/brush fields, `edit` (scripted carves/adds),
+  `shot`, `stats` JSON, `probe`/`pickuv`, pause/resume/`step N` (12 Hz pose
+  steps)/timescale, `snap save|load`, `record`, `break ledger`, `quit`
+- [x] **snapshots**: full sim state (brick pools to high-water mark +
+  allocator + JFA/coarse, ground field + mirror, ledger, gobs, sim time) in a
+  tagged-section file, `snapshots/<name>.snap` (~80 MB). In-session round
+  trip is byte-identical (`rt_A/B.png` cmp equal); `--load NAME` restores at
+  launch cross-process. Load poisons in-flight volume measurements (snapGen)
+- [x] **journal replay**: `record` captures tick-stamped set/edit/bake lines
+  (brush strokes recorded pick-resolved); `--replay f.journal` re-runs them
+  headless on the fixed 60 Hz step with measurement arrival pinned
+  (syncMeasurements) — ledger is run-to-run EXACT, conservation gate applies
+  (exit 3), screenshots match to ~0.02% of pixels (redistance apron healing
+  is dispatch-order sensitive; that's the pre-existing noise floor). Gate
+  images with `python3 tools/imgdiff.py a.png b.png` (exit 1 outside tol)
+- [x] **break-on-condition**: `break ledger TOL` pauses the clock on residual
+  instead of exiting — state stays inspectable via stats/shot/snap
+- [ ] Later if needed: C++ dylib hot reload (deliberately skipped — snapshots
+  make rebuild+relaunch+`--load` ~10 s and always ABI-correct), param-file
+  watch, pause-on-NaN
+
 ## Milestone 5 — Dueling core (REVISED — was "Gameplay core")
 
 *Goal: two fighters, 1 s predictive ticks, sword slicing. Playable-if-rough,

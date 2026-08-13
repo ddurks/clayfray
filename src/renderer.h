@@ -33,12 +33,35 @@ class Renderer {
     void setPickUV(float u, float v) { pickU_ = u; pickV_ = v; }
     bool pickValid() const { return pickValid_; }
     const float* pickPos() const { return pickPos_; }
+    const float* pickNormal() const { return pickNormal_; }
+    float pickMat() const { return pickMat_; }
+    // headless serve mode runs the pick pass too so ctl `probe` works
+    void setAlwaysPick(bool v) { alwaysPick_ = v; }
     // snapshots the pick normal/albedo into the edit so conservation gobs
-    // launch outward from the wound wearing its color
-    void queueBrickEdit(BrickEdit e);
+    // launch outward from the wound wearing its color; returns the resolved
+    // edit so the ctl journal can record it pick-independently
+    BrickEdit queueBrickEdit(BrickEdit e);
     BrickSystem& brick() { return brick_; }
     void setCharacter(CharacterAsset asset);
     const SplootStats& sploot() const { return sploot_; }
+
+    // Sim-state snapshots (M-DEV): body volume + ground field + ledger +
+    // gobs + sim time. Save drains in-flight volume measurements first so
+    // the ledger in the file is settled. Load cancels queued bake/import.
+    bool saveSnapshot(const std::string& path, double simT,
+                      const std::string& charPath);
+    bool loadSnapshot(const std::string& path, double* simT,
+                      const std::string& charPath);
+    // Block until queued volume measurements have landed in measured_ —
+    // pins their arrival frame so journal replay is deterministic.
+    void syncMeasurements();
+    // Fold any completed measurements into the ledger without rendering.
+    // The serve loop calls this while paused/idle so ctl `stats` doesn't
+    // report a stale ledger (absorption otherwise only runs in render()).
+    void pumpLedger() {
+        brick_.pollVolumes();
+        absorbMeasured();
+    }
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -85,6 +108,7 @@ class Renderer {
         float col[3];
     };
     void updateConservation(const LookParams& look, const FrameInfo& frame);
+    void absorbMeasured(); // drain brick measurements into the ledger
 
     Gpu* gpu_ = nullptr;
     BrickSystem brick_;
@@ -110,6 +134,7 @@ class Renderer {
     wgpu::BindGroup pickBind_, pickBrickBind_;
     wgpu::Buffer pickOut_, pickRead_;
     bool pickMapPending_ = false;
+    bool alwaysPick_ = false;
     float pickU_ = 0.5f, pickV_ = 0.5f;
     bool pickValid_ = false;
     float pickPos_[3] = {0, 0, 0};

@@ -1,6 +1,7 @@
 #include "renderer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -8,7 +9,10 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <thread>
 #include <vector>
+
+#include "snapshot.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -649,7 +653,7 @@ void Renderer::pollPick() {
                        });
 }
 
-void Renderer::queueBrickEdit(BrickEdit e) {
+BrickEdit Renderer::queueBrickEdit(BrickEdit e) {
     // snapshot the wound's facing + material color for the gobs this edit
     // will tear off (measurement arrives frames later; pick moves on)
     if (pickValid_ && !e.fromGob) {
@@ -659,13 +663,14 @@ void Renderer::queueBrickEdit(BrickEdit e) {
         }
     }
     brick_.queueEdit(e);
+    return e;
 }
 
-void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame) {
+void Renderer::absorbMeasured() {
     // Measurements from ops that ran 1-2 frames ago. Always drained — even
     // with conservation off — or a measurement queued while ON but arriving
     // while OFF would desync the ledger the next time it's toggled back on.
-    // The toggle gates SPAWNING (below), not accounting.
+    // The toggle gates SPAWNING (updateConservation), not accounting.
     MeasuredEdit m;
     while (brick_.takeMeasured(m)) {
         if (std::getenv("CLAYFRAY_DEBUG_LEDGER")) {
@@ -686,6 +691,10 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
             sploot_.debt += m.edit.gobVol - m.volume;
         }
     }
+}
+
+void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame) {
+    absorbMeasured();
     // conservation off = pre-M4.6 vanish behavior: stop spawning and shed the
     // debt (so a later re-enable doesn't erupt a backlog of gobs at once)
     if (!look.conserveClay) {
@@ -876,7 +885,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         pass.DispatchWorkgroups((width_ + 7) / 8, (height_ + 7) / 8);
         pass.End();
     }
-    bool doPick = swapchainView != nullptr; // windowed only
+    bool doPick = swapchainView != nullptr || alwaysPick_;
     if (doPick) encodePick(encoder);
     {
         wgpu::PassTimestampWrites tsw{};
@@ -993,4 +1002,114 @@ bool Renderer::screenshot(const std::string& path) {
     int rc = stbi_write_png(path.c_str(), width_, height_, 4, pixels.data(), width_ * 4);
     if (rc) std::printf("wrote %s (%dx%d)\n", path.c_str(), width_, height_);
     return rc != 0;
+}
+
+void Renderer::syncMeasurements() {
+    // Copies were submitted with the frame; they only need the event pump,
+    // not more renders. Bounded wait so a lost map can't hang the app.
+    for (int guard = 0; !brick_.measurementsIdle() && guard < 20000; guard++) {
+        gpu_->processEvents();
+        brick_.pollVolumes();
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+    }
+    if (!brick_.measurementsIdle()) {
+        std::fprintf(stderr, "[snap] warning: volume measurements still in flight\n");
+    }
+}
+
+namespace {
+// CPU-side conservation/pose state (RCPU section). Same-build raw bytes,
+// like every snapshot section.
+struct RenderSnapCpu {
+    float carved, deposited, debt, inFlight;
+    int32_t gobCount;
+    float lastWound[3], woundDir[3], woundCol[3];
+    uint32_t haveWound, gobSeed;
+    float animT;
+    uint32_t pad;
+    double simT;
+};
+} // namespace
+
+bool Renderer::saveSnapshot(const std::string& path, double simT,
+                            const std::string& charPath) {
+    // settle the ledger first: an unread measurement would be lost to the
+    // file (carve visible in the volume, never counted as carved)
+    syncMeasurements();
+    absorbMeasured();
+
+    SnapWriter w;
+    if (!w.open(path)) {
+        std::fprintf(stderr, "[snap] cannot write %s\n", path.c_str());
+        return false;
+    }
+    if (!brick_.save(w) || !ground_.save(w)) {
+        w.close();
+        return false;
+    }
+    RenderSnapCpu rc{};
+    rc.carved = sploot_.carved;
+    rc.deposited = sploot_.deposited;
+    rc.debt = sploot_.debt;
+    rc.inFlight = sploot_.inFlight;
+    rc.gobCount = (int32_t)gobs_.size();
+    std::memcpy(rc.lastWound, lastWound_, sizeof(rc.lastWound));
+    std::memcpy(rc.woundDir, woundDir_, sizeof(rc.woundDir));
+    std::memcpy(rc.woundCol, woundCol_, sizeof(rc.woundCol));
+    rc.haveWound = haveWound_ ? 1 : 0;
+    rc.gobSeed = gobSeed_;
+    rc.animT = animT_;
+    rc.simT = simT;
+    w.section("RCPU", &rc, sizeof(rc));
+    w.section("RGOB", gobs_.data(), gobs_.size() * sizeof(Gob));
+    w.section("CHRP", charPath.data(), charPath.size());
+    bool ok = w.close();
+    std::printf("[snap] %s %s\n", ok ? "saved" : "FAILED to save", path.c_str());
+    return ok;
+}
+
+bool Renderer::loadSnapshot(const std::string& path, double* simT,
+                            const std::string& charPath) {
+    SnapReader r;
+    if (!r.open(path)) {
+        std::fprintf(stderr, "[snap] cannot read %s\n", path.c_str());
+        return false;
+    }
+    std::vector<uint8_t> cp = r.blob("CHRP");
+    std::string savedChar((const char*)cp.data(), cp.size());
+    if (savedChar != charPath) {
+        std::fprintf(stderr,
+                     "[snap] warning: snapshot character '%s' != loaded '%s' — "
+                     "voxels won't match the rig\n",
+                     savedChar.c_str(), charPath.c_str());
+    }
+    RenderSnapCpu rc{};
+    if (!r.read("RCPU", &rc, sizeof(rc))) {
+        std::fprintf(stderr, "[snap] missing RCPU section\n");
+        return false;
+    }
+    if (!brick_.load(r) || !ground_.load(r)) return false;
+    gobs_.assign((size_t)std::max(rc.gobCount, 0), Gob{});
+    if (rc.gobCount > 0 &&
+        !r.read("RGOB", gobs_.data(), gobs_.size() * sizeof(Gob))) {
+        gobs_.clear();
+    }
+    sploot_.carved = rc.carved;
+    sploot_.deposited = rc.deposited;
+    sploot_.debt = rc.debt;
+    sploot_.inFlight = rc.inFlight;
+    sploot_.gobs = (int)gobs_.size();
+    std::memcpy(lastWound_, rc.lastWound, sizeof(lastWound_));
+    std::memcpy(woundDir_, rc.woundDir, sizeof(woundDir_));
+    std::memcpy(woundCol_, rc.woundCol, sizeof(woundCol_));
+    haveWound_ = rc.haveWound != 0;
+    gobSeed_ = rc.gobSeed;
+    animT_ = rc.animT;
+    // fresh dt baseline: the restored clock may sit anywhere on the timeline
+    lastSimTime_ = -1.f;
+    lastPoseTime_ = -1.f;
+    if (simT) *simT = rc.simT;
+    std::printf("[snap] loaded %s (t=%.2fs, %zu gob(s))\n", path.c_str(), rc.simT,
+                gobs_.size());
+    return true;
 }

@@ -4,6 +4,9 @@
 
 #include "gpu.h"
 
+class SnapWriter;
+class SnapReader;
+
 // Where carved clay lands (M4.6 conservation). V1 backing store is a floor
 // heightfield: thickness on top of a precomputed pebble-surface base, plus a
 // per-texel color map. splat() is the deposit contract — M7 chunk settling
@@ -29,6 +32,10 @@ class GroundClay {
     // Approximate landing height for gob collision: coarse CPU mirror of the
     // deposited thickness over a mid-pebble base guess.
     float approxTopAt(float x, float z) const;
+
+    // Snapshot the deposited field (GPU maps + CPU mirror). Blocking.
+    bool save(SnapWriter& w);
+    bool load(SnapReader& r);
 
     wgpu::Buffer base, height, color;
 

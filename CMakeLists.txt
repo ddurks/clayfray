@@ -99,6 +99,8 @@ add_executable(clayfray
   src/anim.cpp
   src/ground.cpp
   src/renderer.cpp
+  src/snapshot.cpp
+  src/ctl.cpp
   src/ui.cpp)
 target_include_directories(clayfray PRIVATE ${stb_SOURCE_DIR} ${cgltf_SOURCE_DIR})
 target_link_libraries(clayfray PRIVATE SDL3::SDL3 dawn::webgpu_dawn imgui_lib)

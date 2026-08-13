@@ -13,3 +13,7 @@ reference/
 # runtime/backup droppings
 imgui.ini
 *.blend1
+
+# dev-loop runtime state (ctl inbox/outbox, local scene snapshots)
+ctl/
+snapshots/
