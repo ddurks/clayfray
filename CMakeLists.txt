@@ -96,6 +96,7 @@ add_executable(clayfray
   src/gpu.cpp
   src/brick.cpp
   src/asset.cpp
+  src/anim.cpp
   src/renderer.cpp
   src/ui.cpp)
 target_include_directories(clayfray PRIVATE ${stb_SOURCE_DIR} ${cgltf_SOURCE_DIR})

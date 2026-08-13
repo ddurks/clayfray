@@ -6,6 +6,12 @@
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
 #endif
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 bool Gpu::init(SDL_Window* window) {
     static const wgpu::InstanceFeatureName instFeatures[] = {
@@ -91,9 +97,18 @@ bool Gpu::init(SDL_Window* window) {
         wgpu::SurfaceDescriptor surfDesc{};
         surfDesc.nextInChain = &metalSource;
         surface = instance.CreateSurface(&surfDesc);
+#elif defined(_WIN32)
+        void* hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                                            SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+        wgpu::SurfaceSourceWindowsHWND winSource{};
+        winSource.hwnd = hwnd;
+        winSource.hinstance = GetModuleHandleW(nullptr);
+        wgpu::SurfaceDescriptor surfDesc{};
+        surfDesc.nextInChain = &winSource;
+        surface = instance.CreateSurface(&surfDesc);
 #else
-        // Windows/Linux surface creation lands with the second-platform build (M8).
-        std::fprintf(stderr, "windowed mode is macOS-only for now\n");
+        // Linux (X11/Wayland) surface creation lands with M8.
+        std::fprintf(stderr, "windowed mode: unsupported platform\n");
         return false;
 #endif
         if (!surface) {

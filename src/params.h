@@ -39,6 +39,12 @@ struct LookParams {
     // blit upscales. Chunky low-res + grain reads very stop-motion, and
     // traced pixels are the whole frame cost.
     float resScale = 0.5f; // user-approved default: chunky + fast
+
+    // M4-P0 animation: play the asset's first clip, looped, sampled on the
+    // 12 Hz pose grid. Off = rest pose. (Drives marbles + shadow proxy; the
+    // voxel body articulates in M4-P1.)
+    bool animPlay = true;
+    float animSpeed = 1.0f;
 };
 
 // Sculpt-mode UI state (windowed only).

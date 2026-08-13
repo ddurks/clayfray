@@ -1,7 +1,9 @@
 #pragma once
 #include <functional>
 #include <string>
+#include <vector>
 
+#include "anim.h"
 #include "brick.h"
 #include "camera.h"
 #include "gpu.h"
@@ -27,10 +29,7 @@ class Renderer {
     const float* pickPos() const { return pickPos_; }
     void queueBrickEdit(const BrickEdit& e) { brick_.queueEdit(e); }
     BrickSystem& brick() { return brick_; }
-    void setCharacter(CharacterAsset asset) {
-        if (!asset.marbles.empty()) marbles_ = asset.marbles;
-        brick_.requestImport(std::move(asset));
-    }
+    void setCharacter(CharacterAsset asset);
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -43,10 +42,21 @@ class Renderer {
     bool buildPipelines();
     void buildTargets();
     void buildBindGroups();
-    static constexpr int kUniformSlots = 31; // 13 look + mouse + 8 marbles x2 + meta
+    // 13 look + mouse + 8 marbles x2 + marbleMeta + capsMeta + capsCenter +
+    // 16 capsules x2 + boneMeta + 16 pieces x12 (invSkin mat4, forward skin
+    // mat4, aabb lo/hi, rest capsule a/b)
+    static constexpr int kUniformSlots = 258;
     void packUniforms(const OrbitCamera& cam, const LookParams& look,
                       const FrameInfo& frame, float out[kUniformSlots][4]) const;
     std::vector<MarbleProp> marbles_;
+    // P0 animation: skeleton + clips kept CPU-side; pose sampled at the 12 Hz
+    // quantized clock; marbles and the capsule shadow proxy ride the skin
+    // matrices. (The voxel body stays in rest pose until M4-P1.)
+    std::vector<AssetBone> bones_;
+    std::vector<AnimClip> clips_;
+    std::vector<BoneCapsule> capsules_;
+    std::vector<float> skinMats_;
+    float animT_ = 0.f;
     void encodePick(wgpu::CommandEncoder& enc);
     void pollPick();
 

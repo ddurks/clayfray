@@ -136,14 +136,33 @@ feel before assuming full res is the target.
 
 *Goal: the genuinely novel part — a skinned humanoid SDF that traces correctly.*
 
-- [ ] Chunky character rig: few fat capsules, big smooth-blend radii, mitten hands (see art doc — blobbiness deliberately lowers this risk)
-- [ ] Rest-pose residual detail field in the brickmap, bound to bones
-- [ ] Query-warp skinning: inverse bone transforms at trace time + conservative step scaling (Lipschitz bound) to handle the broken distance metric
-- [ ] Squash & stretch via nonuniform scale channels (same conservative-step caution)
-- [ ] Rigid pristine eyes (white hemispheres + pupils) that never deform
-- [ ] Boiling: detail-noise reseed per pose step, not per render frame
-- [ ] Pose quantization: skeleton sampled at 12 Hz for rendering, camera stays smooth
+**Architecture (shipped, replaces the query-warp sketch):** the ONE
+rest-space brickmap articulates through per-bone pieces sampled at N-bone
+(up to 4) inverse-LBS warped points. A per-cell skin field (bCellW: 4 joints
++ 4 weights, distance-weighted gather at import, flood-filled volume-wide)
+drives the blend; a convex combination of rigid warps is a contraction, so
+sphere tracing stays safe with no conservative-step hack. A region renders
+once, by the piece whose interpolated influence is near-maximal; a forward
+round-trip check (re-map the sampled rest point by ITS OWN weights, reject
+if it lands > 5 cm from the query) kills vacated-space ghosts; an argmax
+fallback guarantees coverage; plain-min union (dual samples are identical
+points — smin only bulged seam rings). Squash/stretch = per-piece min-scale
+distance correction. Pose = 12 Hz-quantized CPU clip eval (STEP/LINEAR,
+nlerp). Carves live in rest space and ride bones structurally. No voxel
+data is touched at pose steps: pose cost is O(bones).
+
+- [x] Clip pipeline: glTF animation parse, 12 Hz pose eval, loop + speed + rest-pose toggle in the panel
+- [x] N-bone chunk articulation of the carveable brickmap (validated: rest pose exact; 80° arm droop clean incl. hands/armpits; heatmap sub-1)
+- [x] Squash & stretch via scale channels (min-scale Lipschitz correction)
+- [x] Rigid pristine eyes: marbles bound to nearest bone, radius fixed
+- [x] Auto-derived capsule shadow proxy from bones, posed per step (M3.5 leftover)
+- [x] Boiling reseed per pose step (was already keyed to poseTime)
+- [x] Pose quantization: 12 Hz skeleton, smooth camera
+- [ ] Carve routing while posed: world hit → rest frame of the owning piece(s) (edits currently land in rest coords; pause anim to sculpt precisely)
+- [ ] Shape keys: per-piece morph distance layers, mix() blending (Lipschitz-1), weights from animation channels
+- [ ] Perf pass: charDist is ~2-3× pre-articulation cost (cell-field fetches × 2 chunkWarp refinements); profile + trim before M6
 - [ ] Two fighters + arena in one traced scene at 60 fps, 1080p-class res on the dev Mac
+- Rig craft note: keep rest poses near the resting stance (warp does least where the player stares longest); set Inherit Scale consistently — the glTF exporter drops inherit-scale-off compensation tracks
 
 ## Milestone 5 — Gameplay core (parallel track — no GPU dependency, start anytime)
 

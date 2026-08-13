@@ -2,6 +2,16 @@
 // Arena is analytic; the character body lives in the sparse brickmap
 // (carveable). Eyes stay analytic rigid beads. Writes linear HDR.
 
+// Per-bone chunk (M4-P1): rest body ∩ rest capsule, posed by invSkin.
+struct Piece {
+  invSkin: mat4x4f, // world -> rest, rigid (posed inverse skin matrix)
+  skin: mat4x4f,    // rest -> world, for the round-trip consistency check
+  aabbLo: vec4f,    // rest-space tight bound of the piece's zero set
+  aabbHi: vec4f,
+  capA: vec4f,      // rest capsule end a, w = swollen radius
+  capB: vec4f,      // rest capsule end b
+}
+
 struct Uniforms {
   camPos: vec4f,    // xyz, w = fovY
   camRight: vec4f,  // xyz, w = aspect
@@ -19,6 +29,12 @@ struct Uniforms {
   mouse: vec4f,          // slot 13 (used by pick)
   marbles: array<vec4f, 16>, // 8 x {pos,radius},{color,-}
   marbleMeta: vec4f,     // x = count
+  capsMeta: vec4f,       // x = capsule count, y = bounding radius
+  capsCenter: vec4f,     // xyz = bounding center (posed)
+  capsules: array<vec4f, 32>, // 16 x {a,radius},{b,-}, posed per 12 Hz step
+  boneMeta: vec4f,       // x = piece count, y = smin k, z = box margin,
+                         // w = posed body bound radius
+  pieces: array<Piece, 16>,
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var hdrOut: texture_storage_2d<rgba16float, write>;
@@ -118,17 +134,38 @@ fn calcAO(p: vec3f, n: vec3f) -> f32 {
   return clamp(1.0 - u.ambient.w * 1.6 * occ, 0.0, 1.0);
 }
 
+// Smooth character occluder proxy: imported characters use bone capsules
+// (fitted at import, posed rigidly per 12 Hz step); the analytic blob
+// remains the fallback. smin-joined so the penumbra term sees no creases.
+fn charProxy(p: vec3f) -> f32 {
+  let n = i32(u.capsMeta.x);
+  if (n == 0) {
+    return charBodyAnalytic(p);
+  }
+  let bound = length(p - u.capsCenter.xyz) - u.capsMeta.y;
+  if (bound > 0.3) {
+    return bound;
+  }
+  var d = 1e9;
+  for (var i = 0; i < n; i++) {
+    let ca = u.capsules[i * 2];
+    let cb = u.capsules[i * 2 + 1];
+    d = smin(d, sdCapsule(p, ca.xyz, cb.xyz, ca.w), 0.05);
+  }
+  return d;
+}
+
 // Shadow STEPS need the conservative field (an overestimate tunnels through
 // the surface) but the PENUMBRA term needs the smooth one — the crease-y
 // seed-based estimates paint organic swirls across every lit surface.
-// Penumbra scene. The character occluder is max(analytic proxy, real field):
+// Penumbra scene. The character occluder is max(smooth proxy, real field):
 // the max opens carved cavities to light (real field says air where the
 // proxy still says clay — without this every crater renders as an unlit
-// void, reading as hollow) while the smooth analytic floors the field's
+// void, reading as hollow) while the smooth proxy floors the field's
 // downward errors, which are what band under a penumbra term.
 fn mapPenumbra(p: vec3f) -> f32 {
   var d = min(arenaFloor(p), arenaWall(p));
-  d = min(d, max(charBodyAnalytic(p), charDistLoose(p)));
+  d = min(d, max(charProxy(p), charDistLoose(p)));
   d = min(d, marblesDist(p));
   return d;
 }

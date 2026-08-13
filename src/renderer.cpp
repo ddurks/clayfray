@@ -1,11 +1,13 @@
 #include "renderer.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <dirent.h>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <sys/stat.h>
 #include <vector>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -50,18 +52,18 @@ std::string loadShader(const char* name) {
 
 // Newest mtime across the shader directory; drives hot reload.
 long shaderDirStamp() {
+    namespace fs = std::filesystem;
     long newest = 0;
-    DIR* dir = opendir(CLAYFRAY_SHADER_DIR);
-    if (!dir) return 0;
-    while (dirent* e = readdir(dir)) {
-        std::string n = e->d_name;
-        if (n.size() < 5 || n.substr(n.size() - 5) != ".wgsl") continue;
-        struct stat st{};
-        if (stat(shaderPath(n.c_str()).c_str(), &st) == 0 && (long)st.st_mtime > newest) {
-            newest = (long)st.st_mtime;
-        }
+    std::error_code ec;
+    for (const fs::directory_entry& e : fs::directory_iterator(CLAYFRAY_SHADER_DIR, ec)) {
+        if (e.path().extension() != ".wgsl") continue;
+        auto t = fs::last_write_time(e.path(), ec);
+        if (ec) continue;
+        long secs = (long)std::chrono::duration_cast<std::chrono::seconds>(
+                        t.time_since_epoch())
+                        .count();
+        if (secs > newest) newest = secs;
     }
-    closedir(dir);
     return newest;
 }
 
@@ -249,7 +251,7 @@ void Renderer::buildBindGroups() {
         traceBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        wgpu::BindGroupEntry entries[5] = {};
+        wgpu::BindGroupEntry entries[7] = {};
         entries[0].binding = 0;
         entries[0].buffer = brick_.indirection;
         entries[1].binding = 1;
@@ -260,9 +262,11 @@ void Renderer::buildBindGroups() {
         entries[3].buffer = brick_.seeds;
         entries[4].binding = 4;
         entries[4].buffer = brick_.coarse;
+        entries[5].binding = 6;
+        entries[5].buffer = brick_.cellWeights;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = tracePipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 5;
+        desc.entryCount = 6;
         desc.entries = entries;
         traceBrickBind_ = dev.CreateBindGroup(&desc);
     }
@@ -279,18 +283,20 @@ void Renderer::buildBindGroups() {
         pickBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        // pick's charDist touches indirection + dist + seeds; auto layout
-        // excludes the unused albedo binding
-        wgpu::BindGroupEntry entries[3] = {};
+        // pick's charDist touches indirection + dist + seeds + weights; auto
+        // layout excludes the unused albedo/coarse bindings
+        wgpu::BindGroupEntry entries[5] = {};
         entries[0].binding = 0;
         entries[0].buffer = brick_.indirection;
         entries[1].binding = 1;
         entries[1].buffer = brick_.distPool;
         entries[2].binding = 3;
         entries[2].buffer = brick_.seeds;
+        entries[3].binding = 6;
+        entries[3].buffer = brick_.cellWeights;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = pickPipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 3;
+        desc.entryCount = 4;
         desc.entries = entries;
         pickBrickBind_ = dev.CreateBindGroup(&desc);
     }
@@ -363,11 +369,133 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
         const MarbleProp& m = marbles_[i];
         float* slotA = out[14 + i * 2];
         float* slotB = out[15 + i * 2];
-        slotA[0] = m.pos[0]; slotA[1] = m.pos[1]; slotA[2] = m.pos[2];
+        float pos[3] = {m.pos[0], m.pos[1], m.pos[2]};
+        // props ride their bone rigidly; radius stays fixed (glass beads
+        // don't breathe with torso scale)
+        if (m.bone >= 0 && (size_t)(m.bone * 16 + 16) <= skinMats_.size()) {
+            matTransformPoint(&skinMats_[m.bone * 16], m.pos, pos);
+        }
+        slotA[0] = pos[0]; slotA[1] = pos[1]; slotA[2] = pos[2];
         slotA[3] = m.radius;
         slotB[0] = m.color[0]; slotB[1] = m.color[1]; slotB[2] = m.color[2];
     }
     out[30][0] = (float)n;
+
+    // posed capsule shadow proxy (empty for the analytic fallback character)
+    int cn = std::min((int)capsules_.size(), 16);
+    float center[3] = {0.f, 0.f, 0.f};
+    for (int i = 0; i < cn; i++) {
+        const BoneCapsule& c = capsules_[i];
+        float a[3] = {c.a[0], c.a[1], c.a[2]};
+        float b[3] = {c.b[0], c.b[1], c.b[2]};
+        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
+            matTransformPoint(&skinMats_[c.bone * 16], c.a, a);
+            matTransformPoint(&skinMats_[c.bone * 16], c.b, b);
+        }
+        float* slotA = out[33 + i * 2];
+        float* slotB = out[34 + i * 2];
+        slotA[0] = a[0]; slotA[1] = a[1]; slotA[2] = a[2]; slotA[3] = c.r;
+        slotB[0] = b[0]; slotB[1] = b[1]; slotB[2] = b[2];
+        for (int k = 0; k < 3; k++) center[k] += (a[k] + b[k]) * 0.5f;
+    }
+    if (cn > 0) {
+        for (int k = 0; k < 3; k++) center[k] /= (float)cn;
+        float radius = 0.f;
+        for (int i = 0; i < cn; i++) {
+            for (int e = 0; e < 2; e++) {
+                const float* p = out[33 + i * 2 + e];
+                float dx = p[0] - center[0], dy = p[1] - center[1], dz = p[2] - center[2];
+                radius = std::max(radius, std::sqrt(dx * dx + dy * dy + dz * dz) +
+                                              out[33 + i * 2][3]);
+            }
+        }
+        out[31][1] = radius + 0.05f;
+        out[32][0] = center[0]; out[32][1] = center[1]; out[32][2] = center[2];
+    }
+    out[31][0] = (float)cn;
+
+    // M4-P1 chunks: the traced body = smin-union over pieces of
+    // max(restField(invSkin * p), restCapsule(invSkin * p)). Rigid warps
+    // preserve the distance metric; max/min/smin keep Lipschitz <= 1.
+    static const bool noPieces = std::getenv("CLAYFRAY_NO_PIECES") != nullptr;
+    int pn = noPieces ? 0 : cn;
+    float bodyBoundR = 0.f;
+    for (int i = 0; i < pn; i++) {
+        const BoneCapsule& c = capsules_[i];
+        float inv[16];
+        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
+            matInvAffine(&skinMats_[c.bone * 16], inv);
+        } else {
+            matIdentity(inv);
+        }
+        float* base = out[66 + i * 12];
+        std::memcpy(base, inv, 16 * sizeof(float)); // 4 slots: column-major mat4
+        // forward skin matrix: the trace warp round-trips its blended rest
+        // sample through the forward blend and rejects inconsistent samples
+        // (vacated-space ghosts)
+        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
+            std::memcpy(out[66 + i * 12 + 4], &skinMats_[c.bone * 16],
+                        16 * sizeof(float));
+        } else {
+            float ident[16];
+            matIdentity(ident);
+            std::memcpy(out[66 + i * 12 + 4], ident, 16 * sizeof(float));
+        }
+        float* lo = out[66 + i * 12 + 8];
+        float* hi = out[66 + i * 12 + 9];
+        float* ca = out[66 + i * 12 + 10];
+        float* cb = out[66 + i * 12 + 11];
+        // squash/stretch (bone scale channels) makes the warp non-rigid:
+        // rest distances overestimate world distances by up to the smallest
+        // scale factor. Store min column norm of the skin matrix; the shader
+        // multiplies sampled distances by it to restore Lipschitz <= 1.
+        float sMin = 1.f;
+        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
+            const float* sm = &skinMats_[c.bone * 16];
+            sMin = 1e9f;
+            for (int col = 0; col < 3; col++) {
+                float len = std::sqrt(sm[col * 4] * sm[col * 4] +
+                                      sm[col * 4 + 1] * sm[col * 4 + 1] +
+                                      sm[col * 4 + 2] * sm[col * 4 + 2]);
+                sMin = std::min(sMin, len);
+            }
+            sMin = std::min(std::max(sMin, 0.25f), 1.f); // never inflate steps
+        }
+        lo[3] = sMin;
+        lo[0] = c.lo[0]; lo[1] = c.lo[1]; lo[2] = c.lo[2];
+        hi[0] = c.hi[0]; hi[1] = c.hi[1]; hi[2] = c.hi[2];
+        ca[0] = c.a[0]; ca[1] = c.a[1]; ca[2] = c.a[2]; ca[3] = c.rPiece;
+        cb[0] = c.b[0]; cb[1] = c.b[1]; cb[2] = c.b[2];
+        cb[3] = (float)c.bone; // weight-ownership gate compares joint ids
+        // posed far bound: piece content stays within rPiece + box diagonal
+        // slack of its posed capsule endpoints
+        const float* pa = out[33 + i * 2];
+        const float* pb = out[34 + i * 2];
+        for (int e = 0; e < 2; e++) {
+            const float* p = e ? pb : pa;
+            float dx = p[0] - center[0], dy = p[1] - center[1], dz = p[2] - center[2];
+            bodyBoundR = std::max(bodyBoundR,
+                                  std::sqrt(dx * dx + dy * dy + dz * dz) + c.rPiece);
+        }
+    }
+    out[65][0] = (float)pn;
+    // joint smin k: with exclusive dominance regions (no double-render) the
+    // blend only bridges hairline handoff cracks; ~3 voxels seals them
+    // without re-introducing ring bulges.
+    out[65][1] = 0.008f;
+    out[65][2] = 0.06f; // box test margin: sample within, bound outside
+    out[65][3] = bodyBoundR + 0.05f;
+}
+
+void Renderer::setCharacter(CharacterAsset asset) {
+    if (!asset.marbles.empty()) marbles_ = asset.marbles;
+    bones_ = asset.bones;
+    clips_ = asset.clips;
+    capsules_ = deriveCapsules(asset);
+    evalPose(bones_, nullptr, 0.f, skinMats_); // identity: rest pose
+    std::printf("anim: %zu bones, %zu clip(s), %zu shadow capsules\n", bones_.size(),
+                clips_.size(), capsules_.size());
+    brick_.requestImport(std::move(asset));
 }
 
 void Renderer::encodePick(wgpu::CommandEncoder& enc) {
@@ -403,6 +531,17 @@ void Renderer::pollPick() {
 void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                       const FrameInfo& frame, wgpu::TextureView swapchainView,
                       const std::function<void(wgpu::RenderPassEncoder&)>& uiCallback) {
+    // pose the skeleton at the quantized clock; paused = rest pose
+    if (!bones_.empty()) {
+        const AnimClip* clip =
+            (look.animPlay && !clips_.empty() && clips_[0].duration > 0.f) ? &clips_[0]
+                                                                           : nullptr;
+        if (clip) {
+            animT_ = std::fmod(frame.poseTime * look.animSpeed, clip->duration);
+        }
+        evalPose(bones_, clip, animT_, skinMats_);
+    }
+
     float uniforms[kUniformSlots][4];
     packUniforms(cam, look, frame, uniforms);
     gpu_->queue.WriteBuffer(uniformBuf_, 0, uniforms, sizeof(uniforms));

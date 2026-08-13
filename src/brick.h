@@ -30,7 +30,13 @@ class BrickSystem {
     // Drops edits that would cross the volume boundary (a clipped blob
     // renders as corruption).
     void queueEdit(const BrickEdit& e);
-    void requestBake() { bakePending_ = true; }
+    // Rebuild the volume from its source. With an imported character the
+    // mesh buffers persist on the GPU, so re-run the import passes; the
+    // analytic bake would silently replace the fighter with the blob.
+    void requestBake() {
+        if (vxTris_) importPending_ = true;
+        else bakePending_ = true;
+    }
     bool hasPendingWork() const { return bakePending_ || !pending_.empty(); }
     // Encodes at most one op (bake or oldest queued edit) plus the JFA
     // refresh. Call once per frame before the trace pass.
@@ -38,6 +44,10 @@ class BrickSystem {
 
     wgpu::Buffer indirection, distPool, albedoPool;
     wgpu::Buffer weightPool; // per-voxel packed top-2 bone weights (M4 reads)
+    // per-cell nearest-surface bone weights, flood-filled volume-wide: the
+    // chunk warp needs weight guidance OUTSIDE the narrow band too (a rigid
+    // warp guess at a big joint angle lands far from the surface)
+    wgpu::Buffer cellWeights;
     wgpu::Buffer seeds;  // canonical JFA output (jfaA), read by tracer/pick
     wgpu::Buffer coarse; // per-cell signed coarse distance, read by tracer
 

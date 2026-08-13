@@ -5,13 +5,37 @@
 #include <cstring>
 #include <unordered_map>
 
+#include "anim.h"
+
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
 
 namespace {
 
-// bounding radius of a mesh's positions around its centroid-ish origin
-float meshBoundRadius(const cgltf_mesh* mesh, float scale) {
+// centroid and bounding radius of a mesh's positions. Marbles authored as
+// origin-centred spheres carry position in the node translation, but a
+// skinned/parented export bakes it into the vertices instead — reading the
+// centroid handles both, so a raw Blender UI export can't corrupt the eyes.
+void meshCentroidRadius(const cgltf_mesh* mesh, float scale, float outC[3],
+                        float& outR) {
+    double c[3] = {0, 0, 0};
+    size_t count = 0;
+    for (cgltf_size p = 0; p < mesh->primitives_count; p++) {
+        const cgltf_primitive& prim = mesh->primitives[p];
+        for (cgltf_size a = 0; a < prim.attributes_count; a++) {
+            if (prim.attributes[a].type != cgltf_attribute_type_position) continue;
+            const cgltf_accessor* acc = prim.attributes[a].data;
+            for (cgltf_size i = 0; i < acc->count; i++) {
+                float v[3];
+                cgltf_accessor_read_float(acc, i, v, 3);
+                c[0] += v[0]; c[1] += v[1]; c[2] += v[2];
+                count++;
+            }
+        }
+    }
+    if (count) {
+        c[0] /= (double)count; c[1] /= (double)count; c[2] /= (double)count;
+    }
     float r2 = 0.f;
     for (cgltf_size p = 0; p < mesh->primitives_count; p++) {
         const cgltf_primitive& prim = mesh->primitives[p];
@@ -21,12 +45,15 @@ float meshBoundRadius(const cgltf_mesh* mesh, float scale) {
             for (cgltf_size i = 0; i < acc->count; i++) {
                 float v[3];
                 cgltf_accessor_read_float(acc, i, v, 3);
-                float d2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+                float dx = v[0] - (float)c[0], dy = v[1] - (float)c[1],
+                      dz = v[2] - (float)c[2];
+                float d2 = dx * dx + dy * dy + dz * dz;
                 if (d2 > r2) r2 = d2;
             }
         }
     }
-    return std::sqrt(r2) * scale;
+    outC[0] = (float)c[0]; outC[1] = (float)c[1]; outC[2] = (float)c[2];
+    outR = std::sqrt(r2) * scale;
 }
 
 } // namespace
@@ -52,13 +79,21 @@ bool CharacterAsset::load(const std::string& path) {
         if (std::strncmp(name, "marble_", 7) == 0) {
             float world[16];
             cgltf_node_transform_world(node, world);
-            MarbleProp m{};
-            m.pos[0] = world[12];
-            m.pos[1] = world[13];
-            m.pos[2] = world[14];
             float scale = std::sqrt(world[0] * world[0] + world[1] * world[1] +
                                     world[2] * world[2]);
-            m.radius = meshBoundRadius(node->mesh, scale);
+            float centroid[3], radius;
+            meshCentroidRadius(node->mesh, scale, centroid, radius);
+            MarbleProp m{};
+            // node translation + rotated/scaled centroid: exact for the
+            // origin-centred authoring rule, and still correct when a
+            // skinned export bakes the position into the vertices
+            m.pos[0] = world[0] * centroid[0] + world[4] * centroid[1] +
+                       world[8] * centroid[2] + world[12];
+            m.pos[1] = world[1] * centroid[0] + world[5] * centroid[1] +
+                       world[9] * centroid[2] + world[13];
+            m.pos[2] = world[2] * centroid[0] + world[6] * centroid[1] +
+                       world[10] * centroid[2] + world[14];
+            m.radius = radius;
             m.color[0] = 0.8f; m.color[1] = 0.8f; m.color[2] = 0.8f;
             if (node->mesh->primitives_count > 0 &&
                 node->mesh->primitives[0].material &&
@@ -138,9 +173,9 @@ bool CharacterAsset::load(const std::string& path) {
         }
     }
 
+    std::unordered_map<const cgltf_node*, int> jointIndex;
     if (bodyNode->skin) {
         const cgltf_skin* skin = bodyNode->skin;
-        std::unordered_map<const cgltf_node*, int> jointIndex;
         for (cgltf_size j = 0; j < skin->joints_count; j++) {
             jointIndex[skin->joints[j]] = (int)j;
         }
@@ -149,9 +184,16 @@ bool CharacterAsset::load(const std::string& path) {
             AssetBone b;
             b.name = jn->name ? jn->name : "bone";
             b.parent = -1;
+            matIdentity(b.pre);
             if (jn->parent) {
                 auto it = jointIndex.find(jn->parent);
-                if (it != jointIndex.end()) b.parent = it->second;
+                if (it != jointIndex.end()) {
+                    b.parent = it->second;
+                } else {
+                    // non-joint ancestor chain (the Armature node): its world
+                    // transform pre-multiplies this root's animated local
+                    cgltf_node_transform_world(jn->parent, b.pre);
+                }
             }
             if (skin->inverse_bind_matrices) {
                 cgltf_accessor_read_float(skin->inverse_bind_matrices, j, b.invBind, 16);
@@ -164,6 +206,70 @@ bool CharacterAsset::load(const std::string& path) {
         }
     }
 
+    // animation clips: TRS channels targeting skin joints
+    for (cgltf_size a = 0; a < data->animations_count; a++) {
+        const cgltf_animation& an = data->animations[a];
+        AnimClip clip;
+        clip.name = an.name ? an.name : "clip";
+        for (cgltf_size ch = 0; ch < an.channels_count; ch++) {
+            const cgltf_animation_channel& channel = an.channels[ch];
+            if (!channel.target_node || !channel.sampler) continue;
+            auto it = jointIndex.find(channel.target_node);
+            if (it == jointIndex.end()) continue;
+            int path;
+            switch (channel.target_path) {
+            case cgltf_animation_path_type_translation: path = 0; break;
+            case cgltf_animation_path_type_rotation: path = 1; break;
+            case cgltf_animation_path_type_scale: path = 2; break;
+            default: continue; // morph weights: P3
+            }
+            const cgltf_animation_sampler* smp = channel.sampler;
+            const int comps = path == 1 ? 4 : 3;
+            const bool cubic =
+                smp->interpolation == cgltf_interpolation_type_cubic_spline;
+            AnimTrack tr;
+            tr.joint = it->second;
+            tr.path = path;
+            tr.interp = smp->interpolation == cgltf_interpolation_type_step ? 0 : 1;
+            tr.times.resize(smp->input->count);
+            for (cgltf_size k = 0; k < smp->input->count; k++) {
+                cgltf_accessor_read_float(smp->input, k, &tr.times[k], 1);
+            }
+            tr.values.resize(smp->input->count * comps);
+            for (cgltf_size k = 0; k < smp->input->count; k++) {
+                // cubic output is (in-tangent, value, out-tangent) triples;
+                // keep the value, sample linearly
+                cgltf_size src = cubic ? k * 3 + 1 : k;
+                float v[4];
+                cgltf_accessor_read_float(smp->output, src, v, comps);
+                std::memcpy(&tr.values[k * comps], v, comps * sizeof(float));
+            }
+            if (!tr.times.empty()) {
+                clip.duration = std::max(clip.duration, tr.times.back());
+                clip.tracks.push_back(std::move(tr));
+            }
+        }
+        if (!clip.tracks.empty()) clips.push_back(std::move(clip));
+    }
+
+    // marbles ride the nearest joint (rest-space origin distance)
+    if (!bones.empty()) {
+        for (MarbleProp& m : marbles) {
+            float best = 1e9f;
+            for (size_t j = 0; j < bones.size(); j++) {
+                float inv[16];
+                matInvAffine(bones[j].invBind, inv);
+                float dx = m.pos[0] - inv[12], dy = m.pos[1] - inv[13],
+                      dz = m.pos[2] - inv[14];
+                float d = dx * dx + dy * dy + dz * dz;
+                if (d < best) {
+                    best = d;
+                    m.bone = (int)j;
+                }
+            }
+        }
+    }
+
     float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
     for (uint32_t v = 0; v < vertexCount(); v++) {
         for (int a = 0; a < 3; a++) {
@@ -173,6 +279,16 @@ bool CharacterAsset::load(const std::string& path) {
     }
     std::printf("asset: %s -> %u verts, %u tris, %zu bones, %zu marbles\n", path.c_str(),
                 vertexCount(), triangleCount(), bones.size(), marbles.size());
+    for (const AnimClip& c : clips) {
+        std::printf("asset: clip '%s' %.2fs, %zu tracks\n", c.name.c_str(), c.duration,
+                    c.tracks.size());
+    }
+    for (const MarbleProp& m : marbles) {
+        if (m.bone >= 0) {
+            std::printf("asset: marble @(%.3f %.3f %.3f) -> bone '%s'\n", m.pos[0],
+                        m.pos[1], m.pos[2], bones[m.bone].name.c_str());
+        }
+    }
     std::printf("asset: body aabb (%.3f %.3f %.3f)..(%.3f %.3f %.3f)\n", lo[0], lo[1],
                 lo[2], hi[0], hi[1], hi[2]);
     cgltf_free(data);

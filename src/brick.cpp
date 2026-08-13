@@ -57,6 +57,9 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
     distPool = makeStorage(dev, kMaxBricks * 256ull * 4ull, "brick dist pool");
     albedoPool = makeStorage(dev, kMaxBricks * 512ull * 4ull, "brick albedo pool");
     weightPool = makeStorage(dev, kMaxBricks * 512ull * 4ull, "brick weight pool");
+    // created once at full size: import fills it in place, so bind groups
+    // built against it never go stale. 2 words per cell: 4 joints + 4 weights.
+    cellWeights = makeStorage(dev, cells * 8ull, "cell weights");
     counters_ = makeStorage(dev, 16, "brick counters");
     freelist_ = makeStorage(dev, kMaxBricks * 4ull, "brick freelist");
     jfaA_ = makeStorage(dev, cells * 4ull, "jfa A");
@@ -414,11 +417,92 @@ void BrickSystem::requestImport(CharacterAsset asset) {
         posNrm[v * 6 + 5] = nz / len;
     }
 
+    // per-cell 4-slot bone weights (joints word + weights word per cell):
+    // the trace-side warp blends up to four bones per region, which is what
+    // hand-scale junctions need. Source: distance-weighted gather over the
+    // cell's binned vertices (denoised vs nearest-vertex), flood-filled so
+    // the warp is defined volume-wide.
+    std::vector<uint32_t> cellW(cells * 2, 0);
+    {
+        std::vector<int> queue;
+        queue.reserve(cells);
+        std::vector<float> acc(256);
+        for (uint32_t ci = 0; ci < cells; ci++) {
+            uint32_t lo = offsets[ci], hi = offsets[ci + 1];
+            if (lo == hi) continue;
+            float cx = kOrigin[0] + ((ci % kGrid) + 0.5f) * kSpan;
+            float cy = kOrigin[1] + (((ci / kGrid) % kGrid) + 0.5f) * kSpan;
+            float cz = kOrigin[2] + ((ci / (kGrid * kGrid)) + 0.5f) * kSpan;
+            std::fill(acc.begin(), acc.end(), 0.f);
+            for (uint32_t k = lo; k < hi; k++) {
+                uint32_t t = ids[k];
+                for (int e = 0; e < 3; e++) {
+                    uint32_t v = asset.indices[t * 3 + e];
+                    const float* pv = &asset.positions[v * 3];
+                    float dx = pv[0] - cx, dy = pv[1] - cy, dz = pv[2] - cz;
+                    float kern = 1.f / (dx * dx + dy * dy + dz * dz +
+                                        kSpan * kSpan * 0.25f);
+                    for (int sl = 0; sl < 4; sl++) {
+                        uint32_t j = std::min<uint32_t>(asset.joints[v * 4 + sl], 255u);
+                        acc[j] += asset.weights[v * 4 + sl] * kern;
+                    }
+                }
+            }
+            // top-4, renormalized to sum 255
+            int top[4] = {-1, -1, -1, -1};
+            for (int j = 0; j < 256; j++) {
+                if (acc[j] <= 0.f) continue;
+                for (int r = 0; r < 4; r++) {
+                    if (top[r] < 0 || acc[j] > acc[top[r]]) {
+                        for (int m = 3; m > r; m--) top[m] = top[m - 1];
+                        top[r] = j;
+                        break;
+                    }
+                }
+            }
+            if (top[0] < 0) continue;
+            float total = 0.f;
+            for (int r = 0; r < 4; r++) {
+                if (top[r] >= 0) total += acc[top[r]];
+            }
+            uint32_t jw = 0, ww = 0;
+            for (int r = 0; r < 4; r++) {
+                if (top[r] < 0) break;
+                uint32_t w8 = (uint32_t)std::lround(acc[top[r]] / total * 255.f);
+                if (r == 0) w8 = std::max(w8, 1u); // dominant never rounds to 0
+                jw |= (uint32_t)top[r] << (r * 8);
+                ww |= w8 << (r * 8);
+            }
+            cellW[ci * 2] = jw;
+            cellW[ci * 2 + 1] = ww;
+            queue.push_back((int)ci);
+        }
+        for (size_t head = 0; head < queue.size(); head++) {
+            int ci = queue[head];
+            int x = ci % kGrid, y = (ci / kGrid) % kGrid, z = ci / (kGrid * kGrid);
+            const int nb[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                  {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+            for (auto& o : nb) {
+                int nx = x + o[0], ny = y + o[1], nz = z + o[2];
+                if (nx < 0 || ny < 0 || nz < 0 || nx >= kGrid || ny >= kGrid ||
+                    nz >= kGrid)
+                    continue;
+                int ni = nx + ny * kGrid + nz * kGrid * kGrid;
+                if (cellW[ni * 2 + 1] == 0) {
+                    cellW[ni * 2] = cellW[ci * 2];
+                    cellW[ni * 2 + 1] = cellW[ci * 2 + 1];
+                    queue.push_back(ni);
+                }
+            }
+        }
+    }
+
     auto upload = [&](const void* data, uint64_t bytes, const char* label) {
         wgpu::Buffer buf = makeStorage(dev, std::max<uint64_t>(bytes, 4), label);
         if (bytes) gpu_->queue.WriteBuffer(buf, 0, data, bytes);
         return buf;
     };
+    gpu_->queue.WriteBuffer(cellWeights, 0, cellW.data(), cellW.size() * 4);
     vxPos_ = upload(posNrm.data(), posNrm.size() * 4, "mesh pos+normal");
     vxIdx_ = upload(asset.indices.data(), asset.indices.size() * 4, "mesh idx");
     vxCol_ = upload(asset.colors.data(), asset.colors.size() * 4, "mesh col");

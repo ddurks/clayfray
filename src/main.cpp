@@ -115,6 +115,7 @@ int runHeadless(const std::string& outPath, int width, int height, int frames,
         look.shadowSoft = 32.f;
     }
     if (std::getenv("CLAYFRAY_DEBUG_NORMALS")) look.debugMode = 1.f;
+    if (std::getenv("CLAYFRAY_NO_ANIM")) look.animPlay = false;
     if (std::getenv("CLAYFRAY_DEBUG_FLATALBEDO")) look.debugMode = 2.f;
     if (std::getenv("CLAYFRAY_DEBUG_GRAD")) look.debugMode = 3.f;
     if (const char* k = std::getenv("CLAYFRAY_SHADOWK")) look.shadowSoft = (float)atof(k);

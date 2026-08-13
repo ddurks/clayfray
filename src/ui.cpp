@@ -48,6 +48,11 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
         ImGui::ColorEdit3("clay color", brush.color);
     }
 
+    if (ImGui::CollapsingHeader("animation", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("play clip (off = rest pose)", &look.animPlay);
+        ImGui::SliderFloat("speed", &look.animSpeed, 0.f, 2.f);
+    }
+
     if (ImGui::CollapsingHeader("key light", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::DragFloat3("position", look.keyPos, 0.05f, -6.f, 6.f);
         ImGui::SliderFloat("intensity", &look.keyIntensity, 0.f, 20.f);

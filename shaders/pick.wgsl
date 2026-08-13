@@ -3,6 +3,16 @@
 
 //#include scene_common.wgsl
 
+// mirror of trace.wgsl's layout (shared uniform buffer + brick_read include)
+struct Piece {
+  invSkin: mat4x4f,
+  skin: mat4x4f,    // forward, for the round-trip consistency check
+  aabbLo: vec4f,
+  aabbHi: vec4f,
+  capA: vec4f,
+  capB: vec4f,
+}
+
 struct Uniforms {
   camPos: vec4f,
   camRight: vec4f,
@@ -20,6 +30,11 @@ struct Uniforms {
   mouse: vec4f, // xy = uv of cursor
   marbles: array<vec4f, 16>,
   marbleMeta: vec4f,
+  capsMeta: vec4f,
+  capsCenter: vec4f,
+  capsules: array<vec4f, 32>,
+  boneMeta: vec4f,
+  pieces: array<Piece, 16>,
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read_write> pickOut: array<vec4f>;
