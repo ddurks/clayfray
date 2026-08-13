@@ -23,6 +23,7 @@ Art direction: *The Trap Door* (1984) — see [`reference/ART_DIRECTION.md`](ref
 | Eyes are marbles | Eyes are rigid glass props, never clay: no carve, no boil, no detail normals, hard glint (all true in the renderer today). When dislodged they're RIGID BODIES — sphere-vs-arena, they roll and bounce; never MPM particles | "They should behave like little marbles for effect." Also the stop-motion truth: real claymation eyes are glass beads pressed into plasticine |
 | Platform reach | macOS now; Windows/Linux next; **mobile is a declared target** | Dawn runs Metal-on-iOS and Vulkan-on-Android, SDL3 covers both; the tracer's cost scales with traced pixels, so the resolution-scale lever + M3 query diet are the path. Phone-class GPUs ran Claybook-likes; feasible if we stay disciplined |
 | Content pipeline | Blender → glTF → import into the engine (mesh + armature + clips) | Generalize beyond the hand-authored blob: voxelize any mesh into the brickmap, drive it with any armature. See "Blender pipeline" under M4 |
+| Gameplay shape (2026-08-13) | Third-person over-the-shoulder duel; **1 s simultaneous-commit ticks** (both pick Move/Block/Slice hidden, resolve together — it's about *predicting* the opponent); **slice = mouse-drag → sword swing**, arc clamped to arm reach | Turn-by-turn-ish cadence makes it a mind-game, not an execution test. The drag-authored swing *is* the swept-blade the locked sever design already wanted. Simultaneous commit keeps deterministic replay/netcode. See M4.7 (enabling IK) + revised M5 |
 
 Dependencies (vendored, full list): SDL3, Dawn, GLM, Dear ImGui, Tracy, stb, miniaudio.
 No physics engine — chunk-vs-floor collision is small enough to write ourselves.
@@ -237,22 +238,81 @@ Architecture: measure → ledger → gobs → deposit.
   aabb — the old set was authored for the taller analytic blob and carved
   air, which the ledger immediately exposed (measured 0 ml).
 
-## Milestone 5 — Gameplay core (parallel track — no GPU dependency, start anytime)
+## Milestone 4.7 — IK arm rig + sword prop (NEW — enabling tech for M5)
 
-*Goal: a playable-if-ugly fighter with capsule debug rendering.*
+*Goal: the fighter holds a sword and the arms follow it via IK. No gameplay
+logic yet — this is the rig the dueling core drives.*
 
-- [ ] Deterministic fixed 60 Hz tick, input ring buffer, 2 gamepads (or keyboard split)
-- [ ] Character state machine: idle / walk / jab / heavy / slice special / hitstun / knockdown
-- [ ] Capsule hitbox/hurtbox overlap tests, attack frame data on the 12 Hz grid
-- [ ] Per-bone damage state: mass notches (0–7, blunt hits shrink capsule radius) and length notches (full/stub/gone) — integers only
-- [ ] Sever ruling: CPU capsule-vs-swept-blade test, cut point quantized to notch boundaries; severed bone + children leave the hurtbox set
-- [ ] Damage consequences wired into movement/attacks: lighter = faster but weaker; severed arm disables that side's moves
-- [ ] Debug view: capsules + frame-data timeline in ImGui
-- [ ] Replay recording from input stream (doubles as determinism test)
+The control scheme inverts today's flow: clips pose the arms (FK) and LBS
+renders the SDF around them; here the SWORD is master (driven by the swing or
+a hold pose) and the arms follow to grip it. IK is just another pose source
+writing into the same `skinMats_` the chunk articulation already reads.
 
-## Milestone 6 — Impacts and slicing
+- [ ] 2-bone analytic IK per arm (shoulder→elbow→wrist): law-of-cosines elbow
+  angle + aim-at-target, pole/hint vector for elbow direction. Outputs local
+  bone rotations into `skinMats_`; the existing M4 LBS chunks render the posed
+  arms with no new SDF path
+- [ ] Grip-target data model: each hand holds an optional {prop, local grip
+  point, hand orientation}; a prop carries 1 OR 2 grips. Two-handed sword =
+  one prop / two grips; dual-wield later = two props / one grip each — the IK
+  code is identical either way (flexibility the user asked to preserve)
+- [ ] Sword as a rigid emissive prop (reuse the marble precedent: rigid,
+  non-clay, no carve/boil/detail). Debug form = a glowing "lightsaber" line/
+  capsule SDF hilt→tip, added to the tracer like a marble. Model swap later
+- [ ] Reachable envelope: clamp the sword transform so both grips stay within
+  arm reach → IK always solves, every pose reads as a real hold/swing. Torso
+  lean for out-of-reach deferred
+- [ ] IK layered over FK: arms driven by IK to the grips, torso/legs/head by
+  clips or the M5 state machine; blend so a slice can hand arm control to IK
+  for the swing and back
+- [ ] Debug harness: drag the sword transform in the panel, confirm both hands
+  stay glued and arms read naturally; |∇d| heatmap stays green (posed SDF
+  valid); wrist twist must not exceed the forearm chunk's warp range (M3.5
+  thin-limb caveat)
 
-*Goal: hits leave marks; the sword means something.*
+## Milestone 5 — Dueling core (REVISED — was "Gameplay core")
+
+*Goal: two fighters, 1 s predictive ticks, sword slicing. Playable-if-rough,
+capsule-debug visuals. Parallel track, but now gated on M4.7 for the sword.*
+
+Locked control scheme (2026-08-13, see top table): third-person
+over-the-shoulder; **1 s decision tick = 60 sim ticks = 12 pose steps**;
+**simultaneous commit** (both pick hidden, resolve together); three actions.
+
+- [ ] Deterministic 60 Hz core + 1 s commit cadence; one action committed per
+  tick, both revealed at tick start (replay/netcode-friendly by construction)
+- [ ] Three actions: MOVE (fixed step, auto-facing the opponent — toward/away/
+  around a dueling ring), BLOCK (raise sword to a guard arc via M4.7 IK;
+  negates slices whose swept arc crosses it), SLICE (mouse-drag → swing)
+- [ ] Slice authoring: capture the screen-space drag, project to a swing arc
+  CLAMPED to the arm-reach envelope (M4.7), sample on the 12 Hz grid; the
+  sword sweeps that arc over the tick
+- [ ] Swept-blade sever (PULLED FORWARD from M6 — it's the core verb now): CPU
+  capsule-vs-swept-blade test against where the opponent ACTUALLY moved this
+  tick → deterministic ruling, notch-quantized; bigger-than-fist = gameplay
+  tier (per the locked sever decision)
+- [ ] Block resolution: guard arc vs incoming swept blade → full/partial
+  negation; chip/stagger tuned in playtest
+- [ ] Simultaneous resolution: both actions animate on the 60 Hz core; a slice
+  tests against the opponent's tick-end capsule path (did they step into it?
+  did they block the arc you chose?) — this IS the mind-game
+- [ ] Per-bone damage state (unchanged from the original M5): mass notches
+  (0–7, blunt shrinks capsule radius) + length notches (full/stub/gone),
+  integers only; severed bone + children leave the hurtbox set
+- [ ] Damage consequences: lighter = faster but weaker; severed arm disables
+  that side's moves (and, with M4.7, that hand's grip → sword drops / one-hand)
+- [ ] Over-the-shoulder camera behind your fighter, opponent framed ahead;
+  drag maps onto the opponent's silhouette. (Supersedes M8's "fixed tabletop
+  camera" for PLAY; tabletop may return for intros/replays)
+- [ ] Capsule + frame-data debug view (ImGui) + replay recording from the
+  input stream (doubles as the determinism test)
+
+## Milestone 6 — Impacts and slicing (visuals)
+
+*Goal: hits leave marks; the sword means something.* NOTE: the gameplay-tier
+swept-blade **sever ruling moved to M5** (it's the core verb). M6 is now the
+VISUAL layer that conforms to M5's rulings — dents, contamination, the CSG
+cut, cosmetic-tier slices, chunk labeling.
 
 - [ ] Wire tick events → GPU edit queue (dent field edits from hit events, scaled by move weight)
 - [ ] Visual dents conform to mass notches: field edit depth driven by the notch change, so silhouette tracks hitbox
@@ -306,6 +366,12 @@ Architecture: measure → ledger → gobs → deposit.
 
 ## Order of play
 
-M0 → M1 (gate) → M2 → M3 → M4 (research) → M6 → M7 → M8, with M5 (gameplay core)
-running as a parallel track from day one. Nothing after M1 is worth building if the
-gate render doesn't look like the show.
+M0 → M1 (gate) → M2 → M3 → M4 (research) → **M4.6 (done)** → **M4.7 (IK, next)**
+→ **M5 (dueling core)** → M6 (impact visuals) → M7 → M8. The gameplay design
+(2026-08-13) makes M4.7 the enabling step for M5, and pulls the gameplay sever
+from M6 into M5. M5 no longer "starts anytime" — it needs the M4.7 sword rig.
+Nothing after M1 is worth building if the gate render doesn't look like the show.
+
+Also still open before layering gameplay: M4 leftovers (carve-while-posed,
+shape keys), M4.6 leftovers (scoop landed clay, wall sticking), and the deeper
+`charDist` perf pass — none block M4.7/M5, revisit as needed.
