@@ -26,8 +26,12 @@ struct ArmIkChain {
     int shoulder = -1, elbow = -1, wrist = -1;
     std::vector<int> upperSubtree; // shoulder + all descendants
     std::vector<int> lowerSubtree; // elbow + all descendants
-    float target[3] = {0, 0, 0};   // world grip position
+    float target[3] = {0, 0, 0};   // world grip position (where the PALM sits)
     float pole[3] = {0, -0.5f, -1.f}; // world-ish elbow-bend hint (fallback)
+    // wrist-to-palm reach: the hand mesh extends past the wrist joint, so the
+    // wrist is aimed short of the grip by this much (along shoulder->grip) to
+    // land the palm on the grip instead of the wrist. Rest hand->fingertips.
+    float handLen = 0.f;
 };
 void applyArmIk(const std::vector<AssetBone>& bones,
                 const std::vector<ArmIkChain>& chains, std::vector<float>& skinMats);

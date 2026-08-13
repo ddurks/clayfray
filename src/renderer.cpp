@@ -578,6 +578,11 @@ void Renderer::setCharacter(CharacterAsset asset) {
             for (int c : kids[b]) st.push_back(c);
         }
     };
+    auto restOrigin = [&](int b, float* o) {
+        float inv[16];
+        matInvAffine(bones_[b].invBind, inv);
+        o[0] = inv[12]; o[1] = inv[13]; o[2] = inv[14];
+    };
     for (const char* side : {"l", "r"}) {
         int sh = findBone(std::string("humerus.") + side);
         int el = findBone(std::string("radius.") + side);
@@ -588,6 +593,16 @@ void Renderer::setCharacter(CharacterAsset asset) {
         subtree(sh, c.upperSubtree);
         subtree(el, c.lowerSubtree);
         c.pole[0] = 0.f; c.pole[1] = -0.5f; c.pole[2] = -1.f; // elbows bend down/back
+        // palm offset: wrist -> fingertips rest length (grip sits mid-mitt, so
+        // ~70% of it). Falls back to 0 (wrist on grip) if no fingertip bone.
+        int ft = findBone(std::string("fingertips.") + side);
+        if (ft >= 0) {
+            float w[3], f[3];
+            restOrigin(wr, w);
+            restOrigin(ft, f);
+            float dx = f[0] - w[0], dy = f[1] - w[1], dz = f[2] - w[2];
+            c.handLen = 0.7f * std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
         armIk_.push_back(c);
     }
     std::printf("anim: %zu bones, %zu clip(s), %zu shadow capsules, %zu IK arm(s)\n",

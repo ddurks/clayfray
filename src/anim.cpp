@@ -309,12 +309,15 @@ void applyArmIk(const std::vector<AssetBone>& bones,
         float L1 = v3len(SE), L2 = v3len(EW);
         if (L1 < 1e-5f || L2 < 1e-5f) continue;
 
-        // target, clamped to the reachable annulus (arc-clamped-to-reach)
+        // target, clamped to the reachable annulus (arc-clamped-to-reach).
+        // aim the WRIST short of the grip by handLen along shoulder->grip so
+        // the hand (which extends past the wrist) lands its palm on the grip.
         float toT[3];
         v3sub(ch.target, S, toT);
         float d = v3len(toT);
         float dir[3] = {0, -1, 0};
         if (d > 1e-6f) { dir[0] = toT[0] / d; dir[1] = toT[1] / d; dir[2] = toT[2] / d; }
+        d = std::max(d - ch.handLen, 0.05f);
         float dmax = L1 + L2 - 0.005f, dmin = std::fabs(L1 - L2) + 0.005f;
         float dc = std::min(std::max(d, dmin), dmax);
 
