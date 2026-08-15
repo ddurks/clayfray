@@ -142,6 +142,15 @@ struct LookParams {
     // blit upscales. Chunky low-res + grain reads very stop-motion, and
     // traced pixels are the whole frame cost.
     float resScale = 0.5f; // user-approved default: chunky + fast
+    // FIXED trace resolution, overriding resScale when both are > 0. Frame
+    // cost is per TRACED PIXEL, so a resScale-derived size makes two machines
+    // incomparable the moment their windows or backing scales differ — and
+    // "same window size" is not the same thing as "same traced pixels" on a
+    // display that reports backing pixels. Pin this and the number means the
+    // same thing everywhere. `--res WxH` sets it; the startup [res] line
+    // always prints what is actually being traced, so a mismatch is visible
+    // instead of inferred.
+    int traceW = 0, traceH = 0; // 0,0 = derive from the window via resScale
 
     // M4-P0 animation: play the asset's first clip, looped, sampled on the
     // 12 Hz pose grid. Off = rest pose. (Drives marbles + shadow proxy; the

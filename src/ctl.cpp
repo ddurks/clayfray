@@ -156,6 +156,8 @@ void CtlServer::buildRegistry() {
     }
     if (refs_.brush) {
         addI("brush.mode", &refs_.brush->mode);
+        addI("look.traceW", &l->traceW);
+        addI("look.traceH", &l->traceH);
         addF("brush.radius", &refs_.brush->radius);
         addF("brush.color", refs_.brush->color, 3);
     }
