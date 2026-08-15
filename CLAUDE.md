@@ -85,9 +85,26 @@ Iteration rules of thumb:
   they are meaningless once frame reuse is on, and they misreport small
   dispatches. Always burn a warm-up run first — a shader edit forces a cold
   pipeline compile on the next launch only, and differencing against that
-  yields negative ms/frame. `CLAYFRAY_NO_REUSE=1` gives the MOVING cost (what
-  governs frame rate whenever anything is in motion); without it you get the
-  idle cost.
+  yields negative ms/frame. The subtler form BURNED A SESSION: when you
+  difference a short run against a long one, the compile lands in the SHORT
+  run, shrinks the difference, and reports ~13 ms/frame too FAST — a plausible
+  looking win, not an obvious error. It fires only for a shader the pipeline
+  cache has never seen, so the committed shader measures clean and every
+  experiment measures fast. Warm up after EVERY shader edit, and never take
+  the min across repeated passes: that picks the contaminated one. Two
+  ablations "worth" 16 and 12 ms were worth 3 and 0 once measured warm.
+  `CLAYFRAY_NO_REUSE=1` gives the MOVING cost (what governs frame rate
+  whenever anything is in motion); without it you get the idle cost.
+- Env-var ablations (`CLAYFRAY_NO_PIECES`, `_AO`, `_SHADOWK`) don't touch
+  shader source, so they never hit the cold-compile trap. Prefer them for
+  cost attribution; reach for a shader edit only to test a fix.
+- **Conditional skips do not pay here.** Several "skip the expensive path
+  when X" experiments came out image-identical and SLOWER (58.5 -> 59.7,
+  60.1, 60.7). A branch only helps if every lane in the wavefront takes it,
+  and neighbouring pixels sit in different regions of the body; the skipped
+  work still gets executed, plus the test. Removing work for EVERY lane is
+  what moves the number. Small edits also swing the frame by ~10% in either
+  direction via register pressure — measure, never assume.
 - Scenario regression: `record` a journal (or hand-write one: `<poseTick>
   <ctl command>` per line, see `scenarios/`), then
   `./build/clayfray --replay scenarios/X.journal --screenshot out.png
