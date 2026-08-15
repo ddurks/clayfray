@@ -254,45 +254,42 @@ fn charAlbedoRest(p: vec3f) -> vec3f {
 // boneMeta: x = piece count (0 = un-rigged: rest field directly),
 //           y = joint smin k, z = box test margin, w = posed bound radius.
 
+// The skin field at ONE cell — the one the sample falls in.
+//
+// This used to gather the 8 surrounding cells and blend their influences
+// trilinearly: 17 loads and 16 registers of corner data, per piece per march
+// step, on the hottest path in the renderer. The smoothing was there to keep
+// the blend continuous across cell boundaries on a dense mesh; the body has
+// since been simplified, and the warp's own joint smin already bridges the
+// handoff, so piecewise-constant weights read the same.
+//
+// Note this is the ONE optimisation in this loop that paid. Conditionally
+// skipping the expensive path never did — see the benchmarking notes in
+// CLAUDE.md.
 struct CellSkin {
-  cw: array<vec2u, 8>, // 8 cell corners: x = joints word, y = weights word
-  f: vec3f,            // trilinear fractions
-  jw: u32,             // nearest cell's joints word (candidate set)
+  jw: u32, // joints word: 4 bone indices, u8 each
+  ww: u32, // weights word: 4 unorm8 weights, same slot order
 }
 
 fn cellSkinAt(q: vec3f) -> CellSkin {
   let v = (q - VOL_ORIGIN) / VOXEL;
+  let cell = clamp(vec3i(floor(v / BRICK_USABLE)), vec3i(0), vec3i(GRID - 1));
+  let ci = cellIndex(cell) * 2u;
   var out: CellSkin;
-  let cellN = clamp(vec3i(floor(v / BRICK_USABLE)), vec3i(0), vec3i(GRID - 1));
-  out.jw = rdCellW(cellIndex(cellN) * 2u);
-  let g = clamp(v / BRICK_USABLE - 0.5, vec3f(0.0), vec3f(f32(GRID) - 1.001));
-  let c0 = vec3i(floor(g));
-  out.f = g - floor(g);
-  for (var k = 0; k < 8; k++) {
-    let c = min(c0 + vec3i(k & 1, (k >> 1) & 1, (k >> 2) & 1), vec3i(GRID - 1));
-    let ci = cellIndex(c) * 2u;
-    out.cw[k] = vec2u(rdCellW(ci), rdCellW(ci + 1u));
-  }
+  out.jw = rdCellW(ci);
+  out.ww = rdCellW(ci + 1u);
   return out;
 }
 
-// trilinear influence of one bone over the gathered corners
+// influence of one bone in that cell (0 if it holds no slot there)
 fn skinInfl(sk: CellSkin, bone: u32) -> f32 {
-  var acc: array<f32, 8>;
-  for (var k = 0; k < 8; k++) {
-    let jw = sk.cw[k].x;
-    let ww = sk.cw[k].y;
-    var w = 0.0;
-    for (var sl = 0u; sl < 4u; sl++) {
-      if (((jw >> (sl * 8u)) & 0xFFu) == bone) {
-        w = max(w, f32((ww >> (sl * 8u)) & 0xFFu) / 255.0);
-      }
+  var w = 0.0;
+  for (var sl = 0u; sl < 4u; sl++) {
+    if (((sk.jw >> (sl * 8u)) & 0xFFu) == bone) {
+      w = max(w, f32((sk.ww >> (sl * 8u)) & 0xFFu) / 255.0);
     }
-    acc[k] = w;
   }
-  return mix(mix(mix(acc[0], acc[1], sk.f.x), mix(acc[2], acc[3], sk.f.x), sk.f.y),
-             mix(mix(acc[4], acc[5], sk.f.x), mix(acc[6], acc[7], sk.f.x), sk.f.y),
-             sk.f.z);
+  return w;
 }
 
 struct WarpOut {
