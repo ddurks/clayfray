@@ -72,6 +72,20 @@ srcRGB]]`, `bake`, `shot PATH`, `stats`, `probe`/`pickuv u v`, `pause`,
 PATH|stop`, `break ledger TOL_ML|off`, `quit`.
 
 Iteration rules of thumb:
+- **Don't render screenshots to check your own work — build it and hand it
+  over.** A `--screenshot`/`--replay` pass costs a startup plus the frame
+  run, and a verification sweep of several burns minutes of the user's time
+  waiting on you. Finish at `cmake --build build` and say what to look at.
+  Render only when asked, or for a gate with no manual equivalent (the
+  `--carve-test` conservation exit code, replay determinism) — and say why
+  first. For perf work, quote benchmark numbers instead of re-rendering to
+  eyeball.
+- **A pixel diff cannot see SHAPE.** imgdiff answers "did values move", not
+  "does it still look right", and the difference has already shipped a
+  regression: a skin-gather change measured 133 changed pixels — inside
+  imgdiff's own tolerance — while visibly wrecking the mitts' silhouette at
+  the 4-bone junction. Anything touching skinning, the warp, silhouettes or
+  the joints is judged by a human in the running app, not by a number.
 - Tuning/look/pose/sword work: NEVER rebuild — `set` + `shot` on a live
   instance. Shaders hot-load on save (~30-frame poll), also no rebuild.
 - C++ changes: `snap save` first, rebuild, relaunch `--serve --load NAME` —

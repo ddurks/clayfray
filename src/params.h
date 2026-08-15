@@ -65,21 +65,28 @@ struct HandParams {
 // Whether the ROOT translation steps on the 12 Hz pose grid like the rest of
 // the stop-motion, or slides at 60 Hz.
 //
-// DEFAULT OFF, and the reason is worth keeping: trap 4 covers the POSE, and
-// extending it to translation does not work at this frame rate. Real
-// stop-motion animates on 2s at 24 fps, so a held position spans 2 frames.
-// We present at 60, so it spans 5 — and a ~9 cm translation jump (1.1 m/s
-// over 1/12 s) is nowhere near as forgiving as a held pose or a boil reseed.
-// It reads as jumpy whichever way the camera is handled: chase the sim
-// position and the subject jumps inside the frame, chase the stepped position
-// and the whole world jumps. There is no framing that hides it.
+// DEFAULT ON. It was off, on the argument below, which is preserved because
+// the reasoning is sound and only the conclusion was wrong:
 //
-// The cost of leaving it off is that walking cannot reuse frames (the root is
-// a traced input that changes every frame), so motion runs at the raw frame
-// cost. That is a rendering problem to solve in the renderer, not by making
-// the movement look worse.
+//   trap 4 covers the POSE, and extending it to translation does not work at
+//   this frame rate. Real stop-motion animates on 2s at 24 fps, so a held
+//   position spans 2 frames. We present at 60, so it spans 5 — and a ~9 cm
+//   translation jump (1.1 m/s over 1/12 s) is nowhere near as forgiving as a
+//   held pose or a boil reseed. It reads as jumpy whichever way the camera is
+//   handled.
+//
+// That was a judgement about the look, and the look was judged again with it
+// on: it reads as stop-motion, not as jitter. Which settles the cost side,
+// because the note used to end "that is a rendering problem to solve in the
+// renderer" — and it is not one the renderer can solve. The root is a traced
+// input, so sliding it at 60 Hz makes every frame unique and defeats frame
+// reuse: walking traces EVERY frame at the raw ~59 ms, while a stepped root
+// walks at the same 73% reuse rate the idle scene gets. Nothing else in the
+// frame is worth a 4x multiple, and no micro-optimisation was close (the
+// largest single item measured was 10.5 ms, and it cost the hands their
+// shape). Consistency with the 12 Hz grid IS the optimisation.
 struct MotionParams {
-    bool stepRoot = false;
+    bool stepRoot = true;
 };
 
 struct GazeParams {
