@@ -25,7 +25,9 @@ Headless flags: `--screenshot PATH --size WxH --frames N --time T --aa N`,
 `Renderer::addPlayer(pose)` adds a fighter and returns its index; player 0 is
 the hero. **The cap is 2** — each body needs its own volume and WGSL bindings
 are static, so 3+ requires the per-player stride in PLAN.md ("fighters are
-SLICES"). ctl exposes `foe.enabled`, `foe.pos`, `foe.yaw`.
+SLICES"). That cap is now enforced by hardware, not taste: a third fighter's
+3 bindings would put `trace` at 12 of Metal's 10 (trap 8). ctl exposes
+`foe.enabled`, `foe.pos`, `foe.yaw`.
 
 Both fighters bill to ONE conservation ledger: clay off either body becomes
 the same gobs on the same arena.
@@ -176,6 +178,24 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    line against the sum of the mesh objects before suspecting the renderer.
    A mesh bound to a SECOND skin is skipped with a warning (joint indices
    would not line up).
+
+8. **A shader stage gets 10 storage buffers on Metal, and `trace` uses 9.**
+   Metal gives a function 31 buffer slots; Dawn spends one on buffer lengths
+   and reserves its default uniform + vertex budget, leaving 10 — the adapter
+   genuinely reports that, so requesting full limits (which `gpu.cpp` already
+   does) buys nothing. M5's second fighter took `trace` to 14 bindings and the
+   pipeline failed to CREATE on macOS: `CreateComputePipeline` errored and
+   every frame after it was invalid, while Vulkan (effectively unbounded)
+   showed nothing wrong. So each fighter's four per-cell arrays (indirection,
+   JFA seeds, coarse, cell weights) are REGIONS of one `volume` buffer: write
+   passes bind their own region as a sub-range, which is why the write shaders
+   still declare them separately, and the tracer binds the buffer once and
+   adds a base index (`CELL_*` from `wgslConstants`, accessors at the top of
+   `brick_read.wgsl`). Budget: 3 per fighter + 3 ground = 9. **Adding a
+   storage binding to trace.wgsl breaks macOS** — grow a region, or pack the
+   ground trio the same way, instead. Keep every write-side binding of those
+   regions `read_write`: Dawn rejects a buffer that is writable and read-only
+   within one pass and tracks that per BUFFER, not per bound range.
 
 ## Verifying a conservation (M4.6) change
 
