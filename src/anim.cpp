@@ -54,6 +54,47 @@ void matTransformPoint(const float* m, const float* p, float* out) {
     out[0] = r[0]; out[1] = r[1]; out[2] = r[2];
 }
 
+float mat3MinSingular(const float m[16]) {
+    // M = A^T A, symmetric positive semi-definite; sigmaMin = sqrt(lambdaMin).
+    // Column-major, so column c is m[c*4 + 0..2].
+    float M[3][3];
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            M[i][j] = m[i * 4] * m[j * 4] + m[i * 4 + 1] * m[j * 4 + 1] +
+                      m[i * 4 + 2] * m[j * 4 + 2];
+        }
+    }
+    const float p1 = M[0][1] * M[0][1] + M[0][2] * M[0][2] + M[1][2] * M[1][2];
+    float lambdaMin;
+    if (p1 <= 1e-20f) {
+        // already diagonal (A's columns are orthogonal — the common case: a
+        // pure rotation, or a rotation times an axis scale)
+        lambdaMin = std::min(M[0][0], std::min(M[1][1], M[2][2]));
+    } else {
+        // Standard closed form for the eigenvalues of a symmetric 3x3
+        // (Smith 1961): shift by the mean, normalise, recover the angle.
+        const float q = (M[0][0] + M[1][1] + M[2][2]) / 3.f;
+        const float d0 = M[0][0] - q, d1 = M[1][1] - q, d2 = M[2][2] - q;
+        const float p2 = d0 * d0 + d1 * d1 + d2 * d2 + 2.f * p1;
+        const float pp = std::sqrt(p2 / 6.f);
+        float B[3][3];
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                B[i][j] = (M[i][j] - (i == j ? q : 0.f)) / pp;
+            }
+        }
+        const float det =
+            B[0][0] * (B[1][1] * B[2][2] - B[1][2] * B[2][1]) -
+            B[0][1] * (B[1][0] * B[2][2] - B[1][2] * B[2][0]) +
+            B[0][2] * (B[1][0] * B[2][1] - B[1][1] * B[2][0]);
+        const float r = std::min(std::max(det * 0.5f, -1.f), 1.f);
+        const float phi = std::acos(r) / 3.f;
+        // eig1 is the largest at phi, eig3 the smallest at phi + 2pi/3
+        lambdaMin = q + 2.f * pp * std::cos(phi + 2.0943951f);
+    }
+    return std::sqrt(std::max(lambdaMin, 0.f));
+}
+
 namespace {
 
 struct Trs {

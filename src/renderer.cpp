@@ -441,7 +441,8 @@ const char* Renderer::uniformSlotName(int s) {
     if (s == 291) return "foeMeta";
     if (s == 292) return "foeCenter";
     if (s < 485) return "pieces (foe articulation)";
-    return "foeBoneMeta";
+    if (s == 485) return "foeBoneMeta";
+    return "rigMeta (affine rig select)";
 }
 
 // Which uniform components the reuse digest is allowed to see. Kept beside
@@ -471,6 +472,147 @@ uint64_t Renderer::traceInputDigest(const float u[kUniformSlots][4]) const {
         }
     }
     return h;
+}
+
+// ---------- M-PERF: the three-piece affine rig ----------
+
+bool Renderer::affineOn(const LookParams& look) const {
+    // Env override so the parent can benchmark both rigs on ONE binary. A
+    // shader edit would force a cold pipeline compile on the next launch and
+    // that has faked two "wins" in this codebase already (CLAUDE.md).
+    static const bool disabled = std::getenv("CLAYFRAY_NO_AFFINE") != nullptr;
+    if (disabled || !look.affineRig) return false;
+    // The ownership test packs one bit per bone into a piece's capB.w, and 16
+    // bones is the cap everywhere in the shader (array<Piece,16>). A bigger
+    // rig falls back to the 13-piece warp rather than silently mis-owning
+    // cells. This rig has 15.
+    return !affinePieces_.empty() && bones_.size() <= 16;
+}
+
+void Renderer::stepSpring(BodySpring& s, const RigParams& r, bool moving, float dt) {
+    if (dt <= 0.f) return;
+    // Metronome: one impulse per footfall while walking, one slower and
+    // gentler per breath at rest. The phase is the only clock — no wall
+    // clock, no rand() — so replay reproduces the squish exactly.
+    const float hz = moving ? r.gaitHz : r.idleHz;
+    const float kick = r.squishKick * (moving ? 1.f : r.idleScale);
+    const float next = s.gait + dt * hz;
+    if (next >= 1.f) s.v -= kick;      // land / inhale: compress
+    s.gait = next - std::floor(next);
+    // Semi-implicit Euler, substepped. dt is a whole 12 Hz pose step (~83 ms)
+    // and the spring's period is ~0.8 s, so one step per frame would be a
+    // visibly lumpy integration; four is stable and still fixed-count, which
+    // is what keeps it deterministic.
+    const int kSub = 4;
+    const float h = dt / (float)kSub;
+    for (int i = 0; i < kSub; i++) {
+        s.v += (-r.squishK * s.q - r.squishDamp * s.v) * h;
+        s.q += s.v * h;
+    }
+    s.q = std::min(std::max(s.q, -0.45f), 0.45f);
+}
+
+// The body's whole articulation, as one matrix:
+//   world = T(pos + hop) . Yaw(yaw) . Shear(lean) . Scale(squish)
+// Scale and shear are both about the FEET (y = 0), so the fighter stays
+// planted while the top of the blob squashes and tips — which is what reads as
+// clay rather than as a rigid body pivoting off the floor.
+//
+// Lean is a SHEAR, not the rotation the 13-piece path used. Same visual, but a
+// rotation lifts the base off the ground and a shear does not. It also reduces
+// to exactly that rotation when ky = cos(lean) and t = tan(lean), which is the
+// sanity check that the sign convention below matches the old root transform:
+// positive lean tips the head toward +Z, the fighter's forward.
+void Renderer::bodyAffine(const FighterPose& disp, const BodySpring& s,
+                          const RigParams& r, float out[16]) const {
+    const float ky = std::min(std::max(1.f + s.q, 0.55f), 1.45f);
+    // sideways bulge: squashing down pushes clay out. Not strictly volume
+    // preserving — `widen` is a taste knob, and clay is not water.
+    const float kxz = std::min(std::max(1.f - r.widen * s.q, 0.55f), 1.65f);
+    const float t = std::tan(disp.lean);
+    // the hop rides the RELEASE half of the spring only, and only when
+    // travelling: an idle breath must not lift the feet off the floor
+    const float hop = disp.moving ? std::max(s.q, 0.f) * r.hop : 0.f;
+    const float cy = std::cos(disp.yaw), sy = std::sin(disp.yaw);
+    out[0] = kxz * cy;      out[1] = 0.f;  out[2] = -kxz * sy;    out[3] = 0.f;
+    out[4] = t * ky * sy;   out[5] = ky;   out[6] = t * ky * cy;  out[7] = 0.f;
+    out[8] = kxz * sy;      out[9] = 0.f;  out[10] = kxz * cy;    out[11] = 0.f;
+    out[12] = disp.pos[0];
+    out[13] = disp.pos[1] + hop;
+    out[14] = disp.pos[2];
+    out[15] = 1.f;
+}
+
+int Renderer::packAffinePieces(float out[kUniformSlots][4], int base,
+                               const std::vector<float>& mats) const {
+    int n = 0;
+    for (const AffinePiece& ap : affinePieces_) {
+        if (n >= 16) break;
+        float fwd[16];
+        if (ap.srcBone >= 0 && (size_t)(ap.srcBone * 16 + 16) <= mats.size()) {
+            std::memcpy(fwd, &mats[ap.srcBone * 16], sizeof(fwd));
+        } else {
+            matIdentity(fwd);
+        }
+        float inv[16];
+        matInvAffine(fwd, inv);
+        std::memcpy(out[base + n * 12], inv, 16 * sizeof(float));
+        std::memcpy(out[base + n * 12 + 4], fwd, 16 * sizeof(float));
+        float* lo = out[base + n * 12 + 8];
+        float* hi = out[base + n * 12 + 9];
+        float* ca = out[base + n * 12 + 10];
+        float* cb = out[base + n * 12 + 11];
+        for (int k = 0; k < 3; k++) {
+            lo[k] = ap.lo[k];
+            hi[k] = ap.hi[k];
+        }
+        // Lipschitz rescale — the SMALLEST SINGULAR VALUE, not the min column
+        // norm the 13-piece path packs here. A shear can have unit-length
+        // columns and a much smaller sigmaMin; trusting the column norm would
+        // overestimate world distances and the march would tunnel. Floored at
+        // 0.25 so a degenerate matrix cannot stall the trace to a crawl.
+        lo[3] = std::min(std::max(mat3MinSingular(fwd), 0.25f), 1.f);
+        // Rest bounding sphere of this piece's clay. Unused by the affine
+        // sampling path today; it is where a baked hand-pose volume would
+        // declare its extent when the mitts move out of the shared volume.
+        for (int k = 0; k < 3; k++) ca[k] = (ap.lo[k] + ap.hi[k]) * 0.5f;
+        float hd = 0.f;
+        for (int k = 0; k < 3; k++) {
+            const float h = (ap.hi[k] - ap.lo[k]) * 0.5f;
+            hd += h * h;
+        }
+        ca[3] = std::sqrt(hd);
+        for (int k = 0; k < 3; k++) cb[k] = ca[k];
+        // capB.w is a BONE MASK in this mode, not a bone id — the shader's
+        // ownership test ANDs it with 1 << dominantBone.
+        cb[3] = (float)ap.boneMask;
+        n++;
+    }
+    return n;
+}
+
+float Renderer::affineBoundR(const std::vector<float>& mats,
+                             const float center[3]) const {
+    float r = 0.f;
+    for (const AffinePiece& ap : affinePieces_) {
+        float m[16];
+        if (ap.srcBone >= 0 && (size_t)(ap.srcBone * 16 + 16) <= mats.size()) {
+            std::memcpy(m, &mats[ap.srcBone * 16], sizeof(m));
+        } else {
+            matIdentity(m);
+        }
+        for (int c = 0; c < 8; c++) {
+            const float q[3] = {(c & 1) ? ap.hi[0] : ap.lo[0],
+                                (c & 2) ? ap.hi[1] : ap.lo[1],
+                                (c & 4) ? ap.hi[2] : ap.lo[2]};
+            float w[3];
+            matTransformPoint(m, q, w);
+            const float dx = w[0] - center[0], dy = w[1] - center[1],
+                        dz = w[2] - center[2];
+            r = std::max(r, std::sqrt(dx * dx + dy * dy + dz * dz));
+        }
+    }
+    return r;
 }
 
 void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
@@ -560,9 +702,19 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // max(restField(invSkin * p), restCapsule(invSkin * p)). Rigid warps
     // preserve the distance metric; max/min/smin keep Lipschitz <= 1.
     static const bool noPieces = std::getenv("CLAYFRAY_NO_PIECES") != nullptr;
+    const bool affine = affineOn(look);
     int pn = noPieces ? 0 : cn;
     float bodyBoundR = 0.f;
-    for (int i = 0; i < pn; i++) {
+    if (affine && !noPieces) {
+        // Three pieces replace the per-capsule ones. The posed bound comes off
+        // the pieces' own rest boxes rather than the capsule endpoints below,
+        // because a squish can push clay past any bound measured at rest.
+        pn = packAffinePieces(out, 66, skinMats_);
+        bodyBoundR = affineBoundR(skinMats_, center);
+    }
+    // ...otherwise the M4-P1 per-capsule pieces, one per bone.
+    const int legacyPn = affine ? 0 : pn;
+    for (int i = 0; i < legacyPn; i++) {
         const BoneCapsule& c = capsules_[i];
         float inv[16];
         if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
@@ -636,7 +788,11 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // the hero's above but driven by ITS skeleton, which is what lets it play
     // its own clip instead of standing rigid.
     int fpn = 0;
-    if (foeEnabled_ && !noPieces && foeSkinMats_.size() >= bones_.size() * 16) {
+    if (affine && foeEnabled_ && !noPieces &&
+        foeSkinMats_.size() >= bones_.size() * 16) {
+        fpn = packAffinePieces(out, 293, foeSkinMats_);
+    } else if (foeEnabled_ && !noPieces &&
+               foeSkinMats_.size() >= bones_.size() * 16) {
         fpn = std::min((int)capsules_.size(), 16);
         for (int i = 0; i < fpn; i++) {
             const BoneCapsule& c = capsules_[i];
@@ -681,15 +837,22 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     }
     out[485][0] = (float)fpn;
 
+    // M-PERF rig select (slot 486). Appended, never inserted, so no earlier
+    // index moves — and mirrored into BOTH shader roots (trap 2). y is the
+    // count of baked hand-pose volumes; 0 means the mitts are sampled out of
+    // the shared rest volume, which is the only mode today's asset supports.
+    out[486][0] = affine ? 1.f : 0.f;
+    out[486][1] = 0.f;
+
     // M4.6 conservation: in-flight gobs (12 Hz-stepped positions) + the
     // ground field's clay top bound (0 disables the field in the tracer).
     // These slot indices are hand-mirrored in trace.wgsl AND pick.wgsl —
     // this static_assert catches only the C++ side overrunning the buffer;
     // the WGSL side has no compile-time link, so CLAUDE.md flags the mirror.
-    static_assert(kUniformSlots >= 486,
+    static_assert(kUniformSlots >= 487,
                   "gobs reach out[282], groundMeta out[283], sword out[284-286], "
-                  "foePieces out[293-485]; keep kUniformSlots and the Uniforms "
-                  "struct in trace.wgsl + pick.wgsl in sync");
+                  "foePieces out[293-485], rigMeta out[486]; keep kUniformSlots "
+                  "and the Uniforms struct in trace.wgsl + pick.wgsl in sync");
     int gn = std::min((int)gobs_.size(), 12);
     for (int i = 0; i < gn; i++) {
         const Gob& g = gobs_[i];
@@ -740,6 +903,24 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
         out[292][0] = t[0] + cy * foeCenterRest_[0] + sy * foeCenterRest_[2];
         out[292][1] = t[1] + foeCenterRest_[1];
         out[292][2] = t[2] - sy * foeCenterRest_[0] + cy * foeCenterRest_[2];
+        // Under the affine rig the yaw-only inverse above no longer describes
+        // the foe's body — a squish is not a rotation — so re-derive the
+        // reject sphere from its actual posed pieces. Too SMALL a sphere
+        // clips the opponent out of the frame, so this has to track the
+        // squish rather than reuse the rest-mesh radius.
+        if (affine && fpn > 0 && foeSkinMats_.size() >= bones_.size() * 16) {
+            float m[16];
+            const int sb = affinePieces_.empty() ? -1 : affinePieces_[0].srcBone;
+            if (sb >= 0 && (size_t)(sb * 16 + 16) <= foeSkinMats_.size()) {
+                std::memcpy(m, &foeSkinMats_[sb * 16], sizeof(m));
+            } else {
+                matIdentity(m);
+            }
+            float c[3];
+            matTransformPoint(m, foeCenterRest_, c);
+            out[292][0] = c[0]; out[292][1] = c[1]; out[292][2] = c[2];
+            out[291][1] = affineBoundR(foeSkinMats_, c) + 0.05f;
+        }
     }
 }
 
@@ -929,10 +1110,88 @@ void Renderer::setCharacter(CharacterAsset asset) {
                                   std::sqrt(dx * dx + dy * dy + dz * dz));
         }
     }
+    // ---- M-PERF: the three-piece affine rig ----
+    // Partition the rig into an affine body plus one rigid piece per mitt.
+    // This is a BONE partition, and on this asset it is exactly the mesh-object
+    // partition too: the blob is weighted only to base/base.001/base.002 and
+    // the mitts only to hand/thumb/finger/*tip — zero shared weights (verified
+    // on assets/fighter.glb). That is what makes the hard handoff safe: no
+    // cell can be near both pieces' clay, so the ownership boundary the shader
+    // tests against runs through the ~12 cm of air between them.
+    affinePieces_.clear();
+    if (!bones_.empty()) {
+        std::vector<int> owner(nb, 0); // default: the body
+        std::vector<int> srcBone{-1};  // piece 0 is the body; filled below
+        for (const HandIkChain& c : handIk_) {
+            const int pi = (int)srcBone.size();
+            for (int b : c.subtree)
+                if (b >= 0 && (size_t)b < nb) owner[b] = pi;
+            srcBone.push_back(c.wrist);
+        }
+        // The body's transform is carried by any bone it owns — once posed
+        // they all hold the same affine — so take the first.
+        for (size_t b = 0; b < nb; b++) {
+            if (owner[b] == 0) {
+                srcBone[0] = (int)b;
+                break;
+            }
+        }
+        std::vector<AffinePiece> pieces(srcBone.size());
+        for (size_t i = 0; i < srcBone.size(); i++) {
+            pieces[i].srcBone = srcBone[i];
+            pieces[i].lo[0] = pieces[i].lo[1] = pieces[i].lo[2] = 1e9f;
+            pieces[i].hi[0] = pieces[i].hi[1] = pieces[i].hi[2] = -1e9f;
+        }
+        // one bit per bone: the shader ANDs this with 1 << dominant bone of
+        // the cell it is sampling. 16 bones is the shader-side cap.
+        for (size_t b = 0; b < nb && b < 16; b++)
+            pieces[owner[b]].boneMask |= 1u << b;
+        // Rest bounds of the clay each piece carries: the vertices whose
+        // DOMINANT bone it owns — the same rule the per-cell skin field uses,
+        // so the AABB cull and the ownership test agree about where a piece
+        // lives.
+        const uint32_t vc = asset.vertexCount();
+        for (uint32_t v = 0; v < vc && asset.weights.size() >= (size_t)vc * 4; v++) {
+            int dom = -1;
+            float bw = 0.f;
+            for (int s = 0; s < 4; s++) {
+                const float w = asset.weights[v * 4 + s];
+                if (w > bw) {
+                    bw = w;
+                    dom = asset.joints[v * 4 + s];
+                }
+            }
+            if (dom < 0 || (size_t)dom >= nb) continue;
+            AffinePiece& ap = pieces[owner[dom]];
+            for (int k = 0; k < 3; k++) {
+                ap.lo[k] = std::min(ap.lo[k], asset.positions[v * 3 + k] - 0.012f);
+                ap.hi[k] = std::max(ap.hi[k], asset.positions[v * 3 + k] + 0.012f);
+            }
+        }
+        // A piece with no clay (a rig with no mitts, or a hand nothing is
+        // bound to) would carry an inverted box and poison the cull, so fold
+        // its bones back into the body and drop it.
+        for (size_t i = 1; i < pieces.size(); i++) {
+            if (pieces[i].hi[0] < pieces[i].lo[0]) {
+                pieces[0].boneMask |= pieces[i].boneMask;
+                pieces[i].boneMask = 0;
+            }
+        }
+        if (pieces[0].hi[0] >= pieces[0].lo[0]) {
+            for (const AffinePiece& ap : pieces)
+                if (ap.boneMask != 0 && ap.hi[0] >= ap.lo[0]) affinePieces_.push_back(ap);
+        }
+        if (bones_.size() > 16 && !affinePieces_.empty()) {
+            std::fprintf(stderr,
+                         "[rig] %zu bones exceeds the 16-bone ownership mask; "
+                         "falling back to the 13-piece warp\n",
+                         bones_.size());
+        }
+    }
     std::printf("anim: %zu bones, %zu clip(s), %zu shadow capsules, %zu hand(s), "
-                "rest reach %.3f m\n",
+                "rest reach %.3f m, %zu affine piece(s)\n",
                 bones_.size(), clips_.size(), capsules_.size(), handIk_.size(),
-                autoReach_);
+                autoReach_, affinePieces_.size());
     // fighter 1 is the same character in its own volume — "identical second
     // fighter". Rest capsules are shared (same mesh), and the bound sphere
     // comes off the mesh so the tracer's cheap reject is tight.
@@ -1388,9 +1647,47 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         foeDisp_ = foePose_;
     }
 
+    // M-PERF: advance the affine body's squish spring. ON THE POSE GRID, not
+    // the frame clock (trap 4): the squish is a traced uniform input, so
+    // integrating it at 60 Hz would make a STANDING fighter re-trace every
+    // frame and hand back the idle frame rate that reuse buys. Fixed substeps,
+    // no wall clock, no RNG, so --replay reproduces it exactly.
+    const bool affine = affineOn(look);
+    if (affine && frame.poseTime != springPoseTime_) {
+        const float dt =
+            (springPoseTime_ >= 0.f)
+                ? std::min(std::max(frame.poseTime - springPoseTime_, 0.f), 0.25f)
+                : 0.f;
+        springPoseTime_ = frame.poseTime;
+        stepSpring(spring_, look.rig, fighter_.moving, dt);
+        stepSpring(foeSpring_, look.rig, foePose_.moving, dt);
+    }
+
     // pose the skeleton at the quantized clock; paused = rest pose
     resolveSword(look);
     if (!bones_.empty()) {
+        if (affine) {
+            // ONE matrix for the whole body. evalPose with a null clip yields
+            // identity per bone (the rest pose by construction), so
+            // premultiplying the affine leaves every body bone holding exactly
+            // A — and the blob, the eye beads, the shadow capsules and the COM
+            // all ride the same deformation with no further plumbing. The hand
+            // IK below then lifts the two mitt subtrees off it.
+            //
+            // The 'bounce'/'idle' clips are simply not sampled here. They stay
+            // in the asset and still drive the 13-piece path (affineRig off),
+            // which is what keeps the A/B comparing like with like; the shape
+            // they described — squash, spring, hop, lean — is what the affine
+            // reproduces procedurally, at three pieces instead of thirteen.
+            evalPose(bones_, nullptr, 0.f, skinMats_);
+            float A[16];
+            bodyAffine(fighterDisp_, spring_, look.rig, A);
+            for (size_t b = 0; b * 16 + 16 <= skinMats_.size(); b++) {
+                float tmp[16];
+                matMul(A, &skinMats_[b * 16], tmp);
+                std::memcpy(&skinMats_[b * 16], tmp, sizeof(tmp));
+            }
+        } else {
         // locomotion picks the clip: bounce while travelling, idle at rest.
         // Falls back to the first clip when the asset has neither name.
         int ci = -1;
@@ -1420,6 +1717,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                 matMul(R, &skinMats_[b * 16], tmp);
                 std::memcpy(&skinMats_[b * 16], tmp, sizeof(tmp));
             }
+        }
         }
 
         // M4.7: sword is master, hands follow. The mitts are detached, so IK
@@ -1452,8 +1750,20 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                 // handle the way two hands on a hilt actually sit
                 std::memcpy(c.aim, blade, sizeof(c.aim));
                 c.roll = look.hands.gripRoll;
-                // fingers wrap the handle; mirrored so both curl inward
-                c.curl = right ? -look.hands.gripCurl : look.hands.gripCurl;
+                // Fingers wrap the handle; mirrored so both curl inward.
+                //
+                // ZERO under the affine rig, and it has to be. The mitt is one
+                // piece there, sampled through the WRIST's transform alone, so
+                // a per-digit rotation would move the shadow capsules and the
+                // COM to a grip the clay never adopts — a curled proxy over
+                // straight fingers. Zeroing it keeps the whole rig telling one
+                // story: applyHandIk then moves every mitt bone by the same
+                // matrix, which is exactly what the one-transform piece
+                // assumes. Getting the curl BACK is what the baked hand-pose
+                // volumes are for (rigMeta.y) — a discrete grip shape selected
+                // by index, not a joint rotation.
+                c.curl = affine ? 0.f
+                                : (right ? -look.hands.gripCurl : look.hands.gripCurl);
                 c.palmLen = c.restSpan * look.hands.palmFrac;
             }
             float com[3];
@@ -1480,7 +1790,17 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
 
     // Player 1 poses itself: its own clip clock, its own skeleton, its own
     // root. It stands and idles rather than following the hero's animation.
-    if (foeEnabled_ && !bones_.empty()) {
+    if (foeEnabled_ && !bones_.empty() && affine) {
+        // same collapse as the hero, driven by ITS pose and ITS spring
+        evalPose(bones_, nullptr, 0.f, foeSkinMats_);
+        float A[16];
+        bodyAffine(foeDisp_, foeSpring_, look.rig, A);
+        for (size_t b = 0; b * 16 + 16 <= foeSkinMats_.size(); b++) {
+            float tmp[16];
+            matMul(A, &foeSkinMats_[b * 16], tmp);
+            std::memcpy(&foeSkinMats_[b * 16], tmp, sizeof(tmp));
+        }
+    } else if (foeEnabled_ && !bones_.empty()) {
         int ci = clipIndex(foeDisp_.moving ? "bounce" : "idle");
         if (ci < 0) ci = 0;
         const AnimClip* clip =
@@ -1783,6 +2103,14 @@ bool Renderer::saveSnapshot(const std::string& path, double simT,
     rc.animT = animT_;
     rc.simT = simT;
     w.section("RCPU", &rc, sizeof(rc));
+    // M-PERF spring state, as its OWN section rather than fields on
+    // RenderSnapCpu: additive sections keep pre-rig snapshots loadable without
+    // a kVersion bump (see the dev-loop invariants in CLAUDE.md).
+    {
+        const float rig[6] = {spring_.q,    spring_.v,    spring_.gait,
+                              foeSpring_.q, foeSpring_.v, foeSpring_.gait};
+        w.section("RRIG", rig, sizeof(rig));
+    }
     w.section("RGOB", gobs_.data(), gobs_.size() * sizeof(Gob));
     w.section("CHRP", charPath.data(), charPath.size());
     bool ok = w.close();
@@ -1827,9 +2155,18 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
     haveWound_ = rc.haveWound != 0;
     gobSeed_ = rc.gobSeed;
     animT_ = rc.animT;
+    // Spring state is optional: a snapshot taken before the affine rig landed
+    // has no RRIG, and starting from neutral is a valid pose.
+    {
+        float rig[6] = {0, 0, 0, 0, 0, 0.37f};
+        r.read("RRIG", rig, sizeof(rig));
+        spring_ = BodySpring{rig[0], rig[1], rig[2]};
+        foeSpring_ = BodySpring{rig[3], rig[4], rig[5]};
+    }
     // fresh dt baseline: the restored clock may sit anywhere on the timeline
     lastSimTime_ = -1.f;
     lastPoseTime_ = -1.f;
+    springPoseTime_ = -1.f;
     if (simT) *simT = rc.simT;
     std::printf("[snap] loaded %s (t=%.2fs, %zu gob(s))\n", path.c_str(), rc.simT,
                 gobs_.size());

@@ -56,8 +56,23 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
     }
 
     if (ImGui::CollapsingHeader("animation", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Off = the M4-P1 13-piece inverse-LBS warp and the skeletal clips;
+        // on = one affine body plus two rigid mitts, animated by the spring
+        // below. The clip sliders only bite in the off state.
+        ImGui::Checkbox("affine rig (3 pieces, procedural)", &look.affineRig);
         ImGui::Checkbox("play clip (off = rest pose)", &look.animPlay);
         ImGui::SliderFloat("speed", &look.animSpeed, 0.f, 2.f);
+        if (look.affineRig) {
+            RigParams& r = look.rig;
+            ImGui::SliderFloat("squish stiffness", &r.squishK, 10.f, 200.f);
+            ImGui::SliderFloat("squish damping", &r.squishDamp, 0.5f, 20.f);
+            ImGui::SliderFloat("squish kick", &r.squishKick, 0.f, 4.f);
+            ImGui::SliderFloat("gait Hz (walk)", &r.gaitHz, 0.2f, 6.f);
+            ImGui::SliderFloat("idle Hz", &r.idleHz, 0.05f, 2.f);
+            ImGui::SliderFloat("idle scale", &r.idleScale, 0.f, 1.f);
+            ImGui::SliderFloat("hop (m per stretch)", &r.hop, 0.f, 2.f);
+            ImGui::SliderFloat("widen", &r.widen, 0.f, 1.5f);
+        }
     }
 
     if (ImGui::CollapsingHeader("sword / IK (M4.7)", ImGuiTreeNodeFlags_DefaultOpen)) {

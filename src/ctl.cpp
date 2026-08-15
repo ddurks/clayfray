@@ -127,6 +127,17 @@ void CtlServer::buildRegistry() {
     addF("sword.grip1", &l->sword.grip1);
     addF("sword.color", l->sword.color, 3);
     addB("motion.stepRoot", &l->motion.stepRoot);
+    // M-PERF: affine body + two rigid mitts vs the 13-piece inverse-LBS warp.
+    // CLAYFRAY_NO_AFFINE=1 pins it off for a benchmark run.
+    addB("look.affineRig", &l->affineRig);
+    addF("rig.squishK", &l->rig.squishK);
+    addF("rig.squishDamp", &l->rig.squishDamp);
+    addF("rig.squishKick", &l->rig.squishKick);
+    addF("rig.gaitHz", &l->rig.gaitHz);
+    addF("rig.idleHz", &l->rig.idleHz);
+    addF("rig.idleScale", &l->rig.idleScale);
+    addF("rig.hop", &l->rig.hop);
+    addF("rig.widen", &l->rig.widen);
     addB("hands.ik", &l->hands.ik);
     addF("hands.reach", &l->hands.reach);
     addF("hands.reachScale", &l->hands.reachScale);

@@ -5,6 +5,7 @@
 //#include scene_common.wgsl
 
 // mirror of trace.wgsl's layout (shared uniform buffer + brick_read include)
+// aabbLo.w and capB.w are mode-dependent — see the comment in trace.wgsl.
 struct Piece {
   invSkin: mat4x4f,
   skin: mat4x4f,    // forward, for the round-trip consistency check
@@ -50,6 +51,7 @@ struct Uniforms {
   // animates. Appended (never inserted) so no earlier slot index moves.
   foePieces: array<Piece, 16>,
   foeBoneMeta: vec4f,    // x = piece count
+  rigMeta: vec4f,        // x = affine rig select, y = hand pose count
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read_write> pickOut: array<vec4f>;

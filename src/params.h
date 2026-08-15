@@ -103,6 +103,38 @@ struct GazeParams {
     float maxAngle = 1.5708f;  // clamp cone off the head's forward, radians
 };
 
+// M-PERF: the affine body's procedural motion.
+//
+// This REPLACES the skeletal clips as the driver of the blob's shape. The
+// animation the game wants is a squish-and-spring (idle) and a squish, hop and
+// forward lean (walk) — that is one non-uniform scale plus a shear plus a
+// translation, i.e. one matrix, i.e. nothing worth skinning per sample. The
+// 45-track 'bounce'/'idle' clips still exist in the asset and still drive the
+// 13-piece path (look.affineRig off), which is what keeps the A/B honest; they
+// are simply not sampled while the affine rig is on.
+//
+// DETERMINISM: the spring is integrated ONLY on 12 Hz pose steps, at a dt read
+// off frame.poseTime, with a fixed substep count and no RNG and no wall clock.
+// So --replay reproduces it exactly, and — the reason it is on the pose grid
+// rather than the frame clock — a standing fighter's uniforms stop changing
+// between pose steps, which is what lets frame reuse keep firing (trap 4).
+// Defaults tuned by simulating the integrator at the 12 Hz step it actually
+// runs at (an impulse response at 60 Hz would be a different curve): they land
+// the walk at about -19% squish / +4% stretch and the idle breath at about
+// -9%, which is a claymation range rather than a jelly one.
+struct RigParams {
+    float squishK = 60.f;     // spring stiffness (rad/s)^2; period ~0.81 s
+    float squishDamp = 4.5f;  // velocity damping; lower = more overshoot/bounce
+    float squishKick = 2.4f;  // impulse per footfall
+    float gaitHz = 2.2f;      // footfalls per second while moving
+    float idleHz = 0.5f;      // breaths per second at rest
+    float idleScale = 0.45f;  // idle impulse as a fraction of the walk's
+    // Metres of lift per unit of STRETCH, walk only. Stretch peaks near +0.04,
+    // so 0.45 is a ~2 cm hop on a 0.69 m body — a skip, not a leap.
+    float hop = 0.45f;
+    float widen = 0.5f;       // sideways bulge per unit of squish
+};
+
 // Look-dev parameters, exposed in the ImGui panel and packed into the
 // uniform buffer by the renderer. Defaults target the Trap Door "day
 // dungeon" rig: warm amber key pooling to black, faint cool rim.
@@ -162,11 +194,20 @@ struct LookParams {
     // vanishing. Off = the pre-conservation vanish behavior.
     bool conserveClay = true;
 
+    // M-PERF: collapse articulation to an affine body + two rigid mitts.
+    // Off = the M4-P1 13-piece inverse-LBS warp. Both live in one binary so
+    // the pair can be benchmarked without a shader edit (a shader edit forces
+    // a cold pipeline compile on the next launch, which has faked wins here
+    // twice — see the benchmarking notes in CLAUDE.md).
+    // CLAYFRAY_NO_AFFINE=1 forces it off regardless.
+    bool affineRig = true;
+
     // M4.7 sword prop + floating-hand IK (debug-controlled hilt transform).
     SwordParams sword;
     HandParams hands;
     GazeParams gaze;
     MotionParams motion;
+    RigParams rig;
 };
 
 // Conservation ledger readout for the panel (all volumes in m^3).

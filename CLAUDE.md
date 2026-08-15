@@ -32,6 +32,42 @@ SLICES"). That cap is now enforced by hardware, not taste: a third fighter's
 Both fighters bill to ONE conservation ledger: clay off either body becomes
 the same gobs on the same arena.
 
+## The affine rig (M-PERF) — how the fighter animates now
+
+`look.affineRig` (default ON, `CLAYFRAY_NO_AFFINE=1` to pin it off) collapses
+articulation from 13 inverse-LBS pieces to **three**: an affine body plus one
+rigid transform per mitt. It exists because `charDistI` resolved skinning PER
+SAMPLE — ~66 field evaluations per shaded pixel, ~900M warps a second, 65% of
+the frame — to articulate a rig that is 10/15 finger bones holding a static
+grip.
+
+- **The body is one matrix**: non-uniform scale (squish) + shear (lean) + yaw +
+  hop, all about the feet. `Renderer::bodyAffine`. The squish comes from a
+  spring in `RigParams`, integrated **on the 12 Hz pose grid** — not the frame
+  clock, because the squish is a traced uniform and a 60 Hz one would make a
+  standing fighter re-trace every frame.
+- **The `bounce`/`idle` clips are not sampled** while it is on. They still
+  drive the 13-piece path, which is what keeps the A/B honest.
+- **Ownership, not box clipping**, decides which piece draws a region: the
+  per-cell dominant bone (`cellW`, already built by brick.cpp) is ANDed against
+  a per-piece bone mask carried in `Piece.capB.w`. Clipping to the AABB instead
+  slices flat bands across a round body. The AABB stays, as the cull it was.
+- The hard handoff is safe on THIS rig because the bone partition is also the
+  mesh partition — the blob is weighted only to `base*`, the mitts only to
+  `hand/thumb/finger*` — so the ownership boundary runs through the ~12 cm of
+  air between them. Attach the mitts to a body and the `min` in
+  `charDistAffine` becomes an `smin` at `u.boneMeta.y`.
+- `Piece.aabbLo.w` is the transform's **smallest singular value** in this mode,
+  not the min column norm the 13-piece path packs: a shear can have unit-length
+  columns and a much smaller sigma_min, and trusting the column norm makes the
+  march step through the skin.
+- **Known visual gap**: the mitts render in their rest (uncurled) shape,
+  because a one-transform piece cannot hold a per-digit curl. The intended fix
+  is baked hand-pose volumes — discrete grip shapes selected by index
+  (`rigMeta.y`, 0 today), never interpolated: blending two would reintroduce
+  exactly the blending this deletes, and a snap on a pose step reads as
+  stop-motion.
+
 ## Windowed test harness (M5)
 
 `WASD` walks the fighter (camera-relative — forward is always away from the
@@ -253,6 +289,7 @@ reference renders — diff against them by eye after a lighting/shading change.
 | `CLAYFRAY_NO_REDIST` / `_NO_ANIM` / `_NO_PIECES` | disable redistance / animation / chunk articulation |
 | `CLAYFRAY_AO` / `_DETAIL` / `_SHADOWK` | override look params (float) |
 | `CLAYFRAY_DEBUG_PICK=1` | print world vs REST position under the cursor (trap 6) |
+| `CLAYFRAY_NO_AFFINE=1` | force the 13-piece inverse-LBS warp instead of the 3-piece affine rig — the A/B for the M-PERF articulation collapse, on ONE binary (see below) |
 | `CLAYFRAY_DEBUG_REUSE=1` | name the input behind every re-trace that happens BETWEEN pose steps (a re-trace ON a pose step is the 12 Hz floor, so it stays quiet — silence means optimal) — a uniform (by slot NAME, e.g. "gobs (flying clay)") or the volume whose generation moved. Frame reuse is what makes motion affordable, so when the `[reuse] traced N of M` line collapses toward 0% skipped, this says which input refuses to settle |
 | `CLAYFRAY_TEST_ADDSTRESS` / `_TEST_NULLEDITS` | `--carve-test` variants (pool stress / null-edit JFA) |
 

@@ -85,7 +85,11 @@ fn rdCoarse(i: u32) -> f32 {
   if (gFighter == 0u) { return bitcast<f32>(bCells[CELL_COARSE + i]); }
   return bitcast<f32>(fCells[CELL_COARSE + i]);
 }
-// Skin weights: fighter 0 only (see above), so no gFighter branch.
+// Skin weights: read from fighter 0's region for BOTH fighters, deliberately.
+// cellW is a pure function of the character mesh (brick.cpp builds it once in
+// prepareImport and hands the same vector to every fighter) and nothing —
+// carving included — ever writes it again, so the two regions are
+// byte-identical and one binding's worth of reads serves both bodies.
 fn rdCellW(i: u32) -> u32 { return bCells[CELL_W + i]; }
 
 fn cellIndex(c: vec3i) -> u32 {
@@ -385,6 +389,164 @@ fn forwardResid(p: vec3f, qh: vec3f,
   return length(back / wsum - p);
 }
 
+// ---------- M-PERF: the three-piece affine rig ----------
+// Everything above this line resolves ARTICULATION PER SAMPLE — 13 posed
+// pieces, each an inverse-LBS warp with two 8-corner cell gathers, a
+// fixed-point refinement pass and a forward round-trip check. The tracer runs
+// ~66 field evaluations per shaded pixel, so that loop executed ~900M times a
+// second and measured 65% of the frame.
+//
+// It is also almost all spent on geometry that does not deform. This rig has
+// 15 bones: a 3-segment blob spine (base, base.001, base.002), two eyes, and
+// TEN finger/thumb bones that only ever hold a static grip. The motion the
+// game actually wants — the idle's squish-and-spring, the walk's squish, hop
+// and forward lean — is one AFFINE transform of the whole blob. So:
+//
+//   piece 0  the body   one affine (non-uniform scale + shear + yaw + hop)
+//   piece 1  hand.l     one rigid transform (placed by the sword-grip IK)
+//   piece 2  hand.r     one rigid transform
+//
+// Per sample that is: the existing AABB cull, ONE inverse transform, ONE
+// ownership fetch, and charDistRest. Deleted from the sampling path entirely:
+// cellSkinAt, skinInfl, chunkWarp, the refinement pass, forwardResid and the
+// inflSelf/inflMax contest. Those exist only to BLEND bones smoothly; three
+// disjoint rigid pieces have nothing to blend.
+//
+// TRAP 3 SURVIVES THE COLLAPSE UNCHANGED. The split is between the two REST
+// samplers, and both are still here: the march path calls charDistRest
+// (conservative — accurate inside allocated bricks, seed-bounded steps
+// outside) and the AO/penumbra path calls charLooseRest (smooth — the relaxed
+// per-cell coarse field, no clamp plateaus). The rig only changes WHERE the
+// rest field is sampled, never WHICH field, so the conservative/smooth pair
+// arrives intact.
+//
+// TRAP 4 SURVIVES TOO: the affine's inputs (root, lean, spring squish) are all
+// latched on the 12 Hz pose grid by the renderer, so the body steps rather
+// than slides and frame reuse still fires between pose steps.
+
+// Which of the three pieces carries the clay at rest point `q`.
+//
+// OWNERSHIP, NOT BOX CLIPPING. The per-cell skin field already stores each
+// cell's DOMINANT bone in slot 0 of its joints word (brick.cpp builds it from
+// a distance-weighted gather and flood-fills it volume-wide), so one u32 read
+// partitions rest space exactly. Clipping each piece to its AABB instead was
+// tried and looks worse: box faces are axis-aligned and slice flat bands
+// across a round body. The AABB stays, but only as the conservative CULL it
+// always was.
+//
+// The mask is a bitfield of the bones a piece carries — capB.w in this mode,
+// which is NOT the single bone id the 13-piece path keeps there. 16 bones is
+// the cap everywhere in this file (array<Piece,16>, boneToPiece[16]), so
+// anything above bone 15 folds into 15.
+fn cellOwnedBy(q: vec3f, boneMask: u32) -> bool {
+  let v = (q - VOL_ORIGIN) / VOXEL;
+  let cell = clamp(vec3i(floor(v / BRICK_USABLE)), vec3i(0), vec3i(GRID - 1));
+  let bone = min(rdCellW(cellIndex(cell) * 2u) & 0xFFu, 15u);
+  return (boneMask & (1u << bone)) != 0u;
+}
+
+// Conservative (march) field under the affine rig.
+fn charDistAffine(p: vec3f) -> f32 {
+  let n = gPieceCount;
+  let far = length(p - gFarCenter) - gFarR;
+  if (far > 0.1) {
+    return far;
+  }
+  var d = 1e9;
+  for (var i = 0; i < n; i++) {
+    // Fetch each bound field ONCE — pieceAt() carries a dynamic branch over
+    // the two players' uniform arrays and the 13-piece path measured four
+    // re-fetches per iteration as a real cost.
+    let pLo = pieceAt(i).aabbLo;
+    let pHi = pieceAt(i).aabbHi;
+    // aabbLo.w = the piece transform's SMALLEST SINGULAR VALUE (not the min
+    // column norm the 13-piece path packs): a squish is a shear plus a
+    // non-uniform scale, and a shear can have unit-length columns while its
+    // smallest singular value is well under 1. Multiplying rest distances by
+    // it is what keeps the world-space estimate a safe underestimate, i.e.
+    // Lipschitz <= 1, i.e. a sphere trace that cannot step through the skin.
+    let s = pLo.w;
+    let q = (pieceAt(i).invSkin * vec4f(p, 1.0)).xyz;
+    let toBox = max(pLo.xyz - q, q - pHi.xyz);
+    let boxDist = length(max(toBox, vec3f(0.0)));
+    if (boxDist > u.boneMeta.z) {
+      // outside the test shell: the tight box bounds this piece's zero set,
+      // so its distance is a safe lower bound (and >= margin, so no stall)
+      d = min(d, boxDist * s);
+      continue;
+    }
+    if (!cellOwnedBy(q, u32(pieceAt(i).capB.w))) {
+      continue; // another piece draws this clay
+    }
+    // min, not smin. On this rig the ownership boundary between the blob and
+    // a mitt runs through ~12 cm of AIR (the blob's clay stops at |x| = 0.21 m
+    // and the mitts start past 0.33 m — they are DETACHED props, CLAUDE.md
+    // trap 7), so the handoff has no seam to bridge and a smin at the packed
+    // joint width (u.boneMeta.y, ~2 voxels) would be an exact no-op that still
+    // costs every lane. Attach the mitts to the body on some future rig and
+    // this is the one line to change.
+    d = min(d, charDistRest(q) * s);
+  }
+  return d;
+}
+
+// Smooth (AO/penumbra) twin — trap 3. Same three pieces, same ownership, but
+// sampling charLooseRest: the relaxed per-cell coarse field instead of the
+// conservative seed steps, because a conservative distance fed to AO or soft
+// shadows reads as phantom occlusion and bands.
+fn charLooseAffine(p: vec3f) -> f32 {
+  let n = gPieceCount;
+  let far = length(p - gFarCenter) - gFarR;
+  if (far > 0.1) {
+    return far;
+  }
+  var d = 1e9;
+  for (var i = 0; i < n; i++) {
+    let pLo = pieceAt(i).aabbLo;
+    let pHi = pieceAt(i).aabbHi;
+    let s = pLo.w;
+    let q = (pieceAt(i).invSkin * vec4f(p, 1.0)).xyz;
+    let toBox = max(pLo.xyz - q, q - pHi.xyz);
+    let boxDist = length(max(toBox, vec3f(0.0)));
+    if (boxDist > u.boneMeta.z) {
+      d = min(d, boxDist * s);
+      continue;
+    }
+    if (!cellOwnedBy(q, u32(pieceAt(i).capB.w))) {
+      continue;
+    }
+    d = min(d, charLooseRest(q) * s);
+  }
+  return d;
+}
+
+// World -> rest under the affine rig. The winner is the piece whose warped
+// surface is nearest, which is the same contest charDistAffine minimises, so
+// the returned point lands on the surface that was actually drawn.
+fn charRestPointAffine(p: vec3f) -> vec3f {
+  let n = gPieceCount;
+  var best = 1e9;
+  var bestQ = p;
+  for (var i = 0; i < n; i++) {
+    let pLo = pieceAt(i).aabbLo;
+    let pHi = pieceAt(i).aabbHi;
+    let q = (pieceAt(i).invSkin * vec4f(p, 1.0)).xyz;
+    let toBox = max(pLo.xyz - q, q - pHi.xyz);
+    if (length(max(toBox, vec3f(0.0))) > u.boneMeta.z) {
+      continue;
+    }
+    if (!cellOwnedBy(q, u32(pieceAt(i).capB.w))) {
+      continue;
+    }
+    let d = charDistRest(q) * pLo.w;
+    if (d < best) {
+      best = d;
+      bestQ = q;
+    }
+  }
+  return bestQ;
+}
+
 // TRIED AND REJECTED: a capsule-union early-out here (step by the distance to
 // the inflated bone capsules and skip the warp where that bound is comfortably
 // positive). It is sound as a MARCH acceleration — a union of enclosing
@@ -400,6 +562,14 @@ fn charDistI(p: vec3f) -> f32 {
   let n = gPieceCount;
   if (n == 0) {
     return charDistRest(p);
+  }
+  // rigMeta.x picks the rig. It is a UNIFORM branch — every lane in the
+  // wavefront takes the same side — so it costs nothing at runtime, and
+  // keeping both paths in one binary is what lets the parent A/B them
+  // (look.affineRig / CLAYFRAY_NO_AFFINE=1) without a shader edit and the
+  // cold-pipeline-compile benchmarking trap that comes with one.
+  if (u.rigMeta.x > 0.5) {
+    return charDistAffine(p);
   }
   let far = length(p - gFarCenter) - gFarR;
   if (far > 0.1) {
@@ -477,6 +647,9 @@ fn charDistLooseI(p: vec3f) -> f32 {
   if (n == 0) {
     return charLooseRest(p);
   }
+  if (u.rigMeta.x > 0.5) {
+    return charLooseAffine(p);
+  }
   let far = length(p - gFarCenter) - gFarR;
   if (far > 0.1) {
     return far;
@@ -545,6 +718,9 @@ fn charRestPointI(p: vec3f) -> vec3f {
   let n = gPieceCount;
   if (n == 0) {
     return p;
+  }
+  if (u.rigMeta.x > 0.5) {
+    return charRestPointAffine(p);
   }
   var qs: array<vec3f, 16>;
   var boneToPiece: array<i32, 16>;
