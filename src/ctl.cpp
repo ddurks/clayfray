@@ -127,6 +127,7 @@ void CtlServer::buildRegistry() {
     addF("sword.grip1", &l->sword.grip1);
     addF("sword.color", l->sword.color, 3);
     addB("motion.stepRoot", &l->motion.stepRoot);
+    addF("motion.movingResScale", &l->motion.movingResScale);
     addB("hands.ik", &l->hands.ik);
     addF("hands.reach", &l->hands.reach);
     addF("hands.reachScale", &l->hands.reachScale);

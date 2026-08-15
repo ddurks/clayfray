@@ -527,6 +527,9 @@ int runWindowed(const RunOpts& o) {
     }
 
     long lastCamPose = -1;
+    uint64_t prevTraced = 0;
+    int movingFrames = 0, stillFrames = 0;
+    bool lowRes = false;
     uint64_t lastTraced = 0, lastPresented = 0;
     float reuseSkipPct = 0.f;
     uint64_t prevNs = SDL_GetTicksNS();
@@ -637,11 +640,33 @@ int runWindowed(const RunOpts& o) {
         if (++frameCounter % 30 == 0) renderer.reloadShadersIfChanged();
         if (o.exitAfter > 0 && frameCounter >= o.exitAfter) running = false;
 
-        // internal resolution scale (throttled so slider drags don't thrash
-        // target recreation)
+        // Internal resolution scale (throttled so slider drags don't thrash
+        // target recreation), with a lower scale while the view is MOVING.
+        //
+        // The motion signal is whether the renderer traced or reused: that is
+        // one test for camera motion, walking and carving alike. Hysteresis in
+        // both directions matters — a resize itself invalidates the trace, so
+        // reacting to a single traced frame would oscillate forever.
+        {
+            const bool tracedThisFrame = renderer.framesTraced() != prevTraced;
+            prevTraced = renderer.framesTraced();
+            if (tracedThisFrame) {
+                stillFrames = 0;
+                if (movingFrames < 1000) movingFrames++;
+            } else {
+                movingFrames = 0;
+                if (stillFrames < 1000) stillFrames++;
+            }
+            const bool wantLow = look.motion.movingResScale > 0.f && movingFrames > 3;
+            const bool wantFull = stillFrames > 8;
+            if (wantLow) lowRes = true;
+            else if (wantFull) lowRes = false;
+        }
         if (frameCounter % 10 == 0) {
-            int tw = std::max(160, (int)(pw * look.resScale));
-            int th = std::max(90, (int)(ph * look.resScale));
+            const float scale =
+                look.resScale * (lowRes ? look.motion.movingResScale : 1.f);
+            int tw = std::max(160, (int)(pw * scale));
+            int th = std::max(90, (int)(ph * scale));
             if (tw != renderer.width() || th != renderer.height()) renderer.resize(tw, th);
         }
 

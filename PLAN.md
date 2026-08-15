@@ -528,10 +528,26 @@ problem to fix in the renderer, not by degrading the movement.
 engaged; 58.0 ms = 17.2 fps raw (camera orbiting, which reuse can never help).
 Shadow is now 22 steps @1.28.
 
-**Remaining limitation.** The CAMERA still invalidates on every orbit frame.
-The fix is dynamic resolution while the camera moves (drop resScale during the
-drag, restore when it settles; motion masks the softness), NOT more per-sample
-work — see the abandoned-approaches note below for why that lever is spent.
+**Dynamic resolution while moving (done 2026-08-15).** Motion is exactly when
+reuse cannot help and exactly when softness is least visible, so the internal
+scale drops to `look.motion.movingResScale` (0.62) while the view moves and
+snaps back when it settles. The motion signal is whether the renderer TRACED or
+REUSED the last frames — one test that catches camera, walking and carving
+alike, instead of enumerating inputs. Hysteresis both ways is required: a
+resize itself invalidates the trace, so reacting to a single traced frame
+oscillates forever.
+
+Measured: 57.8 -> 27.5 ms while moving, **17.3 -> 36.3 fps (2.10x)**.
+
+**Half-res AO/shadow: measured and NOT worth it after the above.** A cheap
+material-gated version (floor/wall/ground clay only RECEIVE the fighter's
+shadow, so they can use the capsule proxy instead of the exact carved field)
+saved only 4 ms of 58 and hardened the contact shadow under the fighter into a
+blob — rejected on looks. The full 3-pass G-buffer restructure would take
+AO+shadow (~17 ms of the 58 ms raw frame, ~8 ms of the 27.5 ms moving frame) to
+a quarter rate, i.e. **36 -> ~42 fps while moving**, in exchange for a real
+silhouette-artifact risk from bilateral upsampling. Poor ratio now that dynamic
+resolution has taken the motion win; revisit only if 36 fps proves not enough.
 
 **Next lever if needed: half-res AO + shadow.** AO and shadow are ~30 ms of the
 raw frame and are REQUIRED to be smooth (trap 3), which is exactly the argument
