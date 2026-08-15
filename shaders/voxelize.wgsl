@@ -6,13 +6,7 @@
 
 //#include scene_common.wgsl
 
-const GRID: i32 = 74;
-const BRICK_USABLE: f32 = 7.0;
-const VOXEL: f32 = 0.0027344;
-const SPAN: f32 = 0.0191406;
-const VOL_ORIGIN: vec3f = vec3f(-0.7082, -0.1582, -0.7082);
-const BAND: f32 = 12.0;
-const MAX_BRICKS: u32 = 49152u;
+//#constants
 
 const IND_ALLOC: u32 = 0x80000000u;
 const IND_FRESH: u32 = 0x20000000u;
@@ -24,12 +18,10 @@ const IND_IDX_MASK: u32 = 0x000FFFFFu;
 @group(0) @binding(2) var<storage, read> mCol: array<f32>;      // rgb per vertex
 @group(0) @binding(3) var<storage, read> mSkin: array<vec2u>;   // per vertex: 4x joint u8, 4x weight unorm8
 @group(0) @binding(4) var<storage, read> cellTris: array<u32>;  // [offsets: cells+1][ids...]
-@group(0) @binding(5) var<storage, read_write> voxParity: array<u32>; // per-voxel inside bits, 17 u32/row
+@group(0) @binding(5) var<storage, read_write> voxParity: array<u32>; // per-voxel inside bits, ROW_WORDS u32/row
 @group(0) @binding(6) var<storage, read> insideBits: array<u32>;      // per-cell parity (classify)
 
-const CELLS: u32 = u32(GRID * GRID * GRID);
-const AXIS_VOX: i32 = GRID * 7 + 1; // 519 lattice points per axis
-const ROW_WORDS: u32 = 17u;         // ceil(519/32)
+// CELLS / AXIS_VOX / ROW_WORDS are in the //#constants block (src/brick.h).
 
 @group(1) @binding(0) var<storage, read_write> bIndirection: array<u32>;
 @group(1) @binding(1) var<storage, read_write> bDist: array<u32>;

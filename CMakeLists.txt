@@ -41,6 +41,11 @@ set(DAWN_USE_GLFW OFF CACHE BOOL "" FORCE)
 set(DAWN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(TINT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(TINT_BUILD_CMD_TOOLS OFF CACHE BOOL "" FORCE)
+# Windows: lets Dawn load vulkan-1.dll by bare name from System32. Without
+# it, DynamicLib::Open passes LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR (which
+# REQUIRES a fully qualified path) -> error 87 -> no Vulkan backend, and the
+# D3D12 fallback compiles the raymarch shaders through FXC: 7+ min startup.
+set(DAWN_FORCE_SYSTEM_COMPONENT_LOAD ON CACHE BOOL "" FORCE)
 # GIT_SUBMODULES "" is load-bearing: Dawn's repo declares dozens of huge
 # submodules (ANGLE, Mesa, SwiftShader...). DAWN_FETCH_DEPENDENCIES fetches
 # the small required subset instead.

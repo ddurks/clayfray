@@ -1,6 +1,7 @@
 // Single-thread scene raycast for brush placement. Marches the same
 // arena analytics + brickmap the tracer uses, writes hit to a 16B buffer.
 
+//#constants
 //#include scene_common.wgsl
 
 // mirror of trace.wgsl's layout (shared uniform buffer + brick_read include)
@@ -41,6 +42,14 @@ struct Uniforms {
   swordA: vec4f,
   swordB: vec4f,
   swordCol: vec4f,
+  // M5 fighter 1 — mirrored from trace.wgsl (see CLAUDE.md trap 2)
+  foeInv: mat4x4f,
+  foeMeta: vec4f,        // x = enabled, y = bound radius
+  foeCenter: vec4f,      // xyz = bound center (world)
+  // player 1's own posed pieces: it runs the same warp as the hero, so it
+  // animates. Appended (never inserted) so no earlier slot index moves.
+  foePieces: array<Piece, 16>,
+  foeBoneMeta: vec4f,    // x = piece count
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read_write> pickOut: array<vec4f>;
@@ -104,7 +113,15 @@ fn cs() {
   if (hit > 0.5 && mat > 2.5 && mat < 3.5) {
     alb = charAlbedo(p);
   }
+  // rest-space address of the hit: what the sculpt tools must edit at, since
+  // the brick volume is authored in rest space and the body is warped away
+  // from it by pose AND by the fighter's world root
+  var rest = p;
+  if (hit > 0.5 && mat > 2.5 && mat < 3.5) {
+    rest = charRestPoint(p);
+  }
   pickOut[0] = vec4f(p, hit);
   pickOut[1] = vec4f(nrm, mat);
   pickOut[2] = vec4f(alb, 0.0);
+  pickOut[3] = vec4f(rest, 0.0);
 }

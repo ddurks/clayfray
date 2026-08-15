@@ -10,9 +10,7 @@
 //   shared memory, K Jacobi-Godunov iterations, write back own 8^3
 // clearDirty (indirect): drop the dirty bits
 
-const GRID: i32 = 74;
-const BAND: f32 = 12.0;
-const DIRTY_CAP: u32 = 65535u; // indirect dispatch x-dim limit
+//#constants
 
 const IND_ALLOC: u32 = 0x80000000u;
 const IND_INSIDE: u32 = 0x40000000u;

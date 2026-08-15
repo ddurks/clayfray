@@ -238,45 +238,181 @@ Architecture: measure → ledger → gobs → deposit.
   aabb — the old set was authored for the taller analytic blob and carved
   air, which the ledger immediately exposed (measured 0 ml).
 
-## Milestone 4.7 — IK arm rig + sword prop (NEW — enabling tech for M5)
+## Milestone 4.7 — IK hand rig + sword prop (NEW — enabling tech for M5)
 
-*Goal: the fighter holds a sword and the arms follow it via IK. No gameplay
+*Goal: the fighter holds a sword and the hands follow it via IK. No gameplay
 logic yet — this is the rig the dueling core drives.*
 
-The control scheme inverts today's flow: clips pose the arms (FK) and LBS
-renders the SDF around them; here the SWORD is master (driven by the swing or
-a hold pose) and the arms follow to grip it. IK is just another pose source
+The control scheme inverts today's flow: clips pose the body (FK) and LBS
+renders the SDF around it; here the SWORD is master (driven by the swing or
+a hold pose) and the hands follow to grip it. IK is just another pose source
 writing into the same `skinMats_` the chunk articulation already reads.
 
-Rig reality (from the .glb, NOT the stale build script): a real 3-joint arm
-chain per side — `humerus.<s>` → `radius.<s>` → `hand.<s>` → `fingertips`,
-thumb also under radius. So true 2-bone IK (shoulder=humerus, elbow=radius,
-wrist=hand) works; `applyArmIk` rotates the two subtrees so the hand reaches.
+**Rig rework (2026-08-13).** The armed rig used to be a real 3-joint arm per
+side (`humerus.<s>` → `radius.<s>` → `hand.<s>`), and articulating a
+CONTINUOUS clay body across those shoulder joints tore the surface: the trace
+warp blends inverse bone transforms, and where the torso and humerus share
+weight the blend invents sample points between two rest surfaces. Chasing
+that (per-voxel ownership partitions, rigid pieces, forward round-trip
+rejection) was abandoned — see the "rigid pieces" dead end below.
 
-- [x] 2-bone analytic IK per arm (anim.cpp `applyArmIk`): reconstruct world
-  from `skinMats_`, law-of-cosines elbow, rigidly rotate the shoulder subtree
-  about S then the elbow subtree about the solved E' (no per-bone locals
-  needed), rewrite affected skin mats. Elbow-bend plane taken from the FK pose
-  (falls back to a down/back hint). Existing M4 LBS renders it — no new SDF
-  path; |∇d| heatmap stays green (`lookdev/ik_grad.png`)
-- [x] Grip-target data model: `ArmIkChain` per arm with subtree lists; the
+The fix was authorial, not algorithmic: **the arms were deleted.** The rig is
+now a blob body (`base` → `base.001` → `base.002`) that barely deforms, plus
+two DETACHED mitts (`hand.<s>` → {`thumb.<s>`→`thumbtip.<s>`,
+`finger.<s>`→`fingertip.<s>`}) authored as a separate mesh object. Body and
+hand weights are disjoint, so no blend band spans a bending joint and the
+original M4 warp is tear-free by construction.
+
+With no arm chain there is nothing to solve a 2-bone IK on. Hands are instead
+moved BODILY to their grips, tethered only by a maximum radius from the
+body's centre of mass — the "arm length" of a fighter with no arms.
+
+- [x] Floating-hand IK (anim.cpp `applyHandIk`): reconstruct world from
+  `skinMats_`, rigidly transform the whole mitt subtree onto its grip,
+  rewrite affected skin mats. Rotation aligns the mitt's rest finger axis
+  with the blade so both hands stack on the handle; `hands.orient 0` keeps
+  the rest orientation. Existing M4 LBS renders it — no new SDF path
+- [x] The tether: `deriveBodyCom`/`evalBodyCom` split the blob's skin-weight
+  mass per bone so the centre of mass re-evaluates under any pose; each grip
+  target is clamped into the ball of radius `hands.reach` about it (0 = auto,
+  rest COM→wrist distance × `hands.reachScale`, 0.423 m × 1.5 on this rig).
+  Out-of-range reads as the grip slipping, not arms stretching
+- [x] Grip-target data model: `HandIkChain` per hand with subtree list; the
   sword carries 2 grips (grip0/grip1 along the blade), hands assigned by
   `.l`/`.r`. One-prop-two-grips now; per-hand props (dual-wield) drop in
   without IK changes
 - [x] Sword as a rigid emissive prop (marble precedent): capsule SDF hilt→tip,
   emissive lightsaber shading (bloom does the glow), `MAT_SWORD`; uniforms
   swordA/B/Col. Model swap later
-- [x] Reachable envelope: per-hand target clamped to the arm's [|L1−L2|,
-  L1+L2] annulus so IK always solves and the arm reads as a real reach.
-  Sword-transform clamp / torso lean for gross out-of-reach still DEFERRED
-- [x] IK layered over FK: arms driven by IK to the grips, torso/head by the
-  clip — verified holding the guard identically across clip frames
-  (`lookdev/ik_anim.png` at t=2.4 vs rest)
-- [x] Debug harness: "sword / IK" panel drives the hilt transform live;
-  `lookdev/ik_test2.png` two-handed guard. Windowed smoke test clean
-- [ ] DEFERRED refinements: hand ORIENTATION to grip (wrist twist to align the
-  mitt with the handle — position-only for now), sword-transform reach clamp +
-  torso lean, and 12 Hz quantization of the swing (smooth for debug drag now)
+- [x] IK layered over FK: hands driven by IK to the grips, body by the clip —
+  verified holding the guard across clip frames
+- [x] Debug harness: "sword / IK" panel drives the hilt transform + all
+  `hands.*` knobs live; every one is ctl-settable for replay scenarios
+- [x] Mitt orientation solved as a FULL frame, not a single-axis swing. The
+  mitt is really a stubby arm (0.27 m wrist→fingertip on a 0.69 m body), so
+  its finger axis runs along the REACH (body→grip) and its thinnest axis
+  (0.10 m, measured off the mesh at import) lies on the handle. Two grips a
+  hand's width apart then fan apart from the body instead of converging.
+  Aiming the fingers down the blade instead spent 0.27 m of handle per hand
+  and the mitts interpenetrated; grip spacing must also clear the thin axis,
+  hence grip0/grip1 defaults 0.05/0.19
+- [x] Eye gaze (M4.8): `applyGaze` rotates each eye bone toward the camera,
+  clamped to a 90° cone off the head's FK forward, re-sampled on the 12 Hz
+  pose grid (a live camera would slide the eyes at frame rate). Eyes are
+  PORCELAIN, not clay: primitives whose material is named `marble_*` are
+  lifted out of the voxelized body into beads that ride their nearest bone,
+  so the gaze bones move them for free
+- [ ] DEFERRED refinements: sword-transform reach clamp + body lean when out
+  of range, and 12 Hz quantization of the swing (smooth for debug drag now)
+
+## Milestone 5 — duel harness (IN PROGRESS)
+
+- [x] Locomotion: a `FighterPose` (pos/yaw/lean/moving) premultiplied onto
+  every skin matrix, so clips stay authored in character space and marbles,
+  capsules, the COM and the IK'd hands all follow without knowing about it.
+  WASD walks camera-relative, the fighter turns to face travel and leans into
+  it (lean eases off mid-pivot so a hard turn doesn't throw the body), and the
+  clip switches bounce/idle on the moving flag. Drivable from ctl/replay
+- [x] Carried sword: `sword.carry` reads pos/yaw in CHARACTER space and rides
+  the root, so walking carries the blade and the hands keep their grip
+- [x] Swing: SPACE sweeps a random arc across the front over 0.42 s (seeded
+  RNG, eased), layered ON TOP of the panel's hold pose
+- [x] Player 2 (`Renderer::addPlayer`): an identical fighter in its OWN
+  carveable volume, running its own clip clock (phase-offset so two identical
+  bodies don't breathe in lockstep) and carrying its own eye beads. The trace
+  reads both through one set of sampling functions selected by a private
+  `gFighter`/`pieceAt` — no duplicated warp. CAP IS 2: each extra volume is
+  another static WGSL binding, so 3+ needs the slice refactor below
+- [x] Slice = carve a channel. Three bugs worth remembering, each of which
+  looked like "cutting doesn't work":
+  1. A SPHERE at the blade's deepest contact sits wholly inside the body —
+     1.4 litres left the ledger with nothing visible. The brush is now a
+     CAPSULE (`BrickEdit.segment`/`posB`, equal endpoints = the old sphere)
+     spanning the blade's entry to exit, pushed past both so it breaks skin.
+  2. Testing only the current hilt->tip segment samples an INSTANT. A swing
+     crosses centimetres per frame, so the wound came out as separate
+     tunnels. The cut is now substepped along the blade's path between frames.
+  3. The substeps all landed in one place because `prevTip_` was advanced
+     BEFORE the loop that interpolates from it.
+  Substeps need several ops per frame, so `BrickSystem::kOpsPerFrame` (6) now
+  drains a batch sharing ONE JFA/redistance — at one op per frame the wound
+  unzipped over half a second after the swing. Residual scalloping on very
+  fast swings is that budget; raising it costs carve dispatches, not refreshes
+
+## Multi-fighter architecture — fighters are SLICES, not systems (LOCKED)
+
+*Goal: 2+ carveable clay fighters so they can actually duel. The decision
+that matters is where a "fighter" lives in the data, and it has to be made
+BEFORE fighter #2 is built, because the obvious answer caps you at two.*
+
+**Measured first (74³ = 405,224 cells, kMaxBricks = 49,152):**
+
+| buffer class | bytes | per-fighter? |
+|---|---|---|
+| per-cell (indirection, seeds, coarse+B, cellWeights, jfaA/B) | ~13 MB | YES |
+| brick pools (dist 50 MB + albedo 101 MB + weight 101 MB) | ~252 MB | NO — shareable |
+| one BrickSystem as it stands today | ~265 MB | |
+
+**Rejected: one BrickSystem per fighter.** It is what the earlier M5 note
+proposed and it is wrong. Three reasons, in order of severity:
+1. **WGSL bindings are static** — there are no binding arrays, so N systems
+   means N copy-pasted binding sets and N copies of every sampling function.
+   The shader forks per fighter. This alone kills it past two.
+2. It duplicates the 252 MB of brick pools that fighters could share: 2
+   fighters = 530 MB, 4 = 1.06 GB.
+3. The uniform block cannot hold a second fighter anyway — see below.
+
+**Locked: one BrickSystem, fighters are slices of it.**
+- Per-cell arrays get a fighter stride: `bIndirection[f * CELLS + cellIndex(c)]`.
+  ~13 MB per fighter, and **one binding set, one shader** — the only shader
+  change is an index.
+- The **brick pool stays shared and sparse**. The free-list allocator already
+  serves arbitrary owners, and a fighter only allocates bricks near its own
+  surface, so its clay is genuinely private — carving one cannot touch
+  another's voxels. 4 fighters ≈ 300 MB instead of 1.06 GB.
+- **The volume extent is NOT an arena limit.** Each fighter is voxelized in
+  its OWN rest space and placed by its root transform, so the 1.42 m box
+  bounds one character, never the arena. Fighters can stand anywhere.
+
+**Forced companion change: pieces leave the uniform block.** `pieces` alone is
+16 × 12 = 192 of the 288 uniform slots (66..257) — one fighter fills two
+thirds of the buffer. Pieces, capsules and marbles must move to storage
+buffers indexed by fighter. This is not optional and is the single biggest
+edit in the work.
+
+**Why the per-frame cost stays sane:**
+- Redistance/JFA is already dirty-list driven with indirect dispatch, so an
+  UNEDITED fighter costs nothing per frame. Idle opponents are free.
+- `map()` loops fighters behind the existing per-fighter bounding sphere
+  (`capsCenter`/`capsMeta`, already computed from posed capsules), so a ray
+  far from a fighter pays one sphere test, not a volume walk.
+
+**Phasing — phase 1 is the de-risk:**
+1. Thread a fighter index through everything with **N = 1**. No visible
+   change, `--carve-test` and the replay scenarios stay green. The whole
+   refactor lands while the game still looks identical.
+2. N = 2: second fighter standing, slice-carve routed by index.
+3. N players: input routing, per-fighter ledger and stats.
+
+**Open risks:**
+- **Pool capacity.** The one measurement on record is 12,417 of 49,152 bricks
+  allocated (older, taller character) — 4 fighters would sit right at the cap.
+  Re-measure with `CLAYFRAY_DEBUG_STATS=1` on the current blob before picking
+  a fighter limit; raising `kMaxBricks` costs ~5 MB per 1k bricks.
+- **Conservation ledger** is single-body (`sploot_`). It becomes per-fighter,
+  with gobs carrying a source id. `--carve-test` must stay exit-0 throughout.
+- **16-piece cap** is per fighter once pieces are indexed; the hero is at 15
+  bones of 16 already, so that cap needs raising in the same pass.
+- Snapshots: bump `kVersion`, per-fighter sections.
+
+**Dead end — do not retry without new information (2026-08-13).** Before the
+rig rework, the shoulder tear was attacked in the shader: per-voxel top-2 bone
+ownership baked at import, pieces defined as body ∩ owned-region, rigid
+per-piece inverse transforms unioned with a 2-nearest smin, and a forward
+LBS round-trip to reject vacated-space samples. It traded tearing for
+epaulet flaps and needed a threshold (`OWN_T`) calibrated per rig. All of it
+was reverted; the tear was a MESH TOPOLOGY problem (one continuous skin across
+a bending joint), and separating the meshes dissolved it.
 
 ## Milestone DEV — Agent iteration loop (NEW, shipped 2026-08-13)
 

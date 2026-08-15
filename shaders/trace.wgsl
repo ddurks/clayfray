@@ -41,10 +41,20 @@ struct Uniforms {
   swordA: vec4f,         // M4.7: hilt xyz, w = blade radius (0 = no sword)
   swordB: vec4f,         // tip xyz
   swordCol: vec4f,       // emissive rgb
+  // M5 fighter 1: world -> its rest volume, plus a bounding sphere so rays
+  // nowhere near it reject in one test. Slots 287..292.
+  foeInv: mat4x4f,
+  foeMeta: vec4f,        // x = enabled, y = bound radius
+  foeCenter: vec4f,      // xyz = bound center (world)
+  // player 1's own posed pieces: it runs the same warp as the hero, so it
+  // animates. Appended (never inserted) so no earlier slot index moves.
+  foePieces: array<Piece, 16>,
+  foeBoneMeta: vec4f,    // x = piece count
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var hdrOut: texture_storage_2d<rgba16float, write>;
 
+//#constants
 //#include scene_common.wgsl
 //#include brick_read.wgsl
 //#include ground_read.wgsl
@@ -56,6 +66,10 @@ const MAT_EYE: f32 = 4.0;   // + marble index (4..11)
 const MAT_PUPIL: f32 = 5.0;
 const MAT_GCLAY: f32 = 20.0;
 const MAT_GOB: f32 = 21.0;  // + gob index (21..32)
+// Deliberately just above MAT_BODY and still under the 3.5 clay cutoff: the
+// opponent IS clay, so grain, AO and the marbles-only glint rule all classify
+// it correctly with no extra predicates. Only albedo needs to know.
+const MAT_FOE: f32 = 3.2;    // M5: the opponent's clay (own volume, carveable)
 const MAT_SWORD: f32 = 50.0; // M4.7: rigid emissive blade, never clay
 
 // ---------- marbles: rigid glass beads, data-driven (never clay) ----------
@@ -82,6 +96,11 @@ fn map(p: vec3f) -> vec2f {
   if (dc < d) {
     d = dc;
     m = MAT_BODY;
+  }
+  let df = foeDist(p);
+  if (df < d) {
+    d = df;
+    m = MAT_FOE;
   }
   let n = i32(u.marbleMeta.x);
   for (var i = 0; i < n; i++) {
@@ -138,6 +157,7 @@ fn march(ro: vec3f, rd: vec3f) -> vec2f {
 fn mapLoose(p: vec3f) -> f32 {
   var d = min(arenaFloor(p), arenaWall(p));
   d = min(d, charDistLoose(p));
+  d = min(d, foeDistLoose(p));
   d = min(d, marblesDist(p));
   d = min(d, groundClaySmooth(p)); // piles shade/occlude like set dressing
   return d;
@@ -187,6 +207,7 @@ fn charProxy(p: vec3f) -> f32 {
   return d;
 }
 
+
 // Shadow STEPS need the conservative field (an overestimate tunnels through
 // the surface) but the PENUMBRA term needs the smooth one — the crease-y
 // seed-based estimates paint organic swirls across every lit surface.
@@ -197,7 +218,14 @@ fn charProxy(p: vec3f) -> f32 {
 // downward errors, which are what band under a penumbra term.
 fn mapPenumbra(p: vec3f) -> f32 {
   var d = min(arenaFloor(p), arenaWall(p));
+  // The max() with the real field is NOT optional: the fitted capsules bulge
+  // past the true surface, so using the proxy alone as the occluder buries
+  // anything sitting proud of the body — the marble eyes render black. Speed
+  // comes from the conservative early-out inside charDistLoose instead, which
+  // is safe because it never REPLACES the field, only skips evaluating it
+  // where a bound already proves the surface is far.
   d = min(d, max(charProxy(p), charDistLoose(p)));
+  d = min(d, foeDistLoose(p));
   d = min(d, marblesDist(p));
   d = min(d, groundClaySmooth(p));
   return d;
@@ -242,6 +270,9 @@ fn albedoFor(p: vec3f, m: f32) -> vec3f {
     let cid = pebbleCell(vec3f(p.x, p.z - WALL_Z, p.y), WALL_CELL, WALL_SEED, WALL_SQUASH);
     return stonePalette(hash12(cid * 5.1 + 4.0)) * (0.42 + 0.28 * fbm(p * 7.0)) *
            (0.82 + 0.36 * fbm(p * 23.0));
+  } else if (abs(m - MAT_FOE) < 0.1) {
+    // opponent: same per-voxel colour, read from ITS volume
+    return foeAlbedo(p);
   } else if (m < 3.5) {
     // per-voxel color from the brickmap (carve reveals, add stamps)
     return charAlbedo(p);
@@ -324,7 +355,14 @@ fn shade(p: vec3f, rd: vec3f, m: f32) -> vec3f {
   let spotDir = normalize(vec3f(0.0, 0.55, 0.0) - u.keyPos.xyz);
   let cone = pow(clamp(dot(-lk, spotDir), 0.0, 1.0), 7.0);
   let att = cone * u.keyPos.w / (1.0 + u.keyColor.w * dk * dk);
-  let sh = softShadow(p + nGeo * 0.022, lk, dk); // offset > voxel: no acne on the sampled field
+  // Shadow-ray origin bias. Must clear ONE CELL, not one voxel: an
+  // unallocated cell's conservative distance has a 0.5*SPAN floor and the
+  // coarse field is cell-granular, so a ray starting inside a cell of the
+  // surface self-intersects and the terminator breaks into ragged black
+  // gashes. This was a hardcoded 0.022 = 1.15 * SPAN at kGrid=74; frozen as a
+  // literal it silently became 0.57 * SPAN at kGrid=37 and the acne appeared.
+  // Keep it expressed in SPAN so it tracks the resolution.
+  let sh = softShadow(p + nGeo * (1.15 * SPAN), lk, dk);
   let ndl = clamp((dot(n, lk) + 0.25) / 1.25, 0.0, 1.0);
   var col = alb * u.keyColor.rgb * att * ndl * sh;
 
@@ -379,7 +417,7 @@ fn cs(@builtin(global_invocation_id) gid: vec3u) {
         // debug 3: |grad charDist| - 1 heatmap. green = true SDF, red =
         // gradient too steep, blue = too shallow
         let p = ro + rd * tm.x;
-        let ge = 0.0027344; // one voxel
+        let ge = VOXEL; // one voxel (brick_read.wgsl — don't hardcode)
         let gx = charDist(p + vec3f(ge, 0.0, 0.0)) - charDist(p - vec3f(ge, 0.0, 0.0));
         let gy = charDist(p + vec3f(0.0, ge, 0.0)) - charDist(p - vec3f(0.0, ge, 0.0));
         let gz = charDist(p + vec3f(0.0, 0.0, ge)) - charDist(p - vec3f(0.0, 0.0, ge));

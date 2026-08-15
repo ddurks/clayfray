@@ -1,8 +1,8 @@
-// Jump-flood over the 74^3 brick grid: nearest allocated cell for every
+// Jump-flood over the 50^3 brick grid: nearest allocated cell for every
 // empty cell -> Chebyshev distance (brick units) stored in the indirection
 // entry. Runs after every edit; whole grid costs ~3M threads total.
 
-const GRID: i32 = 74;
+//#constants
 const IND_ALLOC: u32 = 0x80000000u;
 const IND_INSIDE: u32 = 0x40000000u;
 const IND_CHEB_MASK: u32 = 0x000000FFu;
@@ -21,9 +21,6 @@ struct JfaParams {
 @group(0) @binding(5) var<storage, read_write> coarseDist: array<f32>; // per-cell true-ish distance (m)
 @group(0) @binding(6) var<storage, read_write> coarseB: array<f32>;    // relaxation ping-pong
 
-const BRICK_USABLE: f32 = 7.0;
-const VOXEL: f32 = 0.0027344;
-const SPAN: f32 = 0.0191406;
 const IND_IDX_MASK: u32 = 0x000FFFFFu;
 
 fn brickCenterValue(brick: u32) -> f32 {

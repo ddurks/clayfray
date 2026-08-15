@@ -4,7 +4,10 @@
 
 namespace {
 constexpr char kMagic[4] = {'C', 'F', 'S', 'N'};
-constexpr uint32_t kVersion = 1;
+// 2: BrickEdit gained worldPos (rest-space pos + world wound, M5 locomotion)
+// 3: BrickEdit gained the capsule brush (segment/posB) for blade cuts
+// 4: kGrid 74 -> 50 (kVoxel 2.73 -> 4.05 mm); every pool/cell size changed
+constexpr uint32_t kVersion = 4;
 
 uint32_t tagWord(const char tag[4]) {
     uint32_t w;

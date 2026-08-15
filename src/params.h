@@ -1,18 +1,70 @@
 #pragma once
 
-// M4.7 sword prop + arm IK. Debug: the hilt transform is driven by these
+// M5 locomotion: where the fighter stands and which way it is going. The
+// whole skeleton is premultiplied by this, so pose clips stay authored in
+// character space and the sword/hands follow for free.
+struct FighterPose {
+    float pos[3] = {0.f, 0.f, 0.f}; // world, feet on the arena floor
+    float yaw = 0.f;                // facing, radians about +Y
+    float lean = 0.f;               // radians tilted INTO the direction of travel
+    bool moving = false;            // picks the bounce clip over idle
+};
+
+// M4.7 sword prop + hand IK. Debug: the hilt transform is driven by these
 // panel controls so dragging it demonstrates the hands following via IK.
 // Later the swing/hold pose drives the transform instead.
 struct SwordParams {
-    bool enabled = true;             // hold the sword + run arm IK
-    float pos[3] = {0.f, 0.30f, 0.38f}; // hilt, world (in front of the chest)
+    bool enabled = true;             // hold the sword + run hand IK
+    // carried: `pos`/`yaw` are read in CHARACTER space and ride the fighter's
+    // root, so walking carries the sword and the hands keep their grip. Off =
+    // the old debug behaviour, hilt placed directly in world space.
+    bool carry = true;
+    float pos[3] = {0.16f, 0.26f, 0.30f}; // hilt, in front of and beside the chest
     float yaw = 0.f;                 // radians about world Y
-    float pitch = 0.7f;              // radians: +tilts blade up-forward from +Z
+    // guard pose: blade STRAIGHT UP (pitch = pi/2 makes dir = +Y). The swing
+    // drops it to horizontal and sweeps; at rest it stands vertical.
+    float pitch = 1.5708f;
     float length = 0.85f;            // hilt -> tip, meters
     float radius = 0.018f;           // blade thickness
-    float grip0 = 0.03f;             // near-hilt grip (one hand), m along blade
-    float grip1 = 0.14f;             // stacked grip (other hand), m along blade
+    // grip spacing must clear the mitt's own thickness along the handle
+    // (~0.10 m on this rig) or the two hands interpenetrate
+    float grip0 = 0.05f;             // near-hilt grip (one hand), m along blade
+    float grip1 = 0.19f;             // stacked grip (other hand), m along blade
     float color[3] = {0.35f, 0.85f, 1.0f}; // debug lightsaber cyan (emissive)
+};
+
+// M4.7 floating hands. The rig has no arms — the mitts are detached, and
+// the ONLY thing holding them to the fighter is `reach`, a max distance from
+// the blob body's centre of mass. Push the sword past that and the hands
+// stop following, which reads as the grip slipping rather than the arms
+// stretching (there are no arms to stretch).
+struct HandParams {
+    bool ik = true;          // hands follow the sword grips
+    float reach = 0.f;       // max m from body COM; 0 = auto from the rest rig
+    float reachScale = 1.5f; // auto reach = rest COM->wrist distance * this
+    float palmFrac = 0.6f;   // where along wrist->fingertip the grip sits
+    bool orient = true;      // wrap the mitts around the handle
+    float gripRoll = -1.5f;  // radians about the handle: where fingers point
+    // Two-handed grip. The mitts sit on OPPOSITE faces of the blade rather
+    // than both on its axis — each offset sideways by half the blade's width,
+    // so `gripSpread` is measured in sword radii (1 = exactly half the width
+    // to each side, i.e. each palm on its own face). Then each hand rolls
+    // INWARD by gripCurl, mirrored, so the fingers wrap toward each other the
+    // way they do around a real handle instead of both pointing the same way.
+    float gripSpread = 2.5f;  // lateral offset per hand, in sword radii
+    // Finger curl: rotates the thumb/finger subtrees ABOUT THE HANDLE AXIS so
+    // the digits wrap onto the blade. The wrist is deliberately untouched —
+    // rolling the whole mitt moves the palm off the grip, which is a different
+    // (and wrong) thing. Mirrored per hand so both curl inward.
+    float gripCurl = 0.5f;    // radians, per digit
+};
+
+// M4.8 gaze. The eye bones are leaves under the head, so this is a pure
+// rotation per eye toward whatever the fighter is looking at (the camera, for
+// now). Quantized to the 12 Hz pose grid like everything else that moves.
+struct GazeParams {
+    bool track = true;         // eyes follow the camera as it orbits
+    float maxAngle = 1.5708f;  // clamp cone off the head's forward, radians
 };
 
 // Look-dev parameters, exposed in the ImGui panel and packed into the
@@ -65,8 +117,10 @@ struct LookParams {
     // vanishing. Off = the pre-conservation vanish behavior.
     bool conserveClay = true;
 
-    // M4.7 sword prop + arm IK (debug-controlled hilt transform).
+    // M4.7 sword prop + floating-hand IK (debug-controlled hilt transform).
     SwordParams sword;
+    HandParams hands;
+    GazeParams gaze;
 };
 
 // Conservation ledger readout for the panel (all volumes in m^3).

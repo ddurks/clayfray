@@ -3,13 +3,17 @@
 #include "snapshot.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
 namespace {
 
-constexpr float kOrigin[3] = {-0.7082f, -0.1582f, -0.7082f};
+// Volume geometry lives in BrickSystem (brick.h) — the members below are the
+// same constants this file used to keep a private copy of.
+using K = BrickSystem;
+constexpr const float* kOrigin = K::kOrigin;
 
 wgpu::ShaderModule makeModule(wgpu::Device& device, const std::string& src,
                               const char* label) {
@@ -27,7 +31,14 @@ wgpu::ComputePipeline makePipeline(wgpu::Device& device, wgpu::ShaderModule mod,
     desc.label = entry;
     desc.compute.module = mod;
     desc.compute.entryPoint = entry;
-    return device.CreateComputePipeline(&desc);
+    auto t0 = std::chrono::steady_clock::now();
+    wgpu::ComputePipeline p = device.CreateComputePipeline(&desc);
+    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (s > 0.5) {
+        std::printf("[startup] %s pipeline: %.1fs\n", entry, s);
+        std::fflush(stdout);
+    }
+    return p;
 }
 
 wgpu::Buffer makeStorage(wgpu::Device& device, uint64_t size, const char* label,
@@ -45,9 +56,39 @@ struct EditParamsCpu {
     int32_t regionDims[4];
     float brush[4];
     float color[4];
+    float brushB[4];
 };
 
 } // namespace
+
+// Emitted verbatim into each shader root by the renderer's `//#constants`
+// directive. %.9g round-trips a float exactly, so the GPU sees bit-identical
+// values to the CPU — which matters: a cell index computed from a slightly
+// different SPAN lands in a different brick.
+std::string BrickSystem::wgslConstants() {
+    char buf[1200];
+    std::snprintf(
+        buf, sizeof(buf),
+        "// GENERATED from BrickSystem in src/brick.h — do not edit here, and\n"
+        "// do not hand-copy these into a shader. Change kGrid and rebuild.\n"
+        "const GRID: i32 = %d;\n"
+        "const BRICK_USABLE: f32 = %d.0;\n"
+        "const VOXEL: f32 = %.9g;\n"
+        "const SPAN: f32 = %.9g;\n"
+        "const VOL_ORIGIN: vec3f = vec3f(%.9g, %.9g, %.9g);\n"
+        "const BAND: f32 = %.9g;\n"
+        "const MAX_BRICKS: u32 = %uu;\n"
+        "const DIRTY_CAP: u32 = %uu;\n"
+        "const CELLS: u32 = %uu;\n"
+        "const AXIS_VOX: i32 = %d;\n"
+        "const ROW_WORDS: u32 = %uu;\n"
+        "const WARP_RESID_TOL: f32 = %.9g;\n",
+        kGrid, kBrickUsable, (double)kVoxel, (double)kSpan, (double)kOrigin[0],
+        (double)kOrigin[1], (double)kOrigin[2], (double)kBand, kMaxBricks,
+        kDirtyCap, (uint32_t)kGrid * kGrid * kGrid, (int)kAxisVox, kRowWords,
+        (double)(kWarpResidSpans * kSpan));
+    return buf;
+}
 
 bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& jfaSrc,
                        const std::string& redistSrc, const std::string& voxelizeSrc) {
@@ -69,8 +110,9 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
     seeds = jfaA_;
     coarse = makeStorage(dev, cells * 4ull, "coarse dist");
     coarseB_ = makeStorage(dev, cells * 4ull, "coarse dist B");
-    static_assert(sizeof(EditParamsCpu) == 64, "must match WGSL EditParams");
-    editParams_ = makeStorage(dev, sizeof(EditParamsCpu), "edit params", true);
+    static_assert(sizeof(EditParamsCpu) == 80, "must match WGSL EditParams");
+    for (int i = 0; i < kOpsPerFrame; i++)
+        editParams_[i] = makeStorage(dev, sizeof(EditParamsCpu), "edit params", true);
 
     // 7 pow2 JFA rounds + two refinement rounds (JFA+2: kills the classic
     // 1-JFA wrong-seed errors that overstate safe steps), alternating source
@@ -85,7 +127,7 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
     int32_t resolveData[4] = {1, 0, 0, 0};
     gpu.queue.WriteBuffer(jfaResolveParams_, 0, resolveData, sizeof(resolveData));
 
-    dirtyList_ = makeStorage(dev, 65535ull * 4, "dirty list");
+    dirtyList_ = makeStorage(dev, (uint64_t)kDirtyCap * 4, "dirty list");
     {
         wgpu::BufferDescriptor desc{};
         desc.label = "redist indirect args";
@@ -129,10 +171,12 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
         return gpu_->device.CreateBindGroup(&desc);
     };
 
-    classifyG0_ = bind(classify_, 0, {{0, editParams_}});
+    for (int i = 0; i < kOpsPerFrame; i++)
+        classifyG0_[i] = bind(classify_, 0, {{0, editParams_[i]}});
     classifyG1_ = bind(classify_, 1, {{0, indirection}});
     classifyG2_ = bind(classify_, 2, {{0, counters_}, {1, freelist_}});
-    fillG0_ = bind(fill_, 0, {{0, editParams_}});
+    for (int i = 0; i < kOpsPerFrame; i++)
+        fillG0_[i] = bind(fill_, 0, {{0, editParams_[i]}});
     fillG1_ = bind(fill_, 1, {{0, indirection}, {1, distPool}, {2, albedoPool}});
     fillG2_ = bind(fill_, 2, {{0, counters_}, {1, freelist_}});
     jfaInitG_ = bind(jfaInit_, 0, {{0, indirection}, {1, jfaA_}});
@@ -286,12 +330,28 @@ void BrickSystem::debugScanField() {
     }
 }
 
+// Legacy single-fighter entry point: prepare and use in one step.
 void BrickSystem::requestImport(CharacterAsset asset) {
-    wgpu::Device& dev = gpu_->device;
+    requestImport(prepareImport(*gpu_, asset));
+}
+
+std::shared_ptr<BrickSystem::MeshImport> BrickSystem::prepareImport(
+    Gpu& gpu, const CharacterAsset& asset) {
+    wgpu::Device& dev = gpu.device;
     const uint32_t cells = kGrid * kGrid * kGrid;
     const uint32_t triCount = asset.triangleCount();
     const uint32_t vertCount = asset.vertexCount();
-    if (triCount == 0) return;
+    if (triCount == 0) return nullptr;
+    auto tick = std::chrono::steady_clock::now();
+    auto lap = [&tick](const char* what) {
+        auto now = std::chrono::steady_clock::now();
+        double s = std::chrono::duration<double>(now - tick).count();
+        if (s > 0.5) {
+            std::printf("[startup] import %s: %.1fs\n", what, s);
+            std::fflush(stdout);
+        }
+        tick = now;
+    };
 
     // per-vertex packed skin: x = 4x joint u8, y = 4x weight unorm8
     std::vector<uint32_t> skin(vertCount * 2);
@@ -346,6 +406,7 @@ void BrickSystem::requestImport(CharacterAsset asset) {
                 for (int x = mn[0]; x <= mx[0]; x++)
                     ids[cursor[x + y * kGrid + z * kGrid * kGrid]++] = t;
     }
+    lap("bin");
 
     // watertight inside/outside per cell: +x raycast parity per (y,z) row
     std::vector<uint32_t> inside((cells + 31) / 32, 0);
@@ -391,6 +452,8 @@ void BrickSystem::requestImport(CharacterAsset asset) {
         }
     }
 
+    lap("parity");
+
     // smooth area-weighted vertex normals: the voxel sign test needs them —
     // face-normal signs flip at edges/vertices and speckle the silhouette
     std::vector<float> normals(vertCount * 3, 0.f);
@@ -419,6 +482,8 @@ void BrickSystem::requestImport(CharacterAsset asset) {
         posNrm[v * 6 + 4] = ny / len;
         posNrm[v * 6 + 5] = nz / len;
     }
+
+    lap("normals");
 
     // per-cell 4-slot bone weights (joints word + weights word per cell):
     // the trace-side warp blends up to four bones per region, which is what
@@ -500,24 +565,41 @@ void BrickSystem::requestImport(CharacterAsset asset) {
         }
     }
 
+    lap("cellW");
+
     auto upload = [&](const void* data, uint64_t bytes, const char* label) {
         wgpu::Buffer buf = makeStorage(dev, std::max<uint64_t>(bytes, 4), label);
-        if (bytes) gpu_->queue.WriteBuffer(buf, 0, data, bytes);
+        if (bytes) gpu.queue.WriteBuffer(buf, 0, data, bytes);
         return buf;
     };
-    gpu_->queue.WriteBuffer(cellWeights, 0, cellW.data(), cellW.size() * 4);
-    vxPos_ = upload(posNrm.data(), posNrm.size() * 4, "mesh pos+normal");
-    vxIdx_ = upload(asset.indices.data(), asset.indices.size() * 4, "mesh idx");
-    vxCol_ = upload(asset.colors.data(), asset.colors.size() * 4, "mesh col");
-    vxSkin_ = upload(skin.data(), skin.size() * 4, "mesh skin");
+    auto mesh = std::make_shared<MeshImport>();
+    mesh->triCount = triCount;
+    mesh->cellW = std::move(cellW);
+    mesh->pos = upload(posNrm.data(), posNrm.size() * 4, "mesh pos+normal");
+    mesh->idx = upload(asset.indices.data(), asset.indices.size() * 4, "mesh idx");
+    mesh->col = upload(asset.colors.data(), asset.colors.size() * 4, "mesh col");
+    mesh->skin = upload(skin.data(), skin.size() * 4, "mesh skin");
     // merged [offsets][ids] — stays inside the 10-storage-buffer limit
     std::vector<uint32_t> merged;
     merged.reserve(offsets.size() + ids.size());
     merged.insert(merged.end(), offsets.begin(), offsets.end());
     merged.insert(merged.end(), ids.begin(), ids.end());
-    vxTris_ = upload(merged.data(), merged.size() * 4, "cell tris");
-    vxInside_ = upload(inside.data(), inside.size() * 4, "inside bits");
-    const uint32_t axisVox = kGrid * 7 + 1, rowWords = 17;
+    mesh->tris = upload(merged.data(), merged.size() * 4, "cell tris");
+    mesh->inside = upload(inside.data(), inside.size() * 4, "inside bits");
+
+    std::printf("import: %u tris binned (%zu refs), parity done\n", triCount, ids.size());
+    return mesh;
+}
+
+void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
+    if (!mesh) return;
+    wgpu::Device& dev = gpu_->device;
+    mesh_ = std::move(mesh);
+
+    // per-fighter: this volume's own cell-weight copy and parity scratch
+    gpu_->queue.WriteBuffer(cellWeights, 0, mesh_->cellW.data(),
+                            mesh_->cellW.size() * 4);
+    const uint32_t axisVox = kAxisVox, rowWords = kRowWords;
     vxParityBuf_ = makeStorage(dev, (uint64_t)axisVox * axisVox * rowWords * 4,
                                "voxel parity");
 
@@ -536,13 +618,12 @@ void BrickSystem::requestImport(CharacterAsset asset) {
     };
     // classify's auto layout skips bindings it doesn't touch; fill uses all.
     vxG0_ = bindv(vxFill_, 0,
-                  {{0, vxPos_}, {1, vxIdx_}, {2, vxCol_}, {3, vxSkin_},
-                   {4, vxTris_}, {5, vxParityBuf_}});
+                  {{0, mesh_->pos}, {1, mesh_->idx}, {2, mesh_->col},
+                   {3, mesh_->skin}, {4, mesh_->tris}, {5, vxParityBuf_}});
     vxG1_ = bindv(vxFill_, 1,
                   {{0, indirection}, {1, distPool}, {2, albedoPool}, {3, weightPool}});
     vxG2_ = bindv(vxClassify_, 2, {{0, counters_}, {1, freelist_}});
 
-    std::printf("import: %u tris binned (%zu refs), parity done\n", triCount, ids.size());
     importPending_ = true;
     bakePending_ = false;
 }
@@ -564,14 +645,14 @@ void BrickSystem::encodeImport(wgpu::CommandEncoder& enc) {
         desc.entries = e.data();
         return gpu_->device.CreateBindGroup(&desc);
     };
-    wgpu::BindGroup cg0 = bindc2(vxClassify_, 0, {{0, vxPos_}, {1, vxIdx_},
-                                                  {4, vxTris_}, {6, vxInside_}});
+    wgpu::BindGroup cg0 = bindc2(vxClassify_, 0, {{0, mesh_->pos}, {1, mesh_->idx},
+                                                  {4, mesh_->tris}, {6, mesh_->inside}});
     wgpu::BindGroup cg1 = bindc2(vxClassify_, 1, {{0, indirection}});
     wgpu::BindGroup pg0 = bindc2(vxParity_, 0,
-                                 {{0, vxPos_}, {1, vxIdx_}, {5, vxParityBuf_}});
+                                 {{0, mesh_->pos}, {1, mesh_->idx}, {5, vxParityBuf_}});
 
     const uint32_t wg = (kGrid + 3) / 4;
-    const uint32_t axisVox = kGrid * 7 + 1;
+    const uint32_t axisVox = kAxisVox;
     wgpu::ComputePassEncoder pass = enc.BeginComputePass();
     // exact per-voxel signs first: watertight raycast parity
     pass.SetPipeline(vxParity_);
@@ -595,7 +676,10 @@ bool BrickSystem::editInBounds(const BrickEdit& e) const {
     // a blob clipped at the boundary renders as corruption
     const float m = e.radius + 3.0f * kSpan;
     for (int i = 0; i < 3; i++) {
-        if (e.pos[i] - m < kOrigin[i] || e.pos[i] + m > kOrigin[i] + kGrid * kSpan) {
+        // a capsule edit must clear the boundary at BOTH ends
+        float lo = std::min(e.pos[i], e.segment ? e.posB[i] : e.pos[i]);
+        float hi = std::max(e.pos[i], e.segment ? e.posB[i] : e.pos[i]);
+        if (lo - m < kOrigin[i] || hi + m > kOrigin[i] + kGrid * kSpan) {
             return false;
         }
     }
@@ -784,7 +868,7 @@ void BrickSystem::finishCapacityPoll() {
                       });
 }
 
-void BrickSystem::encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e) {
+void BrickSystem::encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e, int slot) {
     EditParamsCpu params{};
     int regionDims[3];
     if (e.mode == 0) {
@@ -795,8 +879,10 @@ void BrickSystem::encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e) {
             // margin = brush influence reach (band, 1.7 spans) + cell diagonal
             // (0.87) + slack: cells outside the region keep stale voxels, and a
             // too-small margin leaves seams at shared voxel planes
-            float lo = e.pos[i] - e.radius - 3.0f * kSpan - kOrigin[i];
-            float hi = e.pos[i] + e.radius + 3.0f * kSpan - kOrigin[i];
+            float pa = e.pos[i];
+            float pb = e.segment ? e.posB[i] : e.pos[i];
+            float lo = std::min(pa, pb) - e.radius - 3.0f * kSpan - kOrigin[i];
+            float hi = std::max(pa, pb) + e.radius + 3.0f * kSpan - kOrigin[i];
             int c0 = (int)std::floor(lo / kSpan);
             int c1 = (int)std::floor(hi / kSpan);
             params.regionMin[i] = c0;
@@ -810,21 +896,23 @@ void BrickSystem::encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e) {
     params.brush[1] = e.pos[1];
     params.brush[2] = e.pos[2];
     params.brush[3] = e.radius;
+    for (int i = 0; i < 3; i++) params.brushB[i] = e.segment ? e.posB[i] : e.pos[i];
+    params.brushB[3] = 0.f;
     params.color[0] = e.color[0];
     params.color[1] = e.color[1];
     params.color[2] = e.color[2];
     params.color[3] = (float)e.mode;
-    gpu_->queue.WriteBuffer(editParams_, 0, &params, sizeof(params));
+    gpu_->queue.WriteBuffer(editParams_[slot], 0, &params, sizeof(params));
 
     wgpu::ComputePassEncoder pass = enc.BeginComputePass();
     pass.SetPipeline(classify_);
-    pass.SetBindGroup(0, classifyG0_);
+    pass.SetBindGroup(0, classifyG0_[slot]);
     pass.SetBindGroup(1, classifyG1_);
     pass.SetBindGroup(2, classifyG2_);
     pass.DispatchWorkgroups((regionDims[0] + 3) / 4, (regionDims[1] + 3) / 4,
                             (regionDims[2] + 3) / 4);
     pass.SetPipeline(fill_);
-    pass.SetBindGroup(0, fillG0_);
+    pass.SetBindGroup(0, fillG0_[slot]);
     pass.SetBindGroup(1, fillG1_);
     pass.SetBindGroup(2, fillG2_);
     pass.DispatchWorkgroups(regionDims[0], regionDims[1], regionDims[2]);
@@ -888,18 +976,22 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
         enc.ClearBuffer(counters_, 0, 16);
         BrickEdit bake{};
         bake.mode = 0;
-        encodeOp(enc, bake);
+        encodeOp(enc, bake, 0);
         encodeJfa(enc);
         bakePending_ = false;
         return;
     }
     if (!pending_.empty()) {
+      // Drain several ops per frame. They are independent carves into the same
+      // volume, so ONE JFA + redistance after the batch refreshes all of them —
+      // the sweep substeps of a sword cut land in the same frame instead of
+      // unzipping one per frame.
+      const int batch = std::min((int)pending_.size(), kOpsPerFrame);
+      for (int op = 0; op < batch; op++) {
         BrickEdit e = pending_.front();
         pending_.erase(pending_.begin());
         enc.ClearBuffer(counters_, 12, 4); // volume delta = 0
-        encodeOp(enc, e);
-        encodeJfa(enc);
-        if (!std::getenv("CLAYFRAY_NO_REDIST")) encodeRedistance(enc);
+        encodeOp(enc, e, op);
         // conservation: park the measured delta in a free pool slot; the
         // renderer maps it after submit. Pool grows to cover however far the
         // CPU runs ahead of the GPU — a dropped measurement is leaked clay.
@@ -925,6 +1017,9 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
             slot->copied = true;
             slot->gen = snapGen_;
         }
+      }
+      encodeJfa(enc);
+      if (!std::getenv("CLAYFRAY_NO_REDIST")) encodeRedistance(enc);
         if (++editsSinceCap_ >= 60 && !capMapPending_) {
             editsSinceCap_ = 0;
             if (!capRead_) {

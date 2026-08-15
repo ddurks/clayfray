@@ -266,6 +266,15 @@ void rotationBetween(const float* fromIn, const float* toIn, float* R) {
     R[6] = t * x * z + sa * y; R[7] = t * y * z - sa * x; R[8] = t * z * z + ca;
 }
 
+// Rotation by `angle` about a UNIT axis (column-major 3x3 in a padded [9]).
+void axisAngle(const float* axis, float angle, float* R) {
+    float x = axis[0], y = axis[1], z = axis[2];
+    float ca = std::cos(angle), sa = std::sin(angle), t = 1.f - ca;
+    R[0] = t * x * x + ca;     R[1] = t * x * y + sa * z; R[2] = t * x * z - sa * y;
+    R[3] = t * x * y - sa * z; R[4] = t * y * y + ca;     R[5] = t * y * z + sa * x;
+    R[6] = t * x * z + sa * y; R[7] = t * y * z - sa * x; R[8] = t * z * z + ca;
+}
+
 // 4x4 (column-major) applying R about `pivot`: x -> pivot + R*(x - pivot).
 void rotAboutPivot(const float* R, const float* pivot, float* m) {
     for (int col = 0; col < 3; col++) {
@@ -284,8 +293,9 @@ void rotAboutPivot(const float* R, const float* pivot, float* m) {
 
 } // namespace
 
-void applyArmIk(const std::vector<AssetBone>& bones,
-                const std::vector<ArmIkChain>& chains, std::vector<float>& skinMats) {
+void applyHandIk(const std::vector<AssetBone>& bones,
+                 const std::vector<HandIkChain>& chains, const float com[3],
+                 float reach, bool orient, std::vector<float>& skinMats) {
     const size_t n = bones.size();
     if (skinMats.size() < n * 16 || chains.empty()) return;
 
@@ -298,84 +308,267 @@ void applyArmIk(const std::vector<AssetBone>& bones,
     }
 
     std::vector<uint8_t> dirty(n, 0);
-    for (const ArmIkChain& ch : chains) {
-        if (ch.shoulder < 0 || ch.elbow < 0 || ch.wrist < 0) continue;
-        const float* S = &world[ch.shoulder * 16 + 12];
-        const float* E = &world[ch.elbow * 16 + 12];
-        const float* W = &world[ch.wrist * 16 + 12];
-        float SE[3], EW[3];
-        v3sub(E, S, SE);
-        v3sub(W, E, EW);
-        float L1 = v3len(SE), L2 = v3len(EW);
-        if (L1 < 1e-5f || L2 < 1e-5f) continue;
+    for (const HandIkChain& ch : chains) {
+        if (ch.wrist < 0 || (size_t)ch.wrist >= n) continue;
+        // COPY: the subtree loop below overwrites world[wrist] in place
+        const float* Wm = &world[ch.wrist * 16];
+        float W[3] = {Wm[12], Wm[13], Wm[14]};
 
-        // target, clamped to the reachable annulus (arc-clamped-to-reach).
-        // aim the WRIST short of the grip by handLen along shoulder->grip so
-        // the hand (which extends past the wrist) lands its palm on the grip.
-        float toT[3];
-        v3sub(ch.target, S, toT);
-        float d = v3len(toT);
-        float dir[3] = {0, -1, 0};
-        if (d > 1e-6f) { dir[0] = toT[0] / d; dir[1] = toT[1] / d; dir[2] = toT[2] / d; }
-        d = std::max(d - ch.handLen, 0.05f);
-        float dmax = L1 + L2 - 0.005f, dmin = std::fabs(L1 - L2) + 0.005f;
-        float dc = std::min(std::max(d, dmin), dmax);
-
-        // elbow-bend plane: keep the FK pose's bend direction (perp component
-        // of the shoulder->elbow vector), fall back to the hint if straight
-        float along = v3dot(SE, dir);
-        float pole[3] = {SE[0] - dir[0] * along, SE[1] - dir[1] * along,
-                         SE[2] - dir[2] * along};
-        if (v3len(pole) < 1e-5f) {
-            float pa = v3dot(ch.pole, dir);
-            pole[0] = ch.pole[0] - dir[0] * pa;
-            pole[1] = ch.pole[1] - dir[1] * pa;
-            pole[2] = ch.pole[2] - dir[2] * pa;
+        // the tether: pull the grip inside the reach ball about the body's
+        // centre of mass. Everything else is unconstrained — the hand floats.
+        float t[3] = {ch.target[0], ch.target[1], ch.target[2]};
+        if (reach > 0.f) {
+            float d[3];
+            v3sub(t, com, d);
+            float L = v3len(d);
+            if (L > reach) {
+                float k = reach / L;
+                t[0] = com[0] + d[0] * k;
+                t[1] = com[1] + d[1] * k;
+                t[2] = com[2] + d[2] * k;
+            }
         }
-        v3norm(pole);
 
-        // law of cosines: elbow E' = S + dir*a + pole*h
-        float a = (L1 * L1 - L2 * L2 + dc * dc) / (2.f * dc);
-        float h = std::sqrt(std::max(L1 * L1 - a * a, 0.f));
-        float Ep[3] = {S[0] + dir[0] * a + pole[0] * h, S[1] + dir[1] * a + pole[1] * h,
-                       S[2] + dir[2] * a + pole[2] * h};
-        float Wp[3] = {S[0] + dir[0] * dc, S[1] + dir[1] * dc, S[2] + dir[2] * dc};
+        // carry the two wrist-local reference axes through the posed rotation
+        auto localToWorld = [&](const float* v, float* o) {
+            o[0] = Wm[0] * v[0] + Wm[4] * v[1] + Wm[8] * v[2];
+            o[1] = Wm[1] * v[0] + Wm[5] * v[1] + Wm[9] * v[2];
+            o[2] = Wm[2] * v[0] + Wm[6] * v[1] + Wm[10] * v[2];
+            v3norm(o);
+        };
+        float aimNow[3], edgeNow[3];
+        localToWorld(ch.restAim, aimNow);
+        localToWorld(ch.restEdge, edgeNow);
 
-        // q1: swing the whole arm so shoulder->elbow points at E'
-        float newSE[3];
-        v3sub(Ep, S, newSE);
-        float R1[9];
-        rotationBetween(SE, newSE, R1);
-        float M1[16];
-        rotAboutPivot(R1, S, M1);
-        // propagate the wrist through M1, then q2 about E' aims forearm at W'
-        float Wprop[3];
-        matTransformPoint(M1, W, Wprop);
-        float fwFrom[3], fwTo[3];
-        v3sub(Wprop, Ep, fwFrom);
-        v3sub(Wp, Ep, fwTo);
-        float R2[9];
-        rotationBetween(fwFrom, fwTo, R2);
-        float M2[16];
-        rotAboutPivot(R2, Ep, M2);
+        float M[16];
+        float aimTo[3] = {aimNow[0], aimNow[1], aimNow[2]};
+        float want[3] = {ch.aim[0], ch.aim[1], ch.aim[2]};
+        if (orient && v3len(want) > 1e-6f) {
+            v3norm(want);
+            // FULL frame, not a single-axis swing: aiming one axis leaves the
+            // spin about it undetermined, and an arbitrary minimal rotation is
+            // what let the two mitts land in the same place. Handle axis ->
+            // the mitt's thin edge; fingers -> across the handle, `roll`
+            // choosing where around it they point.
+            // The mitt is really a stubby ARM: 0.25 m from wrist to fingertip
+            // on a 0.69 m body. So the finger axis runs along the REACH — body
+            // out to the grip — and the hand end lands on the handle. Two
+            // grips a hand's width apart then fan apart naturally from the
+            // body instead of converging into one lump, which is what made
+            // them interpenetrate when both were aimed down the blade.
+            float Yd[3];
+            v3sub(t, com, Yd);
+            if (v3len(Yd) < 1e-4f) { Yd[0] = 0.f; Yd[1] = 0.f; Yd[2] = 1.f; }
+            v3norm(Yd);
+            // roll the mitt about that reach axis
+            if (ch.roll != 0.f) {
+                float R0[9];
+                axisAngle(Yd, ch.roll, R0);
+                float w2[3] = {R0[0] * want[0] + R0[3] * want[1] + R0[6] * want[2],
+                               R0[1] * want[0] + R0[4] * want[1] + R0[7] * want[2],
+                               R0[2] * want[0] + R0[5] * want[1] + R0[8] * want[2]};
+                std::memcpy(want, w2, sizeof(want));
+            }
+            // narrow edge toward the handle: the mitt's thin dimension is what
+            // sits on the grip, so stacked hands stay clear of each other
+            float dd = v3dot(Yd, want);
+            float Xd[3] = {want[0] - Yd[0] * dd, want[1] - Yd[1] * dd,
+                           want[2] - Yd[2] * dd};
+            if (v3len(Xd) < 1e-4f) { // blade parallel to the reach
+                float alt[3] = {0.f, 1.f, 0.f};
+                dd = v3dot(Yd, alt);
+                Xd[0] = alt[0] - Yd[0] * dd;
+                Xd[1] = alt[1] - Yd[1] * dd;
+                Xd[2] = alt[2] - Yd[2] * dd;
+                if (v3len(Xd) < 1e-4f) { Xd[0] = 1.f; Xd[1] = 0.f; Xd[2] = 0.f; }
+            }
+            v3norm(Xd);
+            float Zd[3];
+            v3cross(Xd, Yd, Zd);
 
-        // upper subtree rotates about S; lower (a subset) additionally about E'
-        for (int b : ch.upperSubtree) {
+            // the same two axes as they stand now C = [edge | aim | third]
+            float Xc[3] = {edgeNow[0], edgeNow[1], edgeNow[2]};
+            float dc = v3dot(Xc, aimNow);
+            float Yc[3] = {aimNow[0] - Xc[0] * dc, aimNow[1] - Xc[1] * dc,
+                           aimNow[2] - Xc[2] * dc};
+            if (v3len(Yc) < 1e-4f) { // degenerate rig (edge parallel to fingers)
+                matIdentity(M);
+            } else {
+                v3norm(Yc);
+                float Zc[3];
+                v3cross(Xc, Yc, Zc);
+                // R = D * C^T maps each current axis onto its desired one
+                const float A[9] = {Xd[0], Xd[1], Xd[2], Yd[0], Yd[1],
+                                    Yd[2], Zd[0], Zd[1], Zd[2]};
+                const float B[9] = {Xc[0], Xc[1], Xc[2], Yc[0], Yc[1],
+                                    Yc[2], Zc[0], Zc[1], Zc[2]};
+                float R[9];
+                for (int col = 0; col < 3; col++)
+                    for (int row = 0; row < 3; row++)
+                        R[col * 3 + row] = A[row] * B[col] +
+                                           A[3 + row] * B[3 + col] +
+                                           A[6 + row] * B[6 + col];
+                rotAboutPivot(R, W, M); // pivot at the wrist: W stays put
+                std::memcpy(aimTo, Yd, sizeof(aimTo));
+            }
+        } else {
+            matIdentity(M);
+        }
+
+        // back the wrist off along the (new) finger axis so the PALM, not the
+        // joint, lands on the grip. Rotating about W left it in place, so the
+        // remaining translation folds straight into M's last column.
+        float Wp[3] = {t[0] - aimTo[0] * ch.palmLen, t[1] - aimTo[1] * ch.palmLen,
+                       t[2] - aimTo[2] * ch.palmLen};
+        M[12] += Wp[0] - W[0];
+        M[13] += Wp[1] - W[1];
+        M[14] += Wp[2] - W[2];
+
+        for (int b : ch.subtree) {
+            if (b < 0 || (size_t)b >= n) continue;
             float tmp[16];
-            matMul(M1, &world[b * 16], tmp);
+            matMul(M, &world[b * 16], tmp);
             std::memcpy(&world[b * 16], tmp, sizeof(tmp));
             dirty[b] = 1;
         }
-        for (int b : ch.lowerSubtree) {
-            float tmp[16];
-            matMul(M2, &world[b * 16], tmp);
-            std::memcpy(&world[b * 16], tmp, sizeof(tmp));
-            dirty[b] = 1;
+
+        // FINGER CURL, after the mitt is in place. Fingers close around a
+        // handle by rotating in the plane perpendicular to it — i.e. about the
+        // handle's own axis — so each digit spins about `aim` through its OWN
+        // root. The wrist is not in any digit's list, so the palm stays exactly
+        // where the IK put it: this curls the fingers without moving the hand.
+        float axis[3] = {ch.aim[0], ch.aim[1], ch.aim[2]};
+        if (ch.curl != 0.f && v3len(axis) > 1e-6f) {
+            v3norm(axis);
+            float Rc[9];
+            axisAngle(axis, ch.curl, Rc);
+            for (const std::vector<int>& dig : ch.digits) {
+                if (dig.empty()) continue;
+                int root = dig[0];
+                if (root < 0 || (size_t)root >= n) continue;
+                const float* Dm = &world[root * 16];
+                const float pivot[3] = {Dm[12], Dm[13], Dm[14]};
+                float C[16];
+                rotAboutPivot(Rc, pivot, C);
+                for (int b : dig) {
+                    if (b < 0 || (size_t)b >= n) continue;
+                    float tmp[16];
+                    matMul(C, &world[b * 16], tmp);
+                    std::memcpy(&world[b * 16], tmp, sizeof(tmp));
+                    dirty[b] = 1;
+                }
+            }
         }
     }
 
     for (size_t j = 0; j < n; j++) {
         if (dirty[j]) matMul(&world[j * 16], bones[j].invBind, &skinMats[j * 16]);
+    }
+}
+
+void applyGaze(const std::vector<AssetBone>& bones,
+               const std::vector<GazeChain>& chains, const float target[3],
+               float maxAngle, std::vector<float>& skinMats) {
+    const size_t n = bones.size();
+    if (skinMats.size() < n * 16 || chains.empty()) return;
+
+    for (const GazeChain& ch : chains) {
+        if (ch.bone < 0 || (size_t)ch.bone >= n) continue;
+        float bind[16], world[16];
+        matInvAffine(bones[ch.bone].invBind, bind);
+        matMul(&skinMats[ch.bone * 16], bind, world);
+        const float E[3] = {world[12], world[13], world[14]};
+
+        // FK forward: the neutral the cone is measured from, so a turned head
+        // carries its own gaze range around with it
+        float f0[3] = {
+            world[0] * ch.restAim[0] + world[4] * ch.restAim[1] + world[8] * ch.restAim[2],
+            world[1] * ch.restAim[0] + world[5] * ch.restAim[1] + world[9] * ch.restAim[2],
+            world[2] * ch.restAim[0] + world[6] * ch.restAim[1] + world[10] * ch.restAim[2]};
+        v3norm(f0);
+
+        float d[3];
+        v3sub(target, E, d);
+        if (v3len(d) < 1e-5f) continue;
+        v3norm(d);
+
+        // hold at the cone edge instead of tracking past it
+        float c = v3dot(f0, d);
+        float lim = std::cos(std::max(maxAngle, 0.f));
+        if (c < lim) {
+            float perp[3] = {d[0] - f0[0] * c, d[1] - f0[1] * c, d[2] - f0[2] * c};
+            if (v3len(perp) < 1e-5f) continue; // exactly behind: no unique way out
+            v3norm(perp);
+            float s = std::sin(maxAngle);
+            d[0] = f0[0] * lim + perp[0] * s;
+            d[1] = f0[1] * lim + perp[1] * s;
+            d[2] = f0[2] * lim + perp[2] * s;
+            v3norm(d);
+        }
+
+        float R[9];
+        rotationBetween(f0, d, R);
+        float M[16], posed[16];
+        rotAboutPivot(R, E, M);
+        matMul(M, world, posed);
+        matMul(posed, bones[ch.bone].invBind, &skinMats[ch.bone * 16]);
+    }
+}
+
+BodyCom deriveBodyCom(const CharacterAsset& asset, const std::vector<int>& handBones) {
+    BodyCom bc;
+    const size_t nb = asset.bones.size();
+    const uint32_t nv = asset.vertexCount();
+    if (nb == 0 || nv == 0 || asset.joints.size() < nv * 4 ||
+        asset.weights.size() < nv * 4)
+        return bc;
+
+    std::vector<uint8_t> isHand(nb, 0);
+    for (int b : handBones)
+        if (b >= 0 && (size_t)b < nb) isHand[b] = 1;
+
+    std::vector<float> mass(nb, 0.f), acc(nb * 3, 0.f);
+    for (uint32_t v = 0; v < nv; v++) {
+        for (int s = 0; s < 4; s++) {
+            float w = asset.weights[v * 4 + s];
+            if (w <= 0.f) continue;
+            uint16_t j = asset.joints[v * 4 + s];
+            if (j >= nb || isHand[j]) continue; // hands are not the blob
+            mass[j] += w;
+            acc[j * 3] += w * asset.positions[v * 3];
+            acc[j * 3 + 1] += w * asset.positions[v * 3 + 1];
+            acc[j * 3 + 2] += w * asset.positions[v * 3 + 2];
+        }
+    }
+    for (size_t j = 0; j < nb; j++) {
+        if (mass[j] <= 1e-6f) continue;
+        bc.bone.push_back((int)j);
+        bc.mass.push_back(mass[j]);
+        bc.restC.push_back(acc[j * 3] / mass[j]);
+        bc.restC.push_back(acc[j * 3 + 1] / mass[j]);
+        bc.restC.push_back(acc[j * 3 + 2] / mass[j]);
+    }
+    return bc;
+}
+
+void evalBodyCom(const BodyCom& bc, const std::vector<float>& skinMats, float out[3]) {
+    out[0] = out[1] = out[2] = 0.f;
+    float total = 0.f;
+    for (size_t i = 0; i < bc.bone.size(); i++) {
+        int b = bc.bone[i];
+        if (b < 0 || (size_t)(b * 16 + 16) > skinMats.size()) continue;
+        float p[3];
+        matTransformPoint(&skinMats[b * 16], &bc.restC[i * 3], p);
+        float m = bc.mass[i];
+        out[0] += m * p[0];
+        out[1] += m * p[1];
+        out[2] += m * p[2];
+        total += m;
+    }
+    if (total > 1e-6f) {
+        out[0] /= total;
+        out[1] /= total;
+        out[2] /= total;
     }
 }
 

@@ -48,7 +48,8 @@ std::string snapFilePath(const std::string& name);
 struct CtlRefs {
     LookParams* look = nullptr;
     OrbitCamera* cam = nullptr;
-    BrushState* brush = nullptr; // null headless
+    BrushState* brush = nullptr;    // null headless
+    FighterPose* fighter = nullptr; // locomotion state, drivable from replay
     Renderer* renderer = nullptr;
     SimClock* clock = nullptr;
     double* simT = nullptr;

@@ -33,6 +33,11 @@ class Renderer {
     void setPickUV(float u, float v) { pickU_ = u; pickV_ = v; }
     bool pickValid() const { return pickValid_; }
     const float* pickPos() const { return pickPos_; }
+    // Where the picked surface lives in the brick volume's REST space. Sculpt
+    // edits MUST use this, not pickPos(): the volume is authored in rest
+    // space, so a world position only addresses it correctly while the
+    // fighter stands unposed at the origin.
+    const float* pickRest() const { return pickRest_; }
     const float* pickNormal() const { return pickNormal_; }
     float pickMat() const { return pickMat_; }
     // headless serve mode runs the pick pass too so ctl `probe` works
@@ -60,6 +65,7 @@ class Renderer {
     // report a stale ledger (absorption otherwise only runs in render()).
     void pumpLedger() {
         brick_.pollVolumes();
+        foe_.pollVolumes();
         absorbMeasured();
     }
 
@@ -80,7 +86,8 @@ class Renderer {
     // + swordA/swordB/swordCol.
     // MUST match the Uniforms struct in trace.wgsl AND pick.wgsl — and a
     // mismatch only bites after a rebuild (shaders hot-load, binaries don't).
-    static constexpr int kUniformSlots = 288;
+    // 287..292 foeInv/foeMeta/foeCenter, 293..484 foePieces, 485 foeBoneMeta
+    static constexpr int kUniformSlots = 488;
     void packUniforms(const OrbitCamera& cam, const LookParams& look,
                       const FrameInfo& frame, float out[kUniformSlots][4]) const;
     std::vector<MarbleProp> marbles_;
@@ -92,9 +99,67 @@ class Renderer {
     std::vector<BoneCapsule> capsules_;
     std::vector<float> skinMats_;
     float animT_ = 0.f;
-    // M4.7: arm IK chains (built at setCharacter from bone names), and the
+    // M4.7: floating-hand IK chains (built at setCharacter from bone names),
+    // the blob's centre-of-mass decomposition that tethers them, and the
     // computed sword geometry for a frame (hilt/tip/two grips, world).
-    std::vector<ArmIkChain> armIk_;
+    std::vector<HandIkChain> handIk_;
+    BodyCom bodyCom_;
+    // stands off to the front, turned to face the hero
+    FighterPose foePose_{{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false};
+    bool foeEnabled_ = false; // no opponent until addPlayer() makes one
+    int playerCount_ = 1;     // the hero always exists
+    std::vector<BoneCapsule> foeCaps_;  // rest capsules, for blade hit tests
+    float foeBoundR_ = 0.6f;            // rest bound radius about foe origin
+    float foeCenterRest_[3] = {0.f, 0.35f, 0.f};
+    float autoReach_ = 0.f; // rest COM->wrist distance; hands.reach 0 uses it
+    // M4.8 gaze: eye bones, and the camera position LATCHED at the last pose
+    // step. Sampling the live camera would slide the eyes at frame rate and
+    // break the 12 Hz stop-motion the rest of the character obeys.
+    // player 1 runs its own pose clock and its own posed skeleton, so it can
+    // play idle while the hero does something else entirely
+    float foeAnimT_ = 0.f;
+    std::vector<float> foeSkinMats_;
+    std::vector<GazeChain> gaze_;
+    float gazeTarget_[3] = {0.f, 0.6f, 3.f};
+
+  public:
+    // M5: where the fighter stands. Set from the gameplay tick; the renderer
+    // premultiplies the whole skeleton by it each frame.
+    void setFighter(const FighterPose& f) { fighter_ = f; }
+    const FighterPose& fighter() const { return fighter_; }
+    // index of a clip by name, -1 if absent (locomotion picks bounce/idle)
+    int clipIndex(const char* name) const;
+    // ---- players ----
+    // Player 0 is the hero (articulated, holds the sword); every later player
+    // is a carveable body with its own volume, placed by its own root.
+    //
+    // The cap is a SHADER limit, not a design one: WGSL bindings are static,
+    // so each extra volume today means another bound array. Lifting it means
+    // giving the per-cell arrays a per-player stride
+    // (`bIndirection[player * CELLS + cell]`) so one binding serves all — see
+    // PLAN.md "fighters are SLICES". addPlayer() keeps this signature when
+    // that lands; only its body changes.
+    static constexpr int kMaxPlayers = 2;
+    int playerCount() const { return playerCount_; }
+    // Returns the new player's index, or -1 if the volume budget is spent.
+    int addPlayer(const FighterPose& at);
+    FighterPose& player(int i) { return i <= 0 ? fighter_ : foePose_; }
+    const FighterPose& player(int i) const { return i <= 0 ? fighter_ : foePose_; }
+    void setPlayerEnabled(int i, bool on) {
+        if (i > 0) foeEnabled_ = on;
+    }
+    bool playerEnabled(int i) const { return i <= 0 ? true : foeEnabled_; }
+    // exposed so ctl/replay can place and toggle the opponent
+    FighterPose* foePosePtr() { return &foePose_; }
+    bool* foeEnabledPtr() { return &foeEnabled_; }
+
+  private:
+    FighterPose fighter_;
+    // the sword resolved into WORLD space for this frame (carry mode folds in
+    // the fighter root). Everything downstream — grips, IK, uniforms — reads
+    // this, never look.sword directly.
+    SwordParams swordWorld_;
+    void resolveSword(const LookParams& look);
     void swordGeometry(const SwordParams& s, float hilt[3], float tip[3],
                        float gripA[3], float gripB[3]) const;
     void encodePick(wgpu::CommandEncoder& enc);
@@ -109,9 +174,18 @@ class Renderer {
     };
     void updateConservation(const LookParams& look, const FrameInfo& frame);
     void absorbMeasured(); // drain brick measurements into the ledger
+    // M5: a MOVING blade that overlaps fighter 1 carves a channel along its
+    // sweep. Gated on blade speed so a sword merely resting against the
+    // opponent doesn't eat it.
+    void updateBladeCut(const LookParams& look);
+    float prevTip_[3] = {0, 0, 0}, prevHilt_[3] = {0, 0, 0};
+    bool haveBlade_ = false;
 
     Gpu* gpu_ = nullptr;
     BrickSystem brick_;
+    // M5 fighter 1: its OWN carveable volume, so cutting it cannot touch the
+    // hero's clay. Rigid — it stands and takes hits, no piece/warp path.
+    BrickSystem foe_;
     GroundClay ground_;
     std::vector<Gob> gobs_;
     SplootStats sploot_;
@@ -132,12 +206,14 @@ class Renderer {
     wgpu::RenderPipeline postPipeline_, blitPipeline_;
     wgpu::BindGroup traceBind_, traceBrickBind_, postBind_, blitBind_;
     wgpu::BindGroup pickBind_, pickBrickBind_;
+    wgpu::BindGroup traceFoeBind_, pickFoeBind_; // group(2): fighter 1's volume
     wgpu::Buffer pickOut_, pickRead_;
     bool pickMapPending_ = false;
     bool alwaysPick_ = false;
     float pickU_ = 0.5f, pickV_ = 0.5f;
     bool pickValid_ = false;
     float pickPos_[3] = {0, 0, 0};
+    float pickRest_[3] = {0, 0, 0};
     float pickNormal_[3] = {0, 1, 0};
     float pickAlbedo_[3] = {0.024f, 0.19f, 0.25f};
     float pickMat_ = 0.f;

@@ -1,4 +1,4 @@
-# CLAUDE.md — agent onboarding for clayfray
+# AGENTS.md — agent onboarding for clayfray
 
 Read `PLAN.md` first: it holds the architecture, the locked decisions, and the
 per-milestone "do not regress" notes (M2 look recovery, M4.6 conservation).
@@ -14,37 +14,10 @@ cmake --build build                 # configures via FetchContent on first run
 ```
 
 Headless flags: `--screenshot PATH --size WxH --frames N --time T --aa N`,
-`--cam AZ,EL,DIST` (inspect from another angle without serve mode),
 `--character file.glb`, `--carve-test` (scripted carve/add exercise),
 `--exit-after N` (windowed smoke test), `--serve` (headless ctl session),
 `--replay f.journal` (deterministic scenario replay), `--load NAME`
 (restore a snapshot at launch).
-
-## Players (M5)
-
-`Renderer::addPlayer(pose)` adds a fighter and returns its index; player 0 is
-the hero. **The cap is 2** — each body needs its own volume and WGSL bindings
-are static, so 3+ requires the per-player stride in PLAN.md ("fighters are
-SLICES"). ctl exposes `foe.enabled`, `foe.pos`, `foe.yaw`.
-
-Both fighters bill to ONE conservation ledger: clay off either body becomes
-the same gobs on the same arena.
-
-## Windowed test harness (M5)
-
-`WASD` walks the fighter (camera-relative — forward is always away from the
-camera), it turns to face travel and leans into it, plays the `bounce` clip
-while moving and `idle` at rest, and the orbit target follows it. `SPACE`
-swings. The sword rests in a VERTICAL guard with a slight bob (quantized to
-the 12 Hz pose grid, trap 4); the swing is a three-beat flourish over 0.80 s —
-wind up high, flatten to horizontal and sweep across the front at chest
-height, then recover to guard. The slow flourish is deliberate: it keeps the
-per-frame blade sweep inside what `BrickSystem::kOpsPerFrame` (6) cut substeps
-can bridge, so a faster swing would need that budget raised.
-`1/2/3` still switch orbit/carve/add.
-
-Headless has no keyboard, so locomotion there is whatever `fighter.pos`,
-`fighter.yaw`, `fighter.lean` and `fighter.moving` are set to via ctl/replay.
 
 ## Agent dev loop (PREFER THIS over rebuild-relaunch cycles)
 
@@ -142,29 +115,6 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    `editInBounds`) to avoid clipped-blob corruption. Carving at the very edge
    of the character therefore no-ops; that's intended, not a bug.
 
-6. **`BrickEdit.pos` is REST space, not world.** The brick volume is authored
-   in the character's rest frame, so a world position only addresses it while
-   the fighter stands unposed at the origin — which was true until M5 gave it
-   a root transform, and is why carving silently stopped the moment he walked
-   (out-of-bounds edits are dropped, see trap 5). Anything turning a world
-   point into an edit must map back through the articulation first:
-   `Renderer::pickRest()` for screen picks (the pick shader returns it via
-   `charRestPoint`), or the inverse skin matrix of the bone it hit for gob
-   re-sticks. `BrickEdit.worldPos` carries the arena-space wound alongside,
-   because gobs must SPAWN in world. `CLAYFRAY_DEBUG_PICK=1` prints both at
-   the cursor — if they differ while the fighter is unposed at the origin,
-   something is wrong.
-
-7. **The character is EVERY mesh bound to the armature, not one node.** The
-   fighter is authored as separate Blender objects (blob body + the two
-   floating mitts) sharing one skin; `CharacterAsset::load` merges all of
-   them. It used to pick a single node, which silently imported whichever
-   came last — a fighter made of nothing but hands, with no error. If the
-   body vanishes after a re-export, check the vertex count on the `asset:`
-   line against the sum of the mesh objects before suspecting the renderer.
-   A mesh bound to a SECOND skin is skipped with a warning (joint indices
-   would not line up).
-
 ## Verifying a conservation (M4.6) change
 
 `--carve-test` now self-checks and **exits nonzero (3) on a conservation
@@ -189,18 +139,7 @@ reference renders — diff against them by eye after a lighting/shading change.
 | `CLAYFRAY_TS=1` | opt-in GPU timestamps (Metal drops these under load — wall-clock is the Mac tool) |
 | `CLAYFRAY_NO_REDIST` / `_NO_ANIM` / `_NO_PIECES` | disable redistance / animation / chunk articulation |
 | `CLAYFRAY_AO` / `_DETAIL` / `_SHADOWK` | override look params (float) |
-| `CLAYFRAY_DEBUG_PICK=1` | print world vs REST position under the cursor (trap 6) |
 | `CLAYFRAY_TEST_ADDSTRESS` / `_TEST_NULLEDITS` | `--carve-test` variants (pool stress / null-edit JFA) |
-
-## Known defect: repeated readbacks stall (Windows/Vulkan, 2026-08-13)
-
-On this box's Vulkan backend a `MapAsync` on a REUSED readback buffer
-succeeds once per process and then never completes again. Consequences:
-`shot` fails outright in `--serve`, and `probe`/`pickuv` return the first
-pick forever (the freeze is `pickMapPending_` never clearing). The volume
-ledger is unaffected — it is the one path that works. Until it is fixed,
-verify renders with `--replay <journal> --screenshot`, NOT serve-mode `shot`,
-and put any journal command whose pick you care about on the FIRST tick.
 
 ## Async readback lifetime
 

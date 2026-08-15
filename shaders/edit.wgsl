@@ -6,13 +6,7 @@
 
 //#include scene_common.wgsl
 
-const GRID: i32 = 74;
-const BRICK_USABLE: f32 = 7.0;
-const VOXEL: f32 = 0.0027344;
-const SPAN: f32 = 0.0191406;
-const VOL_ORIGIN: vec3f = vec3f(-0.7082, -0.1582, -0.7082);
-const BAND: f32 = 12.0; // must match brick_read.wgsl
-const MAX_BRICKS: u32 = 49152u;
+//#constants
 
 const IND_ALLOC: u32 = 0x80000000u;
 const IND_FRESH: u32 = 0x20000000u;
@@ -25,6 +19,7 @@ struct EditParams {
   regionDims: vec4i,  // xyz = region size in cells
   brush: vec4f,       // xyz = position, w = radius
   color: vec4f,       // rgb brush albedo, w = mode
+  brushB: vec4f,      // xyz = second capsule endpoint (== brush.xyz for a sphere)
 }
 
 @group(0) @binding(0) var<uniform> ep: EditParams;
@@ -40,8 +35,17 @@ fn cellIndex(c: vec3i) -> u32 {
 fn cellCenter(c: vec3i) -> vec3f {
   return VOL_ORIGIN + (vec3f(c) + 0.5) * SPAN;
 }
+// Capsule brush: a swept sphere from brush to brushB. Equal endpoints give
+// exactly the old sphere, so every existing edit is bit-identical.
 fn brushSdf(w: vec3f) -> f32 {
-  return length(w - ep.brush.xyz) - ep.brush.w;
+  let a = ep.brush.xyz;
+  let ab = ep.brushB.xyz - a;
+  let l2 = dot(ab, ab);
+  var t = 0.0;
+  if (l2 > 1e-12) {
+    t = clamp(dot(w - a, ab) / l2, 0.0, 1.0);
+  }
+  return length(w - (a + ab * t)) - ep.brush.w;
 }
 // Soft CSG (voxel units): hard max/min leave a gradient discontinuity at the
 // crease that sampled fields render as black pits — and real carved clay has

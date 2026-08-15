@@ -25,12 +25,154 @@ namespace {
 constexpr double kTickRate = 60.0;
 constexpr double kTickDt = 1.0 / kTickRate;
 
-// Deterministic gameplay core stub. Grows a real state machine in M5;
-// for M0/M1 it only advances time. (After a snapshot load its tick count
-// is resynced to the restored sim time.)
+// GPU backpressure for the headless loops (--serve and --replay/--screenshot).
+// Both advance a FIXED 1/60 s per iteration on purpose — that determinism is
+// what makes replays exact — so neither is paced by wall clock, and with no
+// swapchain there is no Fifo Present to block on either. Unthrottled, the CPU
+// encodes ~1400 frames/s while the GPU retires far fewer, Dawn's pending-
+// submission memory grows without bound, and vkQueueSubmit dies with
+// VK_ERROR_OUT_OF_DEVICE_MEMORY within seconds. Every MapAsync after that
+// fails "[Device] is lost", which is what made serve-mode `shot` look like a
+// readback bug. Capping the queue depth costs nothing and fixes it.
+constexpr int kMaxFramesInFlight = 2;
+
+// Deterministic gameplay core. M5 test harness: one fighter walks the arena
+// under WASD and swings its sword on a keypress. Deterministic by the house
+// rules — fixed 60 Hz tick, seeded RNG, no wall clock in here — so a journal
+// replay reproduces a run exactly. (After a snapshot load the tick count is
+// resynced to the restored sim time.)
 struct GameState {
     uint64_t tickCount = 0;
-    void tick() { tickCount++; }
+
+    FighterPose fighter;
+    float vel[3] = {0.f, 0.f, 0.f};
+
+    // desired travel direction in WORLD space, latched from the keyboard each
+    // frame (camera-relative, resolved by the caller). Zero = stand still.
+    float moveX = 0.f, moveZ = 0.f;
+    bool swingRequested = false;
+
+    // swing: a random arc swept across the front over kSwingDur seconds
+    bool swinging = false;
+    float swingT = 0.f, swingFrom = 0.f, swingTo = 0.f, swingArc = 0.f;
+    uint32_t rng = 0x9E3779B9u;
+
+    static constexpr float kMaxSpeed = 1.1f;   // m/s
+    static constexpr float kAccel = 7.0f;      // m/s^2
+    static constexpr float kTurnRate = 7.0f;   // rad/s
+    static constexpr float kMaxLean = 0.30f;   // rad at full speed
+    // A flourished swing is SLOW enough to read as claymation and slow enough
+    // that the cut substeps cover its sweep without a bigger op budget.
+    static constexpr float kSwingDur = 0.80f;  // s
+    static constexpr float kBobAmp = 0.012f;   // m, held-sword breathing
+    static constexpr float kBobTilt = 0.05f;   // rad
+
+    float rand01() {
+        rng = rng * 1664525u + 1013904223u;
+        return (float)((rng >> 8) & 0xFFFFFFu) / 16777216.f;
+    }
+
+    void tick() {
+        tickCount++;
+        const float dt = (float)kTickDt;
+
+        float want[3] = {0.f, 0.f, 0.f};
+        float dl = std::sqrt(moveX * moveX + moveZ * moveZ);
+        if (dl > 1e-3f) {
+            want[0] = moveX / dl * kMaxSpeed;
+            want[2] = moveZ / dl * kMaxSpeed;
+        }
+        for (int a = 0; a < 3; a += 2) {
+            float d = want[a] - vel[a];
+            float m = kAccel * dt;
+            vel[a] += std::max(-m, std::min(d, m));
+        }
+        fighter.pos[0] += vel[0] * dt;
+        fighter.pos[2] += vel[2] * dt;
+
+        float sp = std::sqrt(vel[0] * vel[0] + vel[2] * vel[2]);
+        fighter.moving = sp > 0.10f;
+        if (fighter.moving) {
+            // face the way we are going, then tip into it: shortest-arc turn
+            float target = std::atan2(vel[0], vel[2]);
+            float d = target - fighter.yaw;
+            while (d > 3.14159265f) d -= 6.28318531f;
+            while (d < -3.14159265f) d += 6.28318531f;
+            float m = kTurnRate * dt;
+            fighter.yaw += std::max(-m, std::min(d, m));
+            // lean scales with speed, and eases off while still turning hard
+            // so a pivot doesn't throw the body sideways
+            float aim = kMaxLean * (sp / kMaxSpeed) * (1.f - std::min(std::fabs(d), 1.f));
+            fighter.lean += (aim - fighter.lean) * std::min(1.f, 6.f * dt);
+        } else {
+            fighter.lean += (0.f - fighter.lean) * std::min(1.f, 6.f * dt);
+        }
+
+        if (swingRequested && !swinging) {
+            swinging = true;
+            swingT = 0.f;
+            // a random arc ACROSS the front: start on one side, finish on the
+            // other, with a randomized rise so repeats don't read identically
+            float side = rand01() < 0.5f ? 1.f : -1.f;
+            swingFrom = side * (1.05f + rand01() * 0.25f);
+            swingTo = -side * (1.15f + rand01() * 0.30f);
+            swingArc = 0.25f + rand01() * 0.35f;
+        }
+        swingRequested = false;
+        if (swinging) {
+            swingT += dt;
+            if (swingT >= kSwingDur) swinging = false;
+        }
+    }
+
+    // Sword offsets (character space) on top of the vertical guard pose.
+    // Idle/moving: a slight bob so the held blade breathes. Swinging: a
+    // three-beat flourish — wind up past the start, sweep flat and fast
+    // across the front, then follow through and recover to vertical.
+    // `poseT` is the 12 Hz quantized clock, so the bob steps with the
+    // stop-motion instead of sliding at frame rate (CLAUDE.md trap 4).
+    void swordOffset(float poseT, float& yaw, float& pitch, float& lift) const {
+        // bob rides whether we are moving or not, a touch stronger on the move
+        float amp = kBobAmp * (fighter.moving ? 1.6f : 1.0f);
+        float rate = fighter.moving ? 7.5f : 3.0f;
+        lift = amp * std::sin(poseT * rate);
+        yaw = 0.f;
+        pitch = kBobTilt * std::sin(poseT * rate * 0.5f);
+        if (!swinging) return;
+
+        float u = std::min(1.f, swingT / kSwingDur);
+        const float kWind = 0.28f, kCut = 0.62f; // beat boundaries
+        if (u < kWind) {
+            // 1. wind up: rotate BACK past the start, blade still high
+            float a = u / kWind;
+            float e = a * a * (3.f - 2.f * a);
+            yaw = swingFrom * e;
+            pitch = -0.35f * e; // tip back over the shoulder
+        } else if (u < kCut) {
+            // 2. the cut: flat and fast across the front
+            float a = (u - kWind) / (kCut - kWind);
+            float e = a * a * (3.f - 2.f * a);
+            yaw = swingFrom + (swingTo - swingFrom) * e;
+            // Flatten to HORIZONTAL early in the beat and stay there, so the
+            // blade sweeps flat across the whole strike instead of only
+            // arriving horizontal at the end of it.
+            float pe = std::min(1.f, a / 0.30f);
+            pe = pe * pe * (3.f - 2.f * pe);
+            pitch = -0.35f + (-1.5708f + 0.35f) * pe;
+            // ride the flat sweep up to chest height, where an opponent's
+            // torso actually is — at the hilt's resting height it scythes
+            // past their shins
+            lift += 0.16f * pe;
+        } else {
+            // 3. follow through and recover to the vertical guard
+            float a = (u - kCut) / (1.f - kCut);
+            float e = a * a * (3.f - 2.f * a);
+            yaw = swingTo * (1.f - e) + swingTo * 0.35f * (1.f - e);
+            pitch = -1.5708f * (1.f - e) + swingArc * 0.25f * std::sin(3.14159f * a);
+            lift += 0.16f * (1.f - e);
+        }
+    }
+
     double timeSeconds() const { return (double)tickCount * kTickDt; }
 };
 
@@ -80,8 +222,17 @@ bool loadCharacterInto(Renderer& renderer) {
 
 struct RunOpts {
     std::string screenshotPath;
-    int width = 1280, height = 720, frames = 8, aa = 2;
+    // aa is rays-per-pixel-AXIS: the tracer loops aa*aa full marches per pixel
+    // (trace.wgsl), so cost is quadratic in it. 2 -> 1 measured 3.87x faster
+    // (232.5 -> 60.1 ms/frame, 960x540, RX 5700 XT) for a difference only
+    // visible under magnification on the eyes — the marbles are the one hard
+    // high-contrast edge in the scene; clay silhouettes and the grain hide it.
+    // Raise back to 2 for beauty/reference renders.
+    int width = 1280, height = 720, frames = 8, aa = 1;
     double startTime = 2.0;
+    // headless camera override (radians / meters); NaN = keep the default.
+    // Inspecting an artifact from another angle otherwise needs serve mode.
+    float camAz = NAN, camEl = NAN, camDist = NAN;
     bool carveTest = false;
     bool serve = false;          // headless, loop until ctl `quit`
     std::string replayPath;      // headless journal replay
@@ -95,6 +246,8 @@ int runHeadless(const RunOpts& o) {
     Renderer renderer;
     if (!renderer.init(gpu, o.width, o.height)) return 1;
     if (!loadCharacterInto(renderer)) return 1;
+    // player 2: an identical fighter standing in front, facing the hero
+    renderer.addPlayer(FighterPose{{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false});
 
     if (o.carveTest && std::getenv("CLAYFRAY_TEST_ADDSTRESS")) {
         // far-from-body adds: pool stress + volume-boundary rejection test
@@ -144,6 +297,9 @@ int runHeadless(const RunOpts& o) {
     }
 
     OrbitCamera cam;
+    if (!std::isnan(o.camAz)) cam.azimuth = o.camAz;
+    if (!std::isnan(o.camEl)) cam.elevation = o.camEl;
+    if (!std::isnan(o.camDist)) cam.distance = o.camDist;
     LookParams look;
     if (std::getenv("CLAYFRAY_DEBUG_FLAT")) {
         look.aoStrength = 0.f;
@@ -163,6 +319,8 @@ int runHeadless(const RunOpts& o) {
     bool quit = false;
     float fps = 0.f;
     CtlServer ctl;
+    // headless has no keyboard, so locomotion is whatever ctl/replay sets
+    FighterPose fighter;
     CtlRefs refs;
     refs.look = &look;
     refs.cam = &cam;
@@ -171,6 +329,7 @@ int runHeadless(const RunOpts& o) {
     refs.simT = &t;
     refs.fps = &fps;
     refs.wantQuit = &quit;
+    refs.fighter = &fighter;
     refs.charPath = gCharacterPath;
     ctl.init(o.serve ? "ctl" : "", refs);
 
@@ -182,12 +341,17 @@ int runHeadless(const RunOpts& o) {
         return 2;
     }
 
+    // probe/pickuv are ctl verbs, so they must work in REPLAY too, not just
+    // serve — a journal that asserts what is under the cursor is the only way
+    // to regression-test the pick path headlessly. One 1-workgroup dispatch.
+    renderer.setAlwaysPick(true);
+
     if (o.serve) {
-        renderer.setAlwaysPick(true); // ctl probe/pickuv work headless
         std::printf("[ctl] serving on ctl/ at %dx%d aa=%d — drive with "
                     "tools/ctl.sh, stop with `quit`\n",
                     o.width, o.height, o.aa);
         int warm = 3; // render the bake/import + first visible frames
+        int inFlight = 0;
         while (!quit) {
             long tick = poseTickOf(t);
             ctl.poll(tick);
@@ -199,8 +363,13 @@ int runHeadless(const RunOpts& o) {
                 if (warm > 0) warm--;
                 t += n * kTickDt;
                 auto t0 = std::chrono::steady_clock::now();
+                renderer.setFighter(fighter);
                 renderer.render(cam, look, makeFrameInfo(t, o.aa), nullptr, nullptr);
                 gpu.processEvents();
+                if (++inFlight >= kMaxFramesInFlight) {
+                    gpu.waitForGpu();
+                    inFlight = 0;
+                }
                 double dt = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t0)
                                 .count();
@@ -227,6 +396,7 @@ int runHeadless(const RunOpts& o) {
         double tEnd = (double)(journal.back().tick + 1) / 12.0;
         total += std::max(0, (int)std::ceil((tEnd - o.startTime) * kTickRate) + 1);
     }
+    int inFlight = 0;
     for (int i = 0; i < total; i++) {
         long tick = poseTickOf(t);
         while (ji < journal.size() && journal[ji].tick <= tick) {
@@ -237,10 +407,15 @@ int runHeadless(const RunOpts& o) {
             }
             ji++;
         }
+        renderer.setFighter(fighter);
         renderer.render(cam, look, makeFrameInfo(t, o.aa), nullptr, nullptr);
         // headless still needs the event pump or async readbacks (volume
         // ledger, capacity poll) starve until exit
         gpu.processEvents();
+        if (++inFlight >= kMaxFramesInFlight) {
+            gpu.waitForGpu();
+            inFlight = 0;
+        }
         // replay is the regression harness: pin measurement arrival to the
         // frame after its edit so reruns are bit-for-bit repeatable
         if (!journal.empty()) renderer.syncMeasurements();
@@ -310,6 +485,8 @@ int runWindowed(const RunOpts& o) {
     Renderer renderer;
     if (!renderer.init(gpu, pw, ph)) return 1;
     if (!loadCharacterInto(renderer)) return 1;
+    // player 2: an identical fighter standing in front, facing the hero
+    renderer.addPlayer(FighterPose{{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false});
     if (!uiInit(window, gpu)) return 1;
 
     GameState game;
@@ -326,6 +503,7 @@ int runWindowed(const RunOpts& o) {
     refs.look = &look;
     refs.cam = &cam;
     refs.brush = &brush;
+    refs.fighter = &game.fighter;
     refs.renderer = &renderer;
     refs.clock = &clock;
     refs.simT = &simT;
@@ -372,6 +550,10 @@ int runWindowed(const RunOpts& o) {
                 if (ev.key.key == SDLK_1) brush.mode = 0;
                 if (ev.key.key == SDLK_2) brush.mode = 1;
                 if (ev.key.key == SDLK_3) brush.mode = 2;
+                // SPACE swings. Edge-triggered (not repeat) so holding it
+                // doesn't retrigger every frame mid-arc.
+                if (ev.key.key == SDLK_SPACE && !ev.key.repeat)
+                    game.swingRequested = true;
                 break;
             case SDL_EVENT_MOUSE_MOTION:
                 if (!uiWantsMouse() && brush.mode == 0 &&
@@ -397,6 +579,21 @@ int runWindowed(const RunOpts& o) {
         long tickNow = poseTickOf(simT);
         ctl.poll(tickNow); // before sim/render: same-frame set -> shot
 
+        // WASD walks, camera-relative: forward is away from the camera, so
+        // the fighter always runs "into the screen" whatever the orbit is.
+        {
+            const bool* keys = SDL_GetKeyboardState(nullptr);
+            float fx = -std::sin(cam.azimuth), fz = -std::cos(cam.azimuth);
+            float rx = std::cos(cam.azimuth), rz = -std::sin(cam.azimuth);
+            float mx = 0.f, mz = 0.f;
+            if (keys[SDL_SCANCODE_W]) { mx += fx; mz += fz; }
+            if (keys[SDL_SCANCODE_S]) { mx -= fx; mz -= fz; }
+            if (keys[SDL_SCANCODE_D]) { mx += rx; mz += rz; }
+            if (keys[SDL_SCANCODE_A]) { mx -= rx; mz -= rz; }
+            game.moveX = mx;
+            game.moveZ = mz;
+        }
+
         uint64_t nowNs = SDL_GetTicksNS();
         double frameDt = (double)(nowNs - prevNs) * 1e-9;
         prevNs = nowNs;
@@ -404,6 +601,14 @@ int runWindowed(const RunOpts& o) {
         int ticks = clock.ticksToRun(frameDt);
         if (ticks > 15) ticks = 15;
         for (int k = 0; k < ticks; k++) game.tick();
+        renderer.setFighter(game.fighter);
+        // keep the walker framed: the orbit target chases it, controls unchanged
+        {
+            float k = std::min(1.f, 4.f * (float)frameDt);
+            cam.target.x += (game.fighter.pos[0] - cam.target.x) * k;
+            cam.target.y += (game.fighter.pos[1] + 0.45f - cam.target.y) * k;
+            cam.target.z += (game.fighter.pos[2] - cam.target.z) * k;
+        }
         simT += ticks * kTickDt;
         fps = fps * 0.95f + (float)(1.0 / (frameDt > 1e-6 ? frameDt : 1e-6)) * 0.05f;
 
@@ -428,7 +633,10 @@ int runWindowed(const RunOpts& o) {
             renderer.pickValid()) {
             BrickEdit e;
             e.mode = brush.mode;
-            const float* p = renderer.pickPos();
+            // REST space, not world: the brick volume is authored in rest
+            // space, so carving a fighter that has walked or posed away from
+            // the origin needs the hit mapped back through the articulation.
+            const float* p = renderer.pickRest();
             e.pos[0] = p[0];
             e.pos[1] = p[1];
             e.pos[2] = p[2];
@@ -450,7 +658,15 @@ int runWindowed(const RunOpts& o) {
         if (surfaceTex.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
             surfaceTex.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
             wgpu::TextureView view = surfaceTex.texture.CreateView();
-            renderer.render(cam, look, makeFrameInfo(simT, 1), view,
+            // the swing rides ON TOP of the panel's hold pose, so the sliders
+            // stay authoritative for the guard and the arc is a transient
+            LookParams frameLook = look;
+            float sy, sp, lift;
+            game.swordOffset((float)(std::floor(simT * 12.0) / 12.0), sy, sp, lift);
+            frameLook.sword.yaw += sy;
+            frameLook.sword.pitch += sp;
+            frameLook.sword.pos[1] += lift;
+            renderer.render(cam, frameLook, makeFrameInfo(simT, 1), view,
                             [](wgpu::RenderPassEncoder& pass) { uiRender(pass); });
             gpu.surface.Present();
         } else {
@@ -478,6 +694,8 @@ int runWindowed(const RunOpts& o) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // mintty/pipes fully buffer stdout, hiding startup progress for minutes
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     RunOpts o;
     bool sizeSet = false, aaSet = false;
 
@@ -502,6 +720,14 @@ int main(int argc, char** argv) {
             o.frames = std::atoi(next("--frames"));
         } else if (arg == "--time") {
             o.startTime = std::atof(next("--time"));
+        } else if (arg == "--cam") {
+            // --cam AZ,EL,DIST (radians, radians, meters): inspect an artifact
+            // from any angle headlessly instead of driving serve mode
+            if (std::sscanf(next("--cam"), "%f,%f,%f", &o.camAz, &o.camEl,
+                            &o.camDist) != 3) {
+                std::fprintf(stderr, "--cam expects AZ,EL,DIST\n");
+                return 2;
+            }
         } else if (arg == "--aa") {
             o.aa = std::atoi(next("--aa"));
             aaSet = true;

@@ -126,12 +126,33 @@ void CtlServer::buildRegistry() {
     addF("sword.grip0", &l->sword.grip0);
     addF("sword.grip1", &l->sword.grip1);
     addF("sword.color", l->sword.color, 3);
+    addB("hands.ik", &l->hands.ik);
+    addF("hands.reach", &l->hands.reach);
+    addF("hands.reachScale", &l->hands.reachScale);
+    addF("hands.palmFrac", &l->hands.palmFrac);
+    addB("hands.orient", &l->hands.orient);
+    addF("hands.gripRoll", &l->hands.gripRoll);
+    addF("hands.gripSpread", &l->hands.gripSpread);
+    addF("hands.gripCurl", &l->hands.gripCurl);
+    addB("gaze.track", &l->gaze.track);
+    addF("gaze.maxAngle", &l->gaze.maxAngle);
     OrbitCamera* c = refs_.cam;
     addF("cam.azimuth", &c->azimuth);
     addF("cam.elevation", &c->elevation);
     addF("cam.distance", &c->distance);
     addF("cam.target", &c->target.x, 3);
     addF("cam.fovY", &c->fovY);
+    if (refs_.renderer) {
+        addB("foe.enabled", refs_.renderer->foeEnabledPtr());
+        addF("foe.pos", refs_.renderer->foePosePtr()->pos, 3);
+        addF("foe.yaw", &refs_.renderer->foePosePtr()->yaw);
+    }
+    if (refs_.fighter) {
+        addF("fighter.pos", refs_.fighter->pos, 3);
+        addF("fighter.yaw", &refs_.fighter->yaw);
+        addF("fighter.lean", &refs_.fighter->lean);
+        addB("fighter.moving", &refs_.fighter->moving);
+    }
     if (refs_.brush) {
         addI("brush.mode", &refs_.brush->mode);
         addF("brush.radius", &refs_.brush->radius);
@@ -367,11 +388,16 @@ bool CtlServer::execute(const std::string& line, long poseTick, std::string& out
     if (cmd == "probe") {
         const Renderer* r = refs_.renderer;
         char buf[256];
+        // `rest` is the volume-space address of the hit — what an edit here
+        // would carve. It equals pos only while the fighter is unposed at the
+        // origin; the gap between them IS the articulation.
         std::snprintf(buf, sizeof(buf),
                       "{\"valid\":%d,\"pos\":[%.4f,%.4f,%.4f],"
+                      "\"rest\":[%.4f,%.4f,%.4f],"
                       "\"normal\":[%.3f,%.3f,%.3f],\"mat\":%.1f}",
                       r->pickValid() ? 1 : 0, r->pickPos()[0], r->pickPos()[1],
-                      r->pickPos()[2], r->pickNormal()[0], r->pickNormal()[1],
+                      r->pickPos()[2], r->pickRest()[0], r->pickRest()[1],
+                      r->pickRest()[2], r->pickNormal()[0], r->pickNormal()[1],
                       r->pickNormal()[2], r->pickMat());
         out += std::string(buf) + "\n";
         return true;

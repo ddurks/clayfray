@@ -12,48 +12,50 @@
 
 namespace {
 
-// centroid and bounding radius of a mesh's positions. Marbles authored as
-// origin-centred spheres carry position in the node translation, but a
+// centroid and bounding radius of ONE primitive's positions. Marbles authored
+// as origin-centred spheres carry position in the node translation, but a
 // skinned/parented export bakes it into the vertices instead — reading the
 // centroid handles both, so a raw Blender UI export can't corrupt the eyes.
-void meshCentroidRadius(const cgltf_mesh* mesh, float scale, float outC[3],
+// Per-primitive (not per-mesh) because one eye object is two nested spheres,
+// eyeball + pupil, and each has to become its own bead.
+void primCentroidRadius(const cgltf_primitive& prim, float scale, float outC[3],
                         float& outR) {
+    const cgltf_accessor* acc = nullptr;
+    for (cgltf_size a = 0; a < prim.attributes_count; a++) {
+        if (prim.attributes[a].type == cgltf_attribute_type_position)
+            acc = prim.attributes[a].data;
+    }
+    outC[0] = outC[1] = outC[2] = 0.f;
+    outR = 0.f;
+    if (!acc || acc->count == 0) return;
+
     double c[3] = {0, 0, 0};
-    size_t count = 0;
-    for (cgltf_size p = 0; p < mesh->primitives_count; p++) {
-        const cgltf_primitive& prim = mesh->primitives[p];
-        for (cgltf_size a = 0; a < prim.attributes_count; a++) {
-            if (prim.attributes[a].type != cgltf_attribute_type_position) continue;
-            const cgltf_accessor* acc = prim.attributes[a].data;
-            for (cgltf_size i = 0; i < acc->count; i++) {
-                float v[3];
-                cgltf_accessor_read_float(acc, i, v, 3);
-                c[0] += v[0]; c[1] += v[1]; c[2] += v[2];
-                count++;
-            }
-        }
+    for (cgltf_size i = 0; i < acc->count; i++) {
+        float v[3];
+        cgltf_accessor_read_float(acc, i, v, 3);
+        c[0] += v[0]; c[1] += v[1]; c[2] += v[2];
     }
-    if (count) {
-        c[0] /= (double)count; c[1] /= (double)count; c[2] /= (double)count;
-    }
+    c[0] /= (double)acc->count; c[1] /= (double)acc->count; c[2] /= (double)acc->count;
     float r2 = 0.f;
-    for (cgltf_size p = 0; p < mesh->primitives_count; p++) {
-        const cgltf_primitive& prim = mesh->primitives[p];
-        for (cgltf_size a = 0; a < prim.attributes_count; a++) {
-            if (prim.attributes[a].type != cgltf_attribute_type_position) continue;
-            const cgltf_accessor* acc = prim.attributes[a].data;
-            for (cgltf_size i = 0; i < acc->count; i++) {
-                float v[3];
-                cgltf_accessor_read_float(acc, i, v, 3);
-                float dx = v[0] - (float)c[0], dy = v[1] - (float)c[1],
-                      dz = v[2] - (float)c[2];
-                float d2 = dx * dx + dy * dy + dz * dz;
-                if (d2 > r2) r2 = d2;
-            }
-        }
+    for (cgltf_size i = 0; i < acc->count; i++) {
+        float v[3];
+        cgltf_accessor_read_float(acc, i, v, 3);
+        float dx = v[0] - (float)c[0], dy = v[1] - (float)c[1], dz = v[2] - (float)c[2];
+        float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > r2) r2 = d2;
     }
     outC[0] = (float)c[0]; outC[1] = (float)c[1]; outC[2] = (float)c[2];
     outR = std::sqrt(r2) * scale;
+}
+
+// A primitive is a porcelain bead if its MATERIAL is named marble_*. Material
+// rather than object name because the eyes are one skinned object per side
+// (they carry gaze bones) whose two primitives are already authored as
+// marble_eye_*_mat / marble_pupil_*_mat. Keying on the material keeps clay and
+// porcelain separable inside a single object.
+bool isMarblePrim(const cgltf_primitive& prim) {
+    return prim.material && prim.material->name &&
+           std::strncmp(prim.material->name, "marble_", 7) == 0;
 }
 
 } // namespace
@@ -71,111 +73,138 @@ bool CharacterAsset::load(const std::string& path) {
         return false;
     }
 
-    const cgltf_node* bodyNode = nullptr;
+    // Every mesh bound to the armature is one body: the blob rig authors the
+    // torso and the two floating mitts as SEPARATE Blender objects sharing
+    // one skin, and they all have to land in the same voxel volume. Picking a
+    // single node (as this did) silently imported whichever came last —
+    // a fighter made of nothing but hands.
+    const cgltf_skin* skin = nullptr;
+    std::vector<const cgltf_node*> bodyNodes;
+    const cgltf_node* unskinned = nullptr; // fallback for rigless assets
     for (cgltf_size n = 0; n < data->nodes_count; n++) {
         const cgltf_node* node = &data->nodes[n];
         if (!node->mesh) continue;
         const char* name = node->name ? node->name : "";
-        if (std::strncmp(name, "marble_", 7) == 0) {
-            float world[16];
-            cgltf_node_transform_world(node, world);
-            float scale = std::sqrt(world[0] * world[0] + world[1] * world[1] +
-                                    world[2] * world[2]);
+        // Beads come from either convention: a whole object named marble_*
+        // (the original rule), or any primitive carrying a marble_* material
+        // (how the gaze-rigged eyes are authored). Either way they are props,
+        // never clay — the geometry pass below skips them.
+        const bool wholeNodeIsProp = std::strncmp(name, "marble_", 7) == 0;
+        float pworld[16];
+        cgltf_node_transform_world(node, pworld);
+        float pscale = std::sqrt(pworld[0] * pworld[0] + pworld[1] * pworld[1] +
+                                 pworld[2] * pworld[2]);
+        for (cgltf_size p = 0; p < node->mesh->primitives_count; p++) {
+            const cgltf_primitive& prim = node->mesh->primitives[p];
+            if (!wholeNodeIsProp && !isMarblePrim(prim)) continue;
             float centroid[3], radius;
-            meshCentroidRadius(node->mesh, scale, centroid, radius);
+            primCentroidRadius(prim, pscale, centroid, radius);
+            if (radius <= 0.f) continue;
             MarbleProp m{};
             // node translation + rotated/scaled centroid: exact for the
             // origin-centred authoring rule, and still correct when a
             // skinned export bakes the position into the vertices
-            m.pos[0] = world[0] * centroid[0] + world[4] * centroid[1] +
-                       world[8] * centroid[2] + world[12];
-            m.pos[1] = world[1] * centroid[0] + world[5] * centroid[1] +
-                       world[9] * centroid[2] + world[13];
-            m.pos[2] = world[2] * centroid[0] + world[6] * centroid[1] +
-                       world[10] * centroid[2] + world[14];
+            m.pos[0] = pworld[0] * centroid[0] + pworld[4] * centroid[1] +
+                       pworld[8] * centroid[2] + pworld[12];
+            m.pos[1] = pworld[1] * centroid[0] + pworld[5] * centroid[1] +
+                       pworld[9] * centroid[2] + pworld[13];
+            m.pos[2] = pworld[2] * centroid[0] + pworld[6] * centroid[1] +
+                       pworld[10] * centroid[2] + pworld[14];
             m.radius = radius;
             m.color[0] = 0.8f; m.color[1] = 0.8f; m.color[2] = 0.8f;
-            if (node->mesh->primitives_count > 0 &&
-                node->mesh->primitives[0].material &&
-                node->mesh->primitives[0].material->has_pbr_metallic_roughness) {
-                const float* bc = node->mesh->primitives[0]
-                                      .material->pbr_metallic_roughness.base_color_factor;
+            if (prim.material && prim.material->has_pbr_metallic_roughness) {
+                const float* bc =
+                    prim.material->pbr_metallic_roughness.base_color_factor;
                 m.color[0] = bc[0]; m.color[1] = bc[1]; m.color[2] = bc[2];
             }
             marbles.push_back(m);
-        } else if (node->skin || !bodyNode) {
-            if (node->skin || (bodyNode && !bodyNode->skin)) bodyNode = node;
-            if (!bodyNode) bodyNode = node;
+        }
+        if (wholeNodeIsProp) {
+            // fully consumed as beads
+        } else if (node->skin) {
+            if (!skin) skin = node->skin;
+            if (node->skin == skin) {
+                bodyNodes.push_back(node);
+            } else {
+                std::fprintf(stderr, "asset: mesh '%s' uses a second skin, skipped\n",
+                             name);
+            }
+        } else if (!unskinned) {
+            unskinned = node;
         }
     }
-    if (!bodyNode || !bodyNode->mesh) {
+    // no armature at all: fall back to the single mesh (pre-rig assets)
+    if (bodyNodes.empty() && unskinned) bodyNodes.push_back(unskinned);
+    if (bodyNodes.empty()) {
         std::fprintf(stderr, "asset: no body mesh found in %s\n", path.c_str());
         cgltf_free(data);
         return false;
     }
 
-    // skinned vertices are in armature space per glTF; non-skinned get node world
-    float world[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    if (!bodyNode->skin) cgltf_node_transform_world(bodyNode, world);
+    for (const cgltf_node* bodyNode : bodyNodes) {
+        // skinned verts are in armature space per glTF; non-skinned get node world
+        float world[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        if (!bodyNode->skin) cgltf_node_transform_world(bodyNode, world);
 
-    for (cgltf_size p = 0; p < bodyNode->mesh->primitives_count; p++) {
-        const cgltf_primitive& prim = bodyNode->mesh->primitives[p];
-        if (prim.type != cgltf_primitive_type_triangles) continue;
-        uint32_t base = vertexCount();
+        for (cgltf_size p = 0; p < bodyNode->mesh->primitives_count; p++) {
+            const cgltf_primitive& prim = bodyNode->mesh->primitives[p];
+            if (prim.type != cgltf_primitive_type_triangles) continue;
+            if (isMarblePrim(prim)) continue; // already a bead, not clay
+            uint32_t base = vertexCount();
 
-        const cgltf_accessor* pos = nullptr;
-        const cgltf_accessor* col = nullptr;
-        const cgltf_accessor* jnt = nullptr;
-        const cgltf_accessor* wgt = nullptr;
-        for (cgltf_size a = 0; a < prim.attributes_count; a++) {
-            switch (prim.attributes[a].type) {
-            case cgltf_attribute_type_position: pos = prim.attributes[a].data; break;
-            case cgltf_attribute_type_color:
-                if (prim.attributes[a].index == 0) col = prim.attributes[a].data;
-                break;
-            case cgltf_attribute_type_joints:
-                if (prim.attributes[a].index == 0) jnt = prim.attributes[a].data;
-                break;
-            case cgltf_attribute_type_weights:
-                if (prim.attributes[a].index == 0) wgt = prim.attributes[a].data;
-                break;
-            default: break;
+            const cgltf_accessor* pos = nullptr;
+            const cgltf_accessor* col = nullptr;
+            const cgltf_accessor* jnt = nullptr;
+            const cgltf_accessor* wgt = nullptr;
+            for (cgltf_size a = 0; a < prim.attributes_count; a++) {
+                switch (prim.attributes[a].type) {
+                case cgltf_attribute_type_position: pos = prim.attributes[a].data; break;
+                case cgltf_attribute_type_color:
+                    if (prim.attributes[a].index == 0) col = prim.attributes[a].data;
+                    break;
+                case cgltf_attribute_type_joints:
+                    if (prim.attributes[a].index == 0) jnt = prim.attributes[a].data;
+                    break;
+                case cgltf_attribute_type_weights:
+                    if (prim.attributes[a].index == 0) wgt = prim.attributes[a].data;
+                    break;
+                default: break;
+                }
             }
-        }
-        if (!pos) continue;
+            if (!pos) continue;
 
-        for (cgltf_size i = 0; i < pos->count; i++) {
-            float v[3];
-            cgltf_accessor_read_float(pos, i, v, 3);
-            float x = world[0] * v[0] + world[4] * v[1] + world[8] * v[2] + world[12];
-            float y = world[1] * v[0] + world[5] * v[1] + world[9] * v[2] + world[13];
-            float z = world[2] * v[0] + world[6] * v[1] + world[10] * v[2] + world[14];
-            positions.insert(positions.end(), {x, y, z});
+            for (cgltf_size i = 0; i < pos->count; i++) {
+                float v[3];
+                cgltf_accessor_read_float(pos, i, v, 3);
+                float x = world[0] * v[0] + world[4] * v[1] + world[8] * v[2] + world[12];
+                float y = world[1] * v[0] + world[5] * v[1] + world[9] * v[2] + world[13];
+                float z = world[2] * v[0] + world[6] * v[1] + world[10] * v[2] + world[14];
+                positions.insert(positions.end(), {x, y, z});
 
-            float c[4] = {0.5f, 0.5f, 0.5f, 1.f};
-            if (col) cgltf_accessor_read_float(col, i, c, 4);
-            colors.insert(colors.end(), {c[0], c[1], c[2]});
+                float c[4] = {0.5f, 0.5f, 0.5f, 1.f};
+                if (col) cgltf_accessor_read_float(col, i, c, 4);
+                colors.insert(colors.end(), {c[0], c[1], c[2]});
 
-            cgltf_uint j[4] = {0, 0, 0, 0};
-            if (jnt) cgltf_accessor_read_uint(jnt, i, j, 4);
-            joints.insert(joints.end(), {(uint16_t)j[0], (uint16_t)j[1], (uint16_t)j[2],
-                                         (uint16_t)j[3]});
+                cgltf_uint j[4] = {0, 0, 0, 0};
+                if (jnt) cgltf_accessor_read_uint(jnt, i, j, 4);
+                joints.insert(joints.end(), {(uint16_t)j[0], (uint16_t)j[1],
+                                             (uint16_t)j[2], (uint16_t)j[3]});
 
-            float w[4] = {1.f, 0.f, 0.f, 0.f};
-            if (wgt) cgltf_accessor_read_float(wgt, i, w, 4);
-            weights.insert(weights.end(), {w[0], w[1], w[2], w[3]});
-        }
-        if (prim.indices) {
-            for (cgltf_size i = 0; i < prim.indices->count; i++) {
-                indices.push_back(base +
-                                  (uint32_t)cgltf_accessor_read_index(prim.indices, i));
+                float w[4] = {1.f, 0.f, 0.f, 0.f};
+                if (wgt) cgltf_accessor_read_float(wgt, i, w, 4);
+                weights.insert(weights.end(), {w[0], w[1], w[2], w[3]});
+            }
+            if (prim.indices) {
+                for (cgltf_size i = 0; i < prim.indices->count; i++) {
+                    indices.push_back(
+                        base + (uint32_t)cgltf_accessor_read_index(prim.indices, i));
+                }
             }
         }
     }
 
     std::unordered_map<const cgltf_node*, int> jointIndex;
-    if (bodyNode->skin) {
-        const cgltf_skin* skin = bodyNode->skin;
+    if (skin) {
         for (cgltf_size j = 0; j < skin->joints_count; j++) {
             jointIndex[skin->joints[j]] = (int)j;
         }

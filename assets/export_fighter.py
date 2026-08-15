@@ -78,5 +78,9 @@ bpy.ops.export_scene.gltf(
     # silently lose authored animation from the asset
     export_animations=True,
     export_vertex_color='ACTIVE',
+    # animation-only helpers (shoulder.*) must stay OUT of the skin: the
+    # engine's piece system holds at most 16 bones and 4 per cell — extra
+    # joints crowd the shoulder cells and tear the warp at cell boundaries
+    export_def_bones=True,
 )
 print("exported", out)

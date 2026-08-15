@@ -6,14 +6,12 @@
 //
 // Includers must not redeclare group(1).
 
-const GRID: i32 = 74;              // brick cells per axis
-const BRICK_USABLE: f32 = 7.0;     // unique voxels per brick per axis
-const VOXEL: f32 = 0.0027344;      // meters
-const SPAN: f32 = 0.0191406;       // BRICK_USABLE * VOXEL
-const VOL_ORIGIN: vec3f = vec3f(-0.7082, -0.1582, -0.7082);
-const BAND: f32 = 12.0;            // band half-width ~ cell diagonal: allocated
-                                   // cells report TRUE distance everywhere, so
-                                   // AO/shadow taps never hit a clamp plateau
+// GRID / BRICK_USABLE / VOXEL / SPAN / VOL_ORIGIN / BAND / MAX_BRICKS come
+// from the //#constants block in the including ROOT (trace.wgsl, pick.wgsl),
+// generated from src/brick.h. This file is an include, so it must NOT declare
+// them itself — WGSL rejects the duplicate.
+// BAND is a half-width ~ one cell diagonal, so allocated cells report TRUE
+// distance everywhere and AO/shadow taps never hit a clamp plateau.
 
 const IND_ALLOC: u32 = 0x80000000u;
 const IND_INSIDE: u32 = 0x40000000u;
@@ -27,13 +25,72 @@ const IND_CHEB_MASK: u32 = 0x000000FFu;
 @group(1) @binding(4) var<storage, read> bCoarse: array<f32>;  // per-cell signed distance (m)
 @group(1) @binding(6) var<storage, read> bCellW: array<u32>;    // per-cell 4-slot skin: [joints u8x4][weights u8x4]
 
+// ---------- fighter 1 (the opponent) ----------
+// A second body, in its own volume. Same layout, same code: every read below
+// goes through an accessor that picks the volume by `gFighter`, so one set of
+// sampling functions serves both fighters and nothing here is duplicated.
+// Fighter 1 is RIGID (it stands and gets cut, it does not articulate), so it
+// needs no skin weights — hence no bCellW twin.
+@group(2) @binding(0) var<storage, read> fIndirection: array<u32>;
+@group(2) @binding(1) var<storage, read> fDist: array<u32>;
+@group(2) @binding(2) var<storage, read> fAlbedo: array<u32>;
+@group(2) @binding(3) var<storage, read> fSeeds: array<u32>;
+@group(2) @binding(4) var<storage, read> fCoarse: array<f32>;
+
+// Which body the sampling functions are currently reading, and its pose data.
+// Set them, call, set them back — see foeDist/foeAlbedo at the bottom. This is
+// what lets ONE copy of the warp serve every player.
+var<private> gFighter: u32 = 0u;
+var<private> gPieceCount: i32 = 0;
+var<private> gFarCenter: vec3f = vec3f(0.0);
+var<private> gFarR: f32 = 0.0;
+
+fn usePlayer0() {
+  gFighter = 0u;
+  gPieceCount = i32(u.boneMeta.x);
+  gFarCenter = u.capsCenter.xyz;
+  gFarR = u.boneMeta.w;
+}
+fn usePlayer1() {
+  gFighter = 1u;
+  gPieceCount = i32(u.foeBoneMeta.x);
+  gFarCenter = u.foeCenter.xyz;
+  gFarR = u.foeMeta.y;
+}
+// one piece of whichever player is selected
+fn pieceAt(i: i32) -> Piece {
+  if (gFighter == 0u) { return u.pieces[i]; }
+  return u.foePieces[i];
+}
+
+fn rdIndir(i: u32) -> u32 {
+  if (gFighter == 0u) { return bIndirection[i]; }
+  return fIndirection[i];
+}
+fn rdDist(i: u32) -> u32 {
+  if (gFighter == 0u) { return bDist[i]; }
+  return fDist[i];
+}
+fn rdAlb(i: u32) -> u32 {
+  if (gFighter == 0u) { return bAlbedo[i]; }
+  return fAlbedo[i];
+}
+fn rdSeed(i: u32) -> u32 {
+  if (gFighter == 0u) { return bSeeds[i]; }
+  return fSeeds[i];
+}
+fn rdCoarse(i: u32) -> f32 {
+  if (gFighter == 0u) { return bCoarse[i]; }
+  return fCoarse[i];
+}
+
 fn cellIndex(c: vec3i) -> u32 {
   return u32(c.x + c.y * GRID + c.z * GRID * GRID);
 }
 
 fn brickVoxel(brick: u32, v: vec3i) -> f32 {
   let vi = u32(v.x + v.y * 8 + v.z * 64);
-  let word = bDist[brick * 256u + vi / 2u];
+  let word = rdDist(brick * 256u + vi / 2u);
   let pair = unpack2x16float(word);
   return select(pair.x, pair.y, (vi & 1u) == 1u);
 }
@@ -67,7 +124,7 @@ fn charDistRest(p: vec3f) -> f32 {
   }
   let v = (p - VOL_ORIGIN) / VOXEL;
   let cell = clamp(vec3i(floor(v / BRICK_USABLE)), vec3i(0), vec3i(GRID - 1));
-  let e = bIndirection[cellIndex(cell)];
+  let e = rdIndir(cellIndex(cell));
   if ((e & IND_ALLOC) != 0u) {
     let lf = v - vec3f(cell) * BRICK_USABLE;
     return brickSample(e & IND_IDX_MASK, lf) * VOXEL;
@@ -77,7 +134,7 @@ fn charDistRest(p: vec3f) -> f32 {
   // step floor matches the 2.1-span classify margin: any unallocated point
   // is >= ~0.6 span from the surface, so a 0.5-span floor can't overshoot
   // AND stays safely above the march hit epsilon (no phantom hits)
-  let s = bSeeds[cellIndex(cell)];
+  let s = rdSeed(cellIndex(cell));
   var step = 0.5 * SPAN;
   if (s != 0xFFFFFFFFu) {
     let sc = vec3i(i32(s) % GRID, (i32(s) / GRID) % GRID, i32(s) / (GRID * GRID));
@@ -100,7 +157,7 @@ fn charLooseRest(p: vec3f) -> f32 {
   }
   let v = (p - VOL_ORIGIN) / VOXEL;
   let cell = clamp(vec3i(floor(v / BRICK_USABLE)), vec3i(0), vec3i(GRID - 1));
-  let e = bIndirection[cellIndex(cell)];
+  let e = rdIndir(cellIndex(cell));
   if ((e & IND_ALLOC) != 0u) {
     let lf = v - vec3f(cell) * BRICK_USABLE;
     return brickSample(e & IND_IDX_MASK, lf) * VOXEL;
@@ -114,14 +171,14 @@ fn coarseTrilinear(v: vec3f) -> f32 {
   let g = clamp(v / BRICK_USABLE - 0.5, vec3f(0.0), vec3f(f32(GRID) - 1.001));
   let c0 = vec3i(floor(g));
   let f = g - floor(g);
-  let d000 = bCoarse[cellIndex(c0)];
-  let d100 = bCoarse[cellIndex(min(c0 + vec3i(1, 0, 0), vec3i(GRID - 1)))];
-  let d010 = bCoarse[cellIndex(min(c0 + vec3i(0, 1, 0), vec3i(GRID - 1)))];
-  let d110 = bCoarse[cellIndex(min(c0 + vec3i(1, 1, 0), vec3i(GRID - 1)))];
-  let d001 = bCoarse[cellIndex(min(c0 + vec3i(0, 0, 1), vec3i(GRID - 1)))];
-  let d101 = bCoarse[cellIndex(min(c0 + vec3i(1, 0, 1), vec3i(GRID - 1)))];
-  let d011 = bCoarse[cellIndex(min(c0 + vec3i(0, 1, 1), vec3i(GRID - 1)))];
-  let d111 = bCoarse[cellIndex(min(c0 + vec3i(1, 1, 1), vec3i(GRID - 1)))];
+  let d000 = rdCoarse(cellIndex(c0));
+  let d100 = rdCoarse(cellIndex(min(c0 + vec3i(1, 0, 0), vec3i(GRID - 1))));
+  let d010 = rdCoarse(cellIndex(min(c0 + vec3i(0, 1, 0), vec3i(GRID - 1))));
+  let d110 = rdCoarse(cellIndex(min(c0 + vec3i(1, 1, 0), vec3i(GRID - 1))));
+  let d001 = rdCoarse(cellIndex(min(c0 + vec3i(0, 0, 1), vec3i(GRID - 1))));
+  let d101 = rdCoarse(cellIndex(min(c0 + vec3i(1, 0, 1), vec3i(GRID - 1))));
+  let d011 = rdCoarse(cellIndex(min(c0 + vec3i(0, 1, 1), vec3i(GRID - 1))));
+  let d111 = rdCoarse(cellIndex(min(c0 + vec3i(1, 1, 1), vec3i(GRID - 1))));
   return mix(mix(mix(d000, d100, f.x), mix(d010, d110, f.x), f.y),
              mix(mix(d001, d101, f.x), mix(d011, d111, f.x), f.y), f.z);
 }
@@ -141,7 +198,7 @@ fn charDistSmooth(p: vec3f) -> f32 {
 
 fn albedoVoxel(brick: u32, v: vec3i) -> vec3f {
   let vi = u32(v.x + v.y * 8 + v.z * 64);
-  return unpack4x8unorm(bAlbedo[brick * 512u + vi]).rgb;
+  return unpack4x8unorm(rdAlb(brick * 512u + vi)).rgb;
 }
 
 fn charAlbedoRest(p: vec3f) -> vec3f {
@@ -149,15 +206,15 @@ fn charAlbedoRest(p: vec3f) -> vec3f {
   // contour swirls
   let v = (p - VOL_ORIGIN) / VOXEL;
   let cell = clamp(vec3i(floor(v / BRICK_USABLE)), vec3i(0), vec3i(GRID - 1));
-  let e = bIndirection[cellIndex(cell)];
+  let e = rdIndir(cellIndex(cell));
   if ((e & IND_ALLOC) == 0u) {
     // blended chunk samples can land a hair outside the band; pull the
     // nearest surface brick's color via the JFA seed instead of debug grey
-    let sIdx = bSeeds[cellIndex(cell)];
+    let sIdx = rdSeed(cellIndex(cell));
     if (sIdx != 0xFFFFFFFFu) {
       let sc = vec3i(i32(sIdx) % GRID, (i32(sIdx) / GRID) % GRID,
                      i32(sIdx) / (GRID * GRID));
-      let se = bIndirection[cellIndex(sc)];
+      let se = rdIndir(cellIndex(sc));
       if ((se & IND_ALLOC) != 0u) {
         return albedoVoxel(se & IND_IDX_MASK, vec3i(3, 3, 3));
       }
@@ -250,10 +307,10 @@ fn chunkWarp(p: vec3f, q: vec3f, selfIdx: i32, bone: u32,
   var acc = vec3f(0.0);
   var wsum = 0.0;
   var inflMax = 0.0;
-  var seenBone = false;
-  var cands: array<u32, 4>;
-  var infls: array<f32, 4>;
-  var nc = 0;
+  // `self`'s influence is one of the candidate influences computed below —
+  // the loop already evaluates skinInfl for the slot where cand == bone, so
+  // capture it there instead of re-running that 8x4 gather afterwards.
+  var inflSelf = 0.0;
   for (var sl = 0u; sl < 4u; sl++) {
     let cand = (sk.jw >> (sl * 8u)) & 0xFFu;
     // skip duplicate slots (padding repeats joints)
@@ -272,19 +329,12 @@ fn chunkWarp(p: vec3f, q: vec3f, selfIdx: i32, bone: u32,
     }
     inflMax = max(inflMax, infl);
     if (cand == bone) {
-      seenBone = true;
+      inflSelf = infl;
     }
     if (cand < 16u && (*boneToPiece)[cand] >= 0) {
       acc += infl * (*qs)[(*boneToPiece)[cand]];
       wsum += infl;
-      cands[nc] = cand;
-      infls[nc] = infl;
-      nc++;
     }
-  }
-  var inflSelf = 0.0;
-  if (seenBone) {
-    inflSelf = skinInfl(sk, bone);
   }
   var out: WarpOut;
   out.inflSelf = inflSelf;
@@ -321,7 +371,7 @@ fn forwardResid(p: vec3f, qh: vec3f,
     let j = (jw >> (sl * 8u)) & 0xFFu;
     if (j < 16u && (*boneToPiece)[j] >= 0) {
       let pi = (*boneToPiece)[j];
-      back += f32(w8) * (u.pieces[pi].skin * vec4f(qh, 1.0)).xyz;
+      back += f32(w8) * (pieceAt(pi).skin * vec4f(qh, 1.0)).xyz;
       wsum += f32(w8);
     }
   }
@@ -331,12 +381,23 @@ fn forwardResid(p: vec3f, qh: vec3f,
   return length(back / wsum - p);
 }
 
-fn charDist(p: vec3f) -> f32 {
-  let n = i32(u.boneMeta.x);
+// TRIED AND REJECTED: a capsule-union early-out here (step by the distance to
+// the inflated bone capsules and skip the warp where that bound is comfortably
+// positive). It is sound as a MARCH acceleration — a union of enclosing
+// capsules is a lower bound, which is a safe sphere-trace step — and it was
+// worth ~6.5 ms of 71 ms. It still shifted 1.5% of pixels, because map() feeds
+// calcNormal as well as the march: when the gate fires on some of the four
+// gradient taps and not others, the normal is built from a mix of true-field
+// and bound values and the silhouette shading changes. Making it safe needs a
+// march-only map() separate from the shading one. Note also that capsules[i].w
+// is an 80th-percentile fit (anim.cpp) and does NOT enclose the body — only
+// pieces[i].capA.w (rPiece = max + 3.5 cm) does.
+fn charDistI(p: vec3f) -> f32 {
+  let n = gPieceCount;
   if (n == 0) {
     return charDistRest(p);
   }
-  let far = length(p - u.capsCenter.xyz) - u.boneMeta.w;
+  let far = length(p - gFarCenter) - gFarR;
   if (far > 0.1) {
     return far;
   }
@@ -346,8 +407,8 @@ fn charDist(p: vec3f) -> f32 {
     boneToPiece[i] = -1;
   }
   for (var i = 0; i < n; i++) {
-    qs[i] = (u.pieces[i].invSkin * vec4f(p, 1.0)).xyz;
-    let b = u32(u.pieces[i].capB.w);
+    qs[i] = (pieceAt(i).invSkin * vec4f(p, 1.0)).xyz;
+    let b = u32(pieceAt(i).capB.w);
     if (b < 16u) {
       boneToPiece[b] = i;
     }
@@ -357,10 +418,16 @@ fn charDist(p: vec3f) -> f32 {
   var bestPd = 1e9;
   var rendered = false;
   for (var i = 0; i < n; i++) {
+    // Fetch the bound fields ONCE. pieceAt() carries a dynamic branch over
+    // the two players' uniform arrays, and aabbLo was being re-fetched for
+    // its .w and its .xyz separately — four pieceAt calls per iteration on
+    // the hottest loop in the renderer.
+    let pLo = pieceAt(i).aabbLo;
+    let pHi = pieceAt(i).aabbHi;
     // aabbLo.w = min scale of the skin matrix: converts rest-space distance
     // to a safe world-space bound under squash/stretch
-    let s = u.pieces[i].aabbLo.w;
-    let toBox = max(u.pieces[i].aabbLo.xyz - qs[i], qs[i] - u.pieces[i].aabbHi.xyz);
+    let s = pLo.w;
+    let toBox = max(pLo.xyz - qs[i], qs[i] - pHi.xyz);
     let boxDist = length(max(toBox, vec3f(0.0)));
     if (boxDist > u.boneMeta.z) {
       // outside the test shell: the tight box bounds the piece's zero set,
@@ -368,7 +435,7 @@ fn charDist(p: vec3f) -> f32 {
       d = min(d, boxDist * s);
       continue;
     }
-    let bone = u32(u.pieces[i].capB.w);
+    let bone = u32(pieceAt(i).capB.w);
     // fixed-point refinement: influences read at the rigid guess are off by
     // the warp displacement, so re-evaluate at the blended location. But the
     // correction is proportional to that displacement — near-rigid regions
@@ -379,7 +446,7 @@ fn charDist(p: vec3f) -> f32 {
     if (distance(w.q, qs[i]) > 0.006) { // ~0.3 cell spans
       w = chunkWarp(p, w.q, i, bone, &qs, &boneToPiece);
     }
-    if (forwardResid(p, w.q, &boneToPiece) > 0.05) {
+    if (forwardResid(p, w.q, &boneToPiece) > WARP_RESID_TOL) {
       continue; // vacated-space sample: LBS puts that surface elsewhere
     }
     let pd = charDistRest(w.q) * s;
@@ -401,23 +468,28 @@ fn charDist(p: vec3f) -> f32 {
   return d;
 }
 
-fn charDistLoose(p: vec3f) -> f32 {
-  let n = i32(u.boneMeta.x);
+fn charDistLooseI(p: vec3f) -> f32 {
+  let n = gPieceCount;
   if (n == 0) {
     return charLooseRest(p);
   }
-  let far = length(p - u.capsCenter.xyz) - u.boneMeta.w;
+  let far = length(p - gFarCenter) - gFarR;
   if (far > 0.1) {
     return far;
   }
+  // NO proxy gate here, however tempting: this is the AO/penumbra field, and
+  // the gate returns a CONSERVATIVE bound. Feeding a conservative distance
+  // into AO or soft shadows is CLAUDE.md trap 3 — it reads as phantom
+  // occlusion and bands. Measured: gating here shifted 16% of pixels.
+  // The march path (charDistI) is the one that wants a conservative bound.
   var qs: array<vec3f, 16>;
   var boneToPiece: array<i32, 16>;
   for (var i = 0; i < 16; i++) {
     boneToPiece[i] = -1;
   }
   for (var i = 0; i < n; i++) {
-    qs[i] = (u.pieces[i].invSkin * vec4f(p, 1.0)).xyz;
-    let b = u32(u.pieces[i].capB.w);
+    qs[i] = (pieceAt(i).invSkin * vec4f(p, 1.0)).xyz;
+    let b = u32(pieceAt(i).capB.w);
     if (b < 16u) {
       boneToPiece[b] = i;
     }
@@ -427,18 +499,20 @@ fn charDistLoose(p: vec3f) -> f32 {
   var bestPd = 1e9;
   var rendered = false;
   for (var i = 0; i < n; i++) {
-    let s = u.pieces[i].aabbLo.w;
-    let toBox = max(u.pieces[i].aabbLo.xyz - qs[i], qs[i] - u.pieces[i].aabbHi.xyz);
+    let pLo = pieceAt(i).aabbLo;
+    let pHi = pieceAt(i).aabbHi;
+    let s = pLo.w;
+    let toBox = max(pLo.xyz - qs[i], qs[i] - pHi.xyz);
     let boxDist = length(max(toBox, vec3f(0.0)));
     if (boxDist > u.boneMeta.z) {
       d = min(d, boxDist * s);
       continue;
     }
-    let bone = u32(u.pieces[i].capB.w);
+    let bone = u32(pieceAt(i).capB.w);
     // single-pass warp: AO/penumbra tolerate the coarser estimate, and this
     // path runs 40+ times per shadow ray
     let w = chunkWarp(p, qs[i], i, bone, &qs, &boneToPiece);
-    if (forwardResid(p, w.q, &boneToPiece) > 0.05) {
+    if (forwardResid(p, w.q, &boneToPiece) > WARP_RESID_TOL) {
       continue;
     }
     let pd = charLooseRest(w.q) * s;
@@ -458,10 +532,15 @@ fn charDistLoose(p: vec3f) -> f32 {
   return d;
 }
 
-fn charAlbedo(p: vec3f) -> vec3f {
-  let n = i32(u.boneMeta.x);
+// World point -> the REST-space point it was warped from, i.e. the inverse of
+// the articulation. Everything that has to address the brick volume by a
+// point picked off the SCREEN needs this: the volume is authored in rest
+// space, so a world position is only a valid brick address while the fighter
+// sits unposed at the origin. Carving used to rely on exactly that accident.
+fn charRestPointI(p: vec3f) -> vec3f {
+  let n = gPieceCount;
   if (n == 0) {
-    return charAlbedoRest(p);
+    return p;
   }
   var qs: array<vec3f, 16>;
   var boneToPiece: array<i32, 16>;
@@ -469,32 +548,92 @@ fn charAlbedo(p: vec3f) -> vec3f {
     boneToPiece[i] = -1;
   }
   for (var i = 0; i < n; i++) {
-    qs[i] = (u.pieces[i].invSkin * vec4f(p, 1.0)).xyz;
-    let b = u32(u.pieces[i].capB.w);
+    qs[i] = (pieceAt(i).invSkin * vec4f(p, 1.0)).xyz;
+    let b = u32(pieceAt(i).capB.w);
     if (b < 16u) {
       boneToPiece[b] = i;
     }
   }
-  // albedo follows the nearest candidate surface, sampled at the same
-  // blended point charDist uses
+  // the winning piece is the one whose warped surface is nearest — the same
+  // contest charDist minimises, so the point lands on the surface drawn
   var best = 1e9;
   var q = p;
   for (var i = 0; i < n; i++) {
-    let toBox = max(u.pieces[i].aabbLo.xyz - qs[i], qs[i] - u.pieces[i].aabbHi.xyz);
+    let pLo = pieceAt(i).aabbLo;
+    let pHi = pieceAt(i).aabbHi;
+    let toBox = max(pLo.xyz - qs[i], qs[i] - pHi.xyz);
     if (length(max(toBox, vec3f(0.0))) > u.boneMeta.z) {
       continue;
     }
-    let bone = u32(u.pieces[i].capB.w);
+    let bone = u32(pieceAt(i).capB.w);
     var w = chunkWarp(p, qs[i], i, bone, &qs, &boneToPiece);
     w = chunkWarp(p, w.q, i, bone, &qs, &boneToPiece);
-    if (forwardResid(p, w.q, &boneToPiece) > 0.05) {
+    if (forwardResid(p, w.q, &boneToPiece) > WARP_RESID_TOL) {
       continue;
     }
-    let d = charDistRest(w.q) * u.pieces[i].aabbLo.w - w.inflSelf * 0.001;
+    let d = charDistRest(w.q) * pLo.w - w.inflSelf * 0.001;
     if (d < best) {
       best = d;
       q = w.q;
     }
   }
-  return charAlbedoRest(q);
+  return q;
+}
+
+fn charAlbedoI(p: vec3f) -> vec3f {
+  // albedo follows the nearest candidate surface, sampled at the same
+  // blended point charDist uses
+  return charAlbedoRest(charRestPointI(p));
+}
+
+// ---------- player entry points ----------
+// The hero is player 0; each call re-selects it because the opponent's
+// sampling leaves the private selectors pointing elsewhere.
+fn charDist(p: vec3f) -> f32 {
+  usePlayer0();
+  return charDistI(p);
+}
+fn charDistLoose(p: vec3f) -> f32 {
+  usePlayer0();
+  return charDistLooseI(p);
+}
+fn charAlbedo(p: vec3f) -> vec3f {
+  usePlayer0();
+  return charAlbedoI(p);
+}
+fn charRestPoint(p: vec3f) -> vec3f {
+  usePlayer0();
+  return charRestPointI(p);
+}
+
+// Player 1: same character, same warp, its OWN volume and its own pose. The
+// root transform is folded into its piece matrices exactly like the hero's,
+// so it animates rather than standing rigid.
+fn foeActive() -> bool {
+  return u.foeMeta.x > 0.5;
+}
+fn foeDist(p: vec3f) -> f32 {
+  if (!foeActive() || u.foeBoneMeta.x < 0.5) {
+    return 1e9;
+  }
+  usePlayer1();
+  let d = charDistI(p);
+  usePlayer0();
+  return d;
+}
+// smooth twin for AO/penumbra — same split the hero's field keeps (trap 3)
+fn foeDistLoose(p: vec3f) -> f32 {
+  if (!foeActive() || u.foeBoneMeta.x < 0.5) {
+    return 1e9;
+  }
+  usePlayer1();
+  let d = charDistLooseI(p);
+  usePlayer0();
+  return d;
+}
+fn foeAlbedo(p: vec3f) -> vec3f {
+  usePlayer1();
+  let c = charAlbedoI(p);
+  usePlayer0();
+  return c;
 }

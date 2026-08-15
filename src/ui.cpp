@@ -56,13 +56,27 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
 
     if (ImGui::CollapsingHeader("sword / IK (M4.7)", ImGuiTreeNodeFlags_DefaultOpen)) {
         SwordParams& s = look.sword;
-        ImGui::Checkbox("hold sword (arms follow via IK)", &s.enabled);
+        ImGui::Checkbox("hold sword (hands follow via IK)", &s.enabled);
         ImGui::DragFloat3("hilt pos", s.pos, 0.005f, -1.f, 1.5f);
         ImGui::SliderFloat("yaw", &s.yaw, -3.14f, 3.14f);
         ImGui::SliderFloat("pitch", &s.pitch, -1.57f, 1.57f);
         ImGui::SliderFloat("length", &s.length, 0.2f, 1.4f);
         ImGui::SliderFloat("blade radius", &s.radius, 0.005f, 0.05f);
         ImGui::ColorEdit3("blade glow", s.color);
+        HandParams& h = look.hands;
+        ImGui::Separator();
+        ImGui::Checkbox("floating hands follow grips", &h.ik);
+        // 0 = auto: rest COM->wrist distance * reachScale
+        ImGui::SliderFloat("reach (0 = auto)", &h.reach, 0.f, 1.5f);
+        ImGui::SliderFloat("auto reach scale", &h.reachScale, 0.5f, 3.f);
+        ImGui::SliderFloat("palm along mitt", &h.palmFrac, 0.f, 1.f);
+        ImGui::Checkbox("wrap mitts around handle", &h.orient);
+        ImGui::SliderFloat("grip roll", &h.gripRoll, -3.14f, 3.14f);
+        ImGui::SliderFloat("grip spread (sword radii)", &h.gripSpread, 0.f, 6.f);
+        ImGui::SliderFloat("finger curl (about handle)", &h.gripCurl, -2.0f, 2.0f);
+        ImGui::Separator();
+        ImGui::Checkbox("eyes track camera", &look.gaze.track);
+        ImGui::SliderFloat("gaze cone", &look.gaze.maxAngle, 0.f, 3.14f);
     }
 
     if (ImGui::CollapsingHeader("sploot", ImGuiTreeNodeFlags_DefaultOpen)) {
