@@ -312,3 +312,34 @@ tools/fairbench.sh "software:CLAYFRAY_NO_REUSE=1 CLAYFRAY_NO_SDFTEX=1" \
 TRACED pixel, and window size does not tell you that (SDL reports BACKING
 pixels, and resScale then divides them). The startup `[res]` line always
 prints what is actually traced.
+
+---
+
+# FOLLOW-UP: worthless once the warp is gone (measured -0.5%)
+
+Re-measured on top of the affine rig (three rigid pieces instead of the
+13-piece per-sample inverse-LBS warp), interleaved medians, windowed, pinned
+640x360, every frame traced:
+
+| variant | median | fps |
+|---|---|---|
+| affine rig, software filter | 23.92 ms | 41.8 |
+| affine rig + 3D texture | 23.80 ms | 42.0 |
+
+**-0.5%, i.e. nothing.** Output identical to 30 pixels past tolerance.
+
+So the earlier -8.8% was never hardware filtering beating software filtering.
+It was relieving cache pressure that THE WARP created — 13 pieces per sample,
+each gathering per-cell skin weights, thrashing the cache that brickSample's
+8 loads then had to compete for. Delete the warp and the software filter is
+effectively free.
+
+**Do not merge the 3D texture path.** It costs 86 MB/fighter, a staging
+buffer, and a flatten pass that still freezes on carve, to buy half a
+percent. The branch stays only as a record.
+
+The general lesson outlives this case: an optimisation measured against an
+expensive baseline may be measuring that baseline's WASTE rather than its own
+merit. Re-measure surviving optimisations after any large structural change —
+the same applies to the foveation spike (-27%) and the cone pre-pass, both of
+which were measured against the pre-affine frame.
