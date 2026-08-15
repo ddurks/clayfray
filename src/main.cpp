@@ -252,6 +252,8 @@ bool loadCharacterInto(Renderer& renderer) {
 
 struct RunOpts {
     std::string screenshotPath;
+    // pinned trace resolution from --res (0 = derive from window * resScale)
+    int traceW = 0, traceH = 0;
     // aa is rays-per-pixel-AXIS: the tracer loops aa*aa full marches per pixel
     // (trace.wgsl), so cost is quadratic in it. 2 -> 1 measured 3.87x faster
     // (232.5 -> 60.1 ms/frame, 960x540, RX 5700 XT) for a difference only
@@ -336,6 +338,8 @@ int runHeadless(const RunOpts& o) {
     if (!std::isnan(o.camEl)) cam.elevation = o.camEl;
     if (!std::isnan(o.camDist)) cam.distance = o.camDist;
     LookParams look;
+    look.traceW = o.traceW;
+    look.traceH = o.traceH;
     if (std::getenv("CLAYFRAY_DEBUG_FLAT")) {
         look.aoStrength = 0.f;
         look.detailAmount = 0.f;
@@ -525,8 +529,34 @@ int runWindowed(const RunOpts& o) {
     SDL_GetWindowSizeInPixels(window, &pw, &ph);
     gpu.configureSurface(pw, ph);
 
+    LookParams look;
+    look.traceW = o.traceW;
+    look.traceH = o.traceH;
+    // Trace size is decided ONCE here and reported, rather than drifting in
+    // from the every-10-frames resize below: the first frames would otherwise
+    // trace at full window size and a --res run would not honour the flag
+    // until frame 10.
+    const int traceW0 = look.traceW > 0 ? look.traceW
+                                        : std::max(160, (int)(pw * look.resScale));
+    const int traceH0 = look.traceH > 0 ? look.traceH
+                                        : std::max(90, (int)(ph * look.resScale));
+    {
+        // ALWAYS report what is actually traced. Frame cost is per traced
+        // pixel, and the window size does not tell you that: SDL reports
+        // BACKING pixels, which differ from the logical size on a scaled
+        // display, and resScale then divides them. Two machines "both at
+        // 1280x720" can be tracing 4x different pixel counts, which silently
+        // invalidates every timing comparison between them.
+        int lw = 0, lh = 0;
+        SDL_GetWindowSize(window, &lw, &lh);
+        std::printf("[res] window %dx%d logical, %dx%d backing -> TRACING %dx%d%s\n",
+                    lw, lh, pw, ph, traceW0, traceH0,
+                    look.traceW > 0 ? " (pinned by --res)" : " (resScale)");
+        std::fflush(stdout);
+    }
+
     Renderer renderer;
-    if (!renderer.init(gpu, pw, ph)) return 1;
+    if (!renderer.init(gpu, traceW0, traceH0)) return 1;
     if (!loadCharacterInto(renderer)) return 1;
     // player 2: an identical fighter standing in front, facing the hero
     renderer.addPlayer(FighterPose{{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false});
@@ -534,7 +564,6 @@ int runWindowed(const RunOpts& o) {
 
     GameState game;
     OrbitCamera cam;
-    LookParams look;
     BrushState brush;
 
     SimClock clock;
@@ -680,8 +709,12 @@ int runWindowed(const RunOpts& o) {
         // took the window to 0.31 of native for a frame rate the constant 0.5
         // already reaches, and the resolution switch itself was visible.
         if (frameCounter % 10 == 0) {
-            int tw = std::max(160, (int)(pw * look.resScale));
-            int th = std::max(90, (int)(ph * look.resScale));
+            // A pinned size wins over resScale: frame cost is per traced
+            // pixel, so this is what makes two machines comparable.
+            int tw = look.traceW > 0 ? look.traceW
+                                     : std::max(160, (int)(pw * look.resScale));
+            int th = look.traceH > 0 ? look.traceH
+                                     : std::max(90, (int)(ph * look.resScale));
             if (tw != renderer.width() || th != renderer.height()) renderer.resize(tw, th);
         }
 
@@ -799,6 +832,15 @@ int main(int argc, char** argv) {
             if (std::sscanf(next("--cam"), "%f,%f,%f", &o.camAz, &o.camEl,
                             &o.camDist) != 3) {
                 std::fprintf(stderr, "--cam expects AZ,EL,DIST\n");
+                return 2;
+            }
+        } else if (arg == "--res") {
+            // Pin the TRACED resolution, ignoring window size and resScale.
+            // The point is cross-machine comparability: `--res 640x360` costs
+            // the same work everywhere, so a frame time from one box means
+            // something on another.
+            if (std::sscanf(next("--res"), "%dx%d", &o.traceW, &o.traceH) != 2) {
+                std::fprintf(stderr, "--res expects WxH\n");
                 return 2;
             }
         } else if (arg == "--aa") {
