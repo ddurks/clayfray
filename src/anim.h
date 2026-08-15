@@ -9,6 +9,22 @@ void matMul(const float* a, const float* b, float* out); // out = a * b
 void matInvAffine(const float* m, float* out);
 void matTransformPoint(const float* m, const float* p, float* out);
 
+// Smallest singular value of a 4x4's 3x3 linear part.
+//
+// This is the honest Lipschitz rescale for a rest->world piece transform: for
+// any two rest points, |A(q1-q2)| >= sigmaMin * |q1-q2|, so multiplying a
+// sampled REST distance by sigmaMin gives a world distance that can only be an
+// UNDERESTIMATE — which is exactly what a sphere trace needs.
+//
+// The 13-piece path uses the min COLUMN NORM instead, and gets away with it
+// because its transforms are rotations with at most a per-bone scale. The
+// affine body is a shear composed with a non-uniform scale, and a shear's
+// columns can all be unit length while its smallest singular value is well
+// under 1 — trusting the column norm there would OVERESTIMATE distances and
+// the march would step straight through the skin. Closed form via the
+// eigenvalues of A^T A (symmetric 3x3), so no iteration and no failure mode.
+float mat3MinSingular(const float m[16]);
+
 // Samples `clip` at time t (caller loops/quantizes), composes the joint
 // hierarchy, writes one skinning matrix (world * invBind) per bone. Null
 // clip yields identity matrices — the rest pose by construction, so props

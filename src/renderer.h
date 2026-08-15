@@ -145,6 +145,51 @@ class Renderer {
     FighterPose fighterDisp_, foeDisp_;
     float dispPoseTime_ = -1.f;
 
+    // ---- M-PERF: the three-piece affine rig ----
+    // Articulation collapsed to an affine body plus two rigid mitts. See the
+    // block comment in shaders/brick_read.wgsl for what the sampling path
+    // gains; this is just the CPU-side table that describes the three pieces.
+    //
+    // Built once per character. `srcBone` is the bone whose posed skin matrix
+    // IS the piece's transform — for the body that is any spine bone (they all
+    // carry the same affine once posed), for a mitt it is the wrist the hand
+    // IK placed. `boneMask` is what the shader's ownership test compares the
+    // per-cell dominant bone against; lo/hi bound the clay the piece carries.
+    struct AffinePiece {
+        uint32_t boneMask = 0;
+        float lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
+        int srcBone = -1;
+    };
+    std::vector<AffinePiece> affinePieces_;
+
+    // Procedural squish: one scalar per fighter. q < 0 is compressed, q > 0
+    // stretched; the overshoot back through zero IS the bounce. Stepped on the
+    // 12 Hz pose grid only (trap 4 + frame reuse), fixed substeps, no RNG.
+    struct BodySpring {
+        float q = 0.f, v = 0.f, gait = 0.f;
+    };
+    BodySpring spring_;
+    // phase-offset so two identical fighters don't breathe in lockstep — that
+    // reads as one puppet duplicated, not two actors (the clip path offsets
+    // its own clock by the same 0.37 for the same reason)
+    BodySpring foeSpring_{0.f, 0.f, 0.37f};
+    float springPoseTime_ = -1.f;
+    bool affineOn(const LookParams& look) const;
+    static void stepSpring(BodySpring& s, const RigParams& r, bool moving, float dt);
+    void bodyAffine(const FighterPose& disp, const BodySpring& s,
+                    const RigParams& r, float out[16]) const;
+    // Writes the three pieces at `base` (66 for the hero, 293 for the foe) and
+    // returns how many it wrote.
+    int packAffinePieces(float out[kUniformSlots][4], int base,
+                         const std::vector<float>& mats) const;
+    // Tight posed bound over those pieces: each piece's rest AABB corners run
+    // through its own transform. The 13-piece path derives this from posed
+    // capsule endpoints + rPiece; with three pieces the boxes ARE the clay
+    // bounds, so the corners give a tighter sphere for free — and it has to be
+    // recomputed rather than inherited, because a squish can push the body
+    // past a bound measured on the rest mesh.
+    float affineBoundR(const std::vector<float>& mats, const float center[3]) const;
+
   public:
     // M5: where the fighter stands. Set from the gameplay tick; the renderer
     // premultiplies the whole skeleton by it each frame.

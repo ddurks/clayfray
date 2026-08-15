@@ -3,6 +3,12 @@
 // (carveable). Eyes stay analytic rigid beads. Writes linear HDR.
 
 // Per-bone chunk (M4-P1): rest body ∩ rest capsule, posed by invSkin.
+// Two of these fields carry DIFFERENT things depending on rigMeta.x — see
+// packUniforms and the affine-rig block in brick_read.wgsl:
+//   aabbLo.w  13-piece: min column norm of the skin matrix
+//             affine:   smallest SINGULAR value (a shear needs the honest one)
+//   capB.w    13-piece: this piece's bone id
+//             affine:   BITMASK of the bones whose clay this piece carries
 struct Piece {
   invSkin: mat4x4f, // world -> rest, rigid (posed inverse skin matrix)
   skin: mat4x4f,    // rest -> world, for the round-trip consistency check
@@ -50,6 +56,11 @@ struct Uniforms {
   // animates. Appended (never inserted) so no earlier slot index moves.
   foePieces: array<Piece, 16>,
   foeBoneMeta: vec4f,    // x = piece count
+  // M-PERF three-piece affine rig. Slot 486; appended, so no earlier index
+  // moves (trap 2). x = rig select (0 = the 13-piece inverse-LBS warp,
+  // 1 = affine body + two rigid mitts), y = baked hand-pose volume count
+  // (0 today: the mitts are sampled out of the shared rest volume).
+  rigMeta: vec4f,
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var hdrOut: texture_storage_2d<rgba16float, write>;
