@@ -25,7 +25,9 @@ Headless flags: `--screenshot PATH --size WxH --frames N --time T --aa N`,
 `Renderer::addPlayer(pose)` adds a fighter and returns its index; player 0 is
 the hero. **The cap is 2** — each body needs its own volume and WGSL bindings
 are static, so 3+ requires the per-player stride in PLAN.md ("fighters are
-SLICES"). ctl exposes `foe.enabled`, `foe.pos`, `foe.yaw`.
+SLICES"). That cap is now enforced by hardware, not taste: a third fighter's
+3 bindings would put `trace` at 12 of Metal's 10 (trap 8). ctl exposes
+`foe.enabled`, `foe.pos`, `foe.yaw`.
 
 Both fighters bill to ONE conservation ledger: clay off either body becomes
 the same gobs on the same arena.
@@ -70,6 +72,20 @@ srcRGB]]`, `bake`, `shot PATH`, `stats`, `probe`/`pickuv u v`, `pause`,
 PATH|stop`, `break ledger TOL_ML|off`, `quit`.
 
 Iteration rules of thumb:
+- **Don't render screenshots to check your own work — build it and hand it
+  over.** A `--screenshot`/`--replay` pass costs a startup plus the frame
+  run, and a verification sweep of several burns minutes of the user's time
+  waiting on you. Finish at `cmake --build build` and say what to look at.
+  Render only when asked, or for a gate with no manual equivalent (the
+  `--carve-test` conservation exit code, replay determinism) — and say why
+  first. For perf work, quote benchmark numbers instead of re-rendering to
+  eyeball.
+- **A pixel diff cannot see SHAPE.** imgdiff answers "did values move", not
+  "does it still look right", and the difference has already shipped a
+  regression: a skin-gather change measured 133 changed pixels — inside
+  imgdiff's own tolerance — while visibly wrecking the mitts' silhouette at
+  the 4-bone junction. Anything touching skinning, the warp, silhouettes or
+  the joints is judged by a human in the running app, not by a number.
 - Tuning/look/pose/sword work: NEVER rebuild — `set` + `shot` on a live
   instance. Shaders hot-load on save (~30-frame poll), also no rebuild.
 - C++ changes: `snap save` first, rebuild, relaunch `--serve --load NAME` —
@@ -83,9 +99,26 @@ Iteration rules of thumb:
   they are meaningless once frame reuse is on, and they misreport small
   dispatches. Always burn a warm-up run first — a shader edit forces a cold
   pipeline compile on the next launch only, and differencing against that
-  yields negative ms/frame. `CLAYFRAY_NO_REUSE=1` gives the MOVING cost (what
-  governs frame rate whenever anything is in motion); without it you get the
-  idle cost.
+  yields negative ms/frame. The subtler form BURNED A SESSION: when you
+  difference a short run against a long one, the compile lands in the SHORT
+  run, shrinks the difference, and reports ~13 ms/frame too FAST — a plausible
+  looking win, not an obvious error. It fires only for a shader the pipeline
+  cache has never seen, so the committed shader measures clean and every
+  experiment measures fast. Warm up after EVERY shader edit, and never take
+  the min across repeated passes: that picks the contaminated one. Two
+  ablations "worth" 16 and 12 ms were worth 3 and 0 once measured warm.
+  `CLAYFRAY_NO_REUSE=1` gives the MOVING cost (what governs frame rate
+  whenever anything is in motion); without it you get the idle cost.
+- Env-var ablations (`CLAYFRAY_NO_PIECES`, `_AO`, `_SHADOWK`) don't touch
+  shader source, so they never hit the cold-compile trap. Prefer them for
+  cost attribution; reach for a shader edit only to test a fix.
+- **Conditional skips do not pay here.** Several "skip the expensive path
+  when X" experiments came out image-identical and SLOWER (58.5 -> 59.7,
+  60.1, 60.7). A branch only helps if every lane in the wavefront takes it,
+  and neighbouring pixels sit in different regions of the body; the skipped
+  work still gets executed, plus the test. Removing work for EVERY lane is
+  what moves the number. Small edits also swing the frame by ~10% in either
+  direction via register pressure — measure, never assume.
 - Scenario regression: `record` a journal (or hand-write one: `<poseTick>
   <ctl command>` per line, see `scenarios/`), then
   `./build/clayfray --replay scenarios/X.journal --screenshot out.png
@@ -177,6 +210,24 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    A mesh bound to a SECOND skin is skipped with a warning (joint indices
    would not line up).
 
+8. **A shader stage gets 10 storage buffers on Metal, and `trace` uses 9.**
+   Metal gives a function 31 buffer slots; Dawn spends one on buffer lengths
+   and reserves its default uniform + vertex budget, leaving 10 — the adapter
+   genuinely reports that, so requesting full limits (which `gpu.cpp` already
+   does) buys nothing. M5's second fighter took `trace` to 14 bindings and the
+   pipeline failed to CREATE on macOS: `CreateComputePipeline` errored and
+   every frame after it was invalid, while Vulkan (effectively unbounded)
+   showed nothing wrong. So each fighter's four per-cell arrays (indirection,
+   JFA seeds, coarse, cell weights) are REGIONS of one `volume` buffer: write
+   passes bind their own region as a sub-range, which is why the write shaders
+   still declare them separately, and the tracer binds the buffer once and
+   adds a base index (`CELL_*` from `wgslConstants`, accessors at the top of
+   `brick_read.wgsl`). Budget: 3 per fighter + 3 ground = 9. **Adding a
+   storage binding to trace.wgsl breaks macOS** — grow a region, or pack the
+   ground trio the same way, instead. Keep every write-side binding of those
+   regions `read_write`: Dawn rejects a buffer that is writable and read-only
+   within one pass and tracks that per BUFFER, not per bound range.
+
 ## Verifying a conservation (M4.6) change
 
 `--carve-test` now self-checks and **exits nonzero (3) on a conservation
@@ -202,6 +253,7 @@ reference renders — diff against them by eye after a lighting/shading change.
 | `CLAYFRAY_NO_REDIST` / `_NO_ANIM` / `_NO_PIECES` | disable redistance / animation / chunk articulation |
 | `CLAYFRAY_AO` / `_DETAIL` / `_SHADOWK` | override look params (float) |
 | `CLAYFRAY_DEBUG_PICK=1` | print world vs REST position under the cursor (trap 6) |
+| `CLAYFRAY_DEBUG_REUSE=1` | name the input behind every re-trace that happens BETWEEN pose steps (a re-trace ON a pose step is the 12 Hz floor, so it stays quiet — silence means optimal) — a uniform (by slot NAME, e.g. "gobs (flying clay)") or the volume whose generation moved. Frame reuse is what makes motion affordable, so when the `[reuse] traced N of M` line collapses toward 0% skipped, this says which input refuses to settle |
 | `CLAYFRAY_TEST_ADDSTRESS` / `_TEST_NULLEDITS` | `--carve-test` variants (pool stress / null-edit JFA) |
 
 ## Known defect: repeated readbacks stall (Windows/Vulkan, 2026-08-13)

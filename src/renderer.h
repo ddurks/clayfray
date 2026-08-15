@@ -257,6 +257,12 @@ class Renderer {
     bool reuseEnabled_ = true;
     uint64_t framesTraced_ = 0, framesPresented_ = 0;
     uint64_t traceInputDigest(const float u[kUniformSlots][4]) const;
+    static bool digestIncludes(int slot, int comp);
+    static const char* uniformSlotName(int slot);
+    // CLAYFRAY_DEBUG_REUSE only: last frame's traced inputs, so a re-trace can
+    // name the input that changed instead of just counting itself.
+    float prevUniforms_[kUniformSlots][4] = {};
+    uint32_t prevGens_[3] = {0, 0, 0};
 
     // Shared with in-flight MapAsync callbacks; false once destroyed.
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);

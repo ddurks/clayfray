@@ -293,28 +293,25 @@ void Renderer::buildBindGroups() {
         traceBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        wgpu::BindGroupEntry entries[9] = {};
+        // One binding covers indirection + seeds + coarse + cell weights: they
+        // are regions of brick_.volume, and Metal allows a stage only 10
+        // storage buffers (brick.h). Six here plus fighter 1's three = 9.
+        wgpu::BindGroupEntry entries[6] = {};
         entries[0].binding = 0;
-        entries[0].buffer = brick_.indirection;
+        entries[0].buffer = brick_.volume;
         entries[1].binding = 1;
         entries[1].buffer = brick_.distPool;
         entries[2].binding = 2;
         entries[2].buffer = brick_.albedoPool;
-        entries[3].binding = 3;
-        entries[3].buffer = brick_.seeds;
-        entries[4].binding = 4;
-        entries[4].buffer = brick_.coarse;
-        entries[5].binding = 6;
-        entries[5].buffer = brick_.cellWeights;
-        entries[6].binding = 7;
-        entries[6].buffer = ground_.base;
-        entries[7].binding = 8;
-        entries[7].buffer = ground_.height;
-        entries[8].binding = 9;
-        entries[8].buffer = ground_.color;
+        entries[3].binding = 7;
+        entries[3].buffer = ground_.base;
+        entries[4].binding = 8;
+        entries[4].buffer = ground_.height;
+        entries[5].binding = 9;
+        entries[5].buffer = ground_.color;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = tracePipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 9;
+        desc.entryCount = 6;
         desc.entries = entries;
         traceBrickBind_ = dev.CreateBindGroup(&desc);
     }
@@ -331,50 +328,41 @@ void Renderer::buildBindGroups() {
         pickBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        // pick's charDist + charAlbedo touch indirection + dist + albedo +
-        // seeds + weights; auto layout excludes the unused coarse binding
-        wgpu::BindGroupEntry entries[5] = {};
+        // Same three as trace, minus the ground: pick marches the body only.
+        // (Before the volume regions merged, trace and pick needed different
+        // entry counts here — pick's auto layout dropped the coarse field it
+        // never reads. One binding now carries every per-cell array, so both
+        // layouts agree.)
+        wgpu::BindGroupEntry entries[3] = {};
         entries[0].binding = 0;
-        entries[0].buffer = brick_.indirection;
+        entries[0].buffer = brick_.volume;
         entries[1].binding = 1;
         entries[1].buffer = brick_.distPool;
         entries[2].binding = 2;
         entries[2].buffer = brick_.albedoPool;
-        entries[3].binding = 3;
-        entries[3].buffer = brick_.seeds;
-        entries[4].binding = 6;
-        entries[4].buffer = brick_.cellWeights;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = pickPipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 5;
+        desc.entryCount = 3;
         desc.entries = entries;
         pickBrickBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        // group(2): fighter 1's volume. Same five arrays the rigid sampling
-        // path reads — no skin weights, it doesn't articulate. Bound for BOTH
-        // pipelines because brick_read.wgsl references them statically, so
-        // Tint keeps the bindings alive even on paths pick never takes.
-        wgpu::BindGroupEntry entries[5] = {};
+        // group(2): fighter 1's volume, laid out exactly like fighter 0's.
+        // Bound for BOTH pipelines because brick_read.wgsl references these
+        // statically, so Tint keeps the bindings alive even on paths pick
+        // never takes.
+        wgpu::BindGroupEntry entries[3] = {};
         entries[0].binding = 0;
-        entries[0].buffer = foe_.indirection;
+        entries[0].buffer = foe_.volume;
         entries[1].binding = 1;
         entries[1].buffer = foe_.distPool;
         entries[2].binding = 2;
         entries[2].buffer = foe_.albedoPool;
-        entries[3].binding = 3;
-        entries[3].buffer = foe_.seeds;
-        entries[4].binding = 4;
-        entries[4].buffer = foe_.coarse;
         wgpu::BindGroupDescriptor desc{};
         desc.entries = entries;
-        desc.entryCount = 5;
+        desc.entryCount = 3;
         desc.layout = tracePipeline_.GetBindGroupLayout(2);
         traceFoeBind_ = dev.CreateBindGroup(&desc);
-        // pick never takes the AO/penumbra path, so its auto layout drops the
-        // coarse field — same asymmetry group(1) already has above. Feeding
-        // the trace-sized set here fails validation.
-        desc.entryCount = 4;
         desc.layout = pickPipeline_.GetBindGroupLayout(2);
         pickFoeBind_ = dev.CreateBindGroup(&desc);
     }
@@ -427,6 +415,47 @@ bool Renderer::reloadShadersIfChanged() {
 //   mouse     pick uv     — pick runs every frame regardless, on its own pass
 // Volume CONTENTS are not in the uniform buffer at all, so the caller folds in
 // the brick/ground generation counters separately.
+// Slot -> what lives there, so a re-trace report reads as "gobs" rather than
+// "slot 271". Mirrors the Uniforms layout (trap 2); boundaries match the
+// hardcoded writes in packUniforms.
+const char* Renderer::uniformSlotName(int s) {
+    static const char* head[14] = {"camPos",   "camRight", "camUp",    "camFwd",
+                                   "res",      "keyPos",   "keyColor", "rimDir",
+                                   "rimColor", "ambient",  "material", "post",
+                                   "post2",    "mouse"};
+    if (s < 14) return head[s];
+    if (s < 30) return "marbles (eyes)";
+    if (s == 30) return "marbleMeta";
+    if (s == 31) return "capsMeta";
+    if (s == 32) return "capsCenter";
+    if (s < 65) return "capsules (hero shadow proxy)";
+    if (s == 65) return "boneMeta";
+    if (s < 258) return "pieces (hero articulation)";
+    if (s == 258) return "gobMeta (in-flight count)";
+    if (s < 283) return "gobs (flying clay)";
+    if (s == 283) return "groundMeta (clay top bound)";
+    if (s == 284) return "swordA (hilt)";
+    if (s == 285) return "swordB (tip)";
+    if (s == 286) return "swordCol";
+    if (s < 291) return "foeInv";
+    if (s == 291) return "foeMeta";
+    if (s == 292) return "foeCenter";
+    if (s < 485) return "pieces (foe articulation)";
+    return "foeBoneMeta";
+}
+
+// Which uniform components the reuse digest is allowed to see. Kept beside
+// traceInputDigest so the digest and the CLAYFRAY_DEBUG_REUSE report below
+// cannot drift into disagreeing about what counts as a change.
+bool Renderer::digestIncludes(int s, int c) {
+    if (s == 13) return false;               // pick uv
+    if (s == 11) return false;               // post
+    if (s == 2 && c == 3) return false;      // frame.time
+    if (s == 4 && c == 2) return false;      // grainFrame
+    if (s == 12 && c != 3) return false;     // post2: keep only debugMode
+    return true;
+}
+
 uint64_t Renderer::traceInputDigest(const float u[kUniformSlots][4]) const {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](float f) {
@@ -437,13 +466,8 @@ uint64_t Renderer::traceInputDigest(const float u[kUniformSlots][4]) const {
         h *= 1099511628211ull;
     };
     for (int s = 0; s < kUniformSlots; s++) {
-        if (s == 13) continue;               // pick uv
-        if (s == 11) continue;               // post
         for (int c = 0; c < 4; c++) {
-            if (s == 2 && c == 3) continue;  // frame.time
-            if (s == 4 && c == 2) continue;  // grainFrame
-            if (s == 12 && c != 3) continue; // post2: keep only debugMode
-            mix(u[s][c]);
+            if (digestIncludes(s, c)) mix(u[s][c]);
         }
     }
     return h;
@@ -1206,7 +1230,11 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
         gobSeed_ = gobSeed_ * 1664525u + 1013904223u;
         return (float)(gobSeed_ >> 8) * (1.f / 16777216.f);
     };
-    while (haveWound_ && sploot_.debt > kMinGob && (int)gobs_.size() < 12) {
+    // Spawning changes the in-flight count, which the tracer reads, so it
+    // belongs on the pose grid too — otherwise the array refills at 60 Hz as
+    // fast as landings drain it and reuse never recovers.
+    while (poseStep && haveWound_ && sploot_.debt > kMinGob &&
+           (int)gobs_.size() < 12) {
         float v = std::min(sploot_.debt, kMaxGob);
         sploot_.debt -= v;
         Gob g{};
@@ -1275,7 +1303,9 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
                 float d[3] = {g.pos[0] - cp[0], g.pos[1] - cp[1], g.pos[2] - cp[2]};
                 float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
                 if (dist >= g.radius + pc.r) continue;
-                if (resting) {
+                // same pose-grid rule as the floor landing below: a deposit
+                // queues an edit, which bumps a volume generation
+                if (resting && poseStep) {
                     BrickEdit e;
                     e.mode = 2;
                     e.fromGob = true;
@@ -1314,10 +1344,20 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
             continue;
         }
 
-        // landing: floor mosaic or an existing pile (coarse CPU mirror)
+        // Landing: floor mosaic or an existing pile (coarse CPU mirror).
+        // ON POSE STEPS ONLY, like every other visible event. The gob FLIES at
+        // 60 Hz — trajectories need it — but touching down splats the ground
+        // and drops the gob from the array, and both are traced inputs. Landing
+        // whenever a gob happened to cross the floor made the ground clay
+        // generation and the in-flight count change at frame rate, so the ~2 s
+        // of clay raining down after a hit re-traced EVERY frame: 60 traces a
+        // second instead of 12, right after the hit that most wants the frames.
+        // Deferring costs nothing visually — the drawn position (g.disp) is
+        // already frozen between pose steps, so a gob that dips under the floor
+        // mid-step was never drawn there.
         float top = ground_.approxTopAt(g.pos[0], g.pos[2]);
-        if ((g.pos[1] - 0.4f * g.radius < top && g.vel[1] <= 0.f) ||
-            g.pos[1] < -0.1f) {
+        if (poseStep && ((g.pos[1] - 0.4f * g.radius < top && g.vel[1] <= 0.f) ||
+                         g.pos[1] < -0.1f)) {
             ground_.splat(g.pos[0], g.pos[2], g.vol, g.col);
             sploot_.deposited += g.vol;
             it = gobs_.erase(it);
@@ -1495,6 +1535,54 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     }
     const bool reuse = reuseEnabled_ && traceValid_ && digest == traceDigest_;
     framesPresented_++;
+
+    // Why did this frame re-trace? Frame reuse is the difference between
+    // motion costing one trace per pose step and one per frame, so when it
+    // drops to 0% the useful question is which input refuses to settle.
+    // Names the first differing uniform component, or the volume whose
+    // generation moved (i.e. something queued an edit).
+    static const bool dbgReuse = std::getenv("CLAYFRAY_DEBUG_REUSE") != nullptr;
+    // A re-trace ON a pose step is the floor, not a fault — the image is
+    // supposed to change 12 times a second. Reporting those buries the ones
+    // that matter, and worse, misattributes them: the report names the first
+    // differing slot in index order, so a pose step also carrying a camera
+    // move gets blamed on camPos (slot 0) rather than the pose clock (slot
+    // 3.3). Stay quiet unless a frame re-traced BETWEEN pose steps, which is
+    // the only kind that costs anything.
+    const bool poseStepFrame = uniforms[3][3] != prevUniforms_[3][3];
+    if (dbgReuse && !reuse && traceValid_ && !poseStepFrame) {
+        const uint32_t gens[3] = {brick_.generation(), foe_.generation(),
+                                  ground_.generation()};
+        const char* gname[3] = {"hero volume", "foe volume", "ground clay"};
+        bool blamed = false;
+        for (int i = 0; i < 3; i++) {
+            if (gens[i] != prevGens_[i]) {
+                std::printf("[reuse] re-trace: %s generation %u -> %u\n", gname[i],
+                            prevGens_[i], gens[i]);
+                blamed = true;
+            }
+        }
+        for (int s = 0; s < kUniformSlots && !blamed; s++) {
+            for (int c = 0; c < 4; c++) {
+                if (!digestIncludes(s, c)) continue;
+                if (uniforms[s][c] == prevUniforms_[s][c]) continue;
+                std::printf("[reuse] re-trace: %s (slot %d.%d)  %.9g -> %.9g\n",
+                            uniformSlotName(s), s, c,
+                            (double)prevUniforms_[s][c], (double)uniforms[s][c]);
+                blamed = true;
+                break;
+            }
+        }
+        if (!blamed) std::printf("[reuse] re-trace between pose steps: no input changed?\n");
+        std::fflush(stdout);
+    }
+    if (dbgReuse) {
+        std::memcpy(prevUniforms_, uniforms, sizeof(prevUniforms_));
+        prevGens_[0] = brick_.generation();
+        prevGens_[1] = foe_.generation();
+        prevGens_[2] = ground_.generation();
+    }
+
     if (!reuse) {
         framesTraced_++;
         traceDigest_ = digest;

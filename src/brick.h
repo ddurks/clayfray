@@ -89,6 +89,38 @@ class BrickSystem {
     static constexpr uint32_t kAxisVox = kGrid * kBrickUsable + 1;
     static constexpr uint32_t kRowWords = (kAxisVox + 31) / 32;
 
+    // ---- the four per-cell arrays share ONE buffer ----
+    // A Metal shader stage gets 10 storage buffers: 31 Metal buffer slots,
+    // less the one Dawn reserves for buffer lengths and its default uniform
+    // and vertex-buffer budget. The tracer samples TWO fighters plus the
+    // ground, and at one binding per array that came to 14 — the trace
+    // pipeline failed to create at all and the app drew nothing on macOS.
+    // (Vulkan's limit is effectively unbounded, which is why M5's second
+    // fighter looked fine on the Windows box.)
+    //
+    // So indirection, JFA seeds, the coarse field and the cell weights live
+    // at fixed offsets inside `volume`. A pass that WRITES one binds just its
+    // own region as a sub-range, so the write shaders are untouched; the
+    // tracer binds the whole buffer once and adds a base index on the read
+    // (the CELL_* constants in wgslConstants(), used by brick_read.wgsl).
+    //
+    // Every write-side binding of these regions is read_write ON PURPOSE:
+    // Dawn rejects a buffer that is writable and read-only within one pass,
+    // and it tracks that per BUFFER, not per bound range — so a `read`
+    // binding on any region would break every pass that writes another.
+    static constexpr uint64_t kCellCount = (uint64_t)kGrid * kGrid * kGrid;
+    static constexpr uint64_t kCellBytes = kCellCount * 4;
+    static constexpr uint64_t kCellWBytes = kCellCount * 8; // 4 joints + 4 weights
+    // Region starts must satisfy minStorageBufferOffsetAlignment (256).
+    static constexpr uint64_t kAlign = 256;
+    static constexpr uint64_t kRegionStride = (kCellBytes + kAlign - 1) & ~(kAlign - 1);
+    static constexpr uint64_t kIndOff = 0;                     // indirection
+    static constexpr uint64_t kSeedOff = kRegionStride;        // JFA seeds (jfaA)
+    static constexpr uint64_t kCoarseOff = kRegionStride * 2;  // coarse distance
+    static constexpr uint64_t kCellWOff = kRegionStride * 3;   // per-cell skin
+    static constexpr uint64_t kVolumeBytes =
+        kCellWOff + ((kCellWBytes + kAlign - 1) & ~(kAlign - 1));
+
     // ---- chunk-warp thresholds: RESOLUTION-RELATIVE, never metres ----
     // These three were authored as fixed distances (0.05 / 0.008 / 0.06 m)
     // tuned at kGrid=50. A fixed distance silently TIGHTENS as kGrid falls,
@@ -172,14 +204,18 @@ class BrickSystem {
     // refresh. Call once per frame before the trace pass.
     void encode(wgpu::CommandEncoder& enc);
 
-    wgpu::Buffer indirection, distPool, albedoPool;
+    // The per-cell arrays, packed at the kIndOff/kSeedOff/kCoarseOff/kCellWOff
+    // offsets above:
+    //   ind    — indirection grid
+    //   seed   — canonical JFA output (jfaA), read by tracer/pick
+    //   coarse — per-cell signed coarse distance, read by tracer
+    //   cellW  — per-cell nearest-surface bone weights, flood-filled
+    //            volume-wide: the chunk warp needs weight guidance OUTSIDE the
+    //            narrow band too (a rigid warp guess at a big joint angle
+    //            lands far from the surface)
+    wgpu::Buffer volume;
+    wgpu::Buffer distPool, albedoPool;
     wgpu::Buffer weightPool; // per-voxel packed top-2 bone weights (M4 reads)
-    // per-cell nearest-surface bone weights, flood-filled volume-wide: the
-    // chunk warp needs weight guidance OUTSIDE the narrow band too (a rigid
-    // warp guess at a big joint angle lands far from the surface)
-    wgpu::Buffer cellWeights;
-    wgpu::Buffer seeds;  // canonical JFA output (jfaA), read by tracer/pick
-    wgpu::Buffer coarse; // per-cell signed coarse distance, read by tracer
 
     // Blocking readbacks; debug only.
     void debugStats(const char* label);
@@ -222,7 +258,9 @@ class BrickSystem {
     wgpu::Buffer dirtyList_, indirectArgs_;
     wgpu::BindGroup rdCompactG_, rdPrepG_, rdRedistG_, rdClearG_;
     static constexpr int kJfaSteps = 9; // 7 pow2 rounds + JFA+2 refinement
-    wgpu::Buffer editParams_[kOpsPerFrame], counters_, freelist_, jfaA_, jfaB_;
+    // jfaB_ is the JFA's ping-pong scratch; the canonical side (jfaA) is the
+    // seed region of `volume`, since the tracer reads it.
+    wgpu::Buffer editParams_[kOpsPerFrame], counters_, freelist_, jfaB_;
     wgpu::Buffer jfaStepParams_[kJfaSteps], jfaResolveParams_;
     wgpu::BindGroup classifyG0_[kOpsPerFrame], classifyG1_, classifyG2_;
     wgpu::BindGroup fillG0_[kOpsPerFrame], fillG1_, fillG2_;

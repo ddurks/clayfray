@@ -19,3 +19,6 @@ third_party/dxc/*.dll
 # dev-loop runtime state (ctl inbox/outbox, local scene snapshots)
 ctl/
 snapshots/
+
+# agent worktrees (transient)
+.claude/worktrees/

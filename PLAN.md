@@ -362,6 +362,18 @@ proposed and it is wrong. Three reasons, in order of severity:
    fighters = 530 MB, 4 = 1.06 GB.
 3. The uniform block cannot hold a second fighter anyway — see below.
 
+**Reason 1 has a hard number now (Metal, 2026-08-15).** M5 shipped the
+rejected design anyway — a second BrickSystem with its own group(2) — and it
+does not run on macOS at all: a Metal shader stage gets **10** storage
+buffers (31 Metal buffer slots, less the one Dawn spends on buffer lengths
+and its default uniform/vertex budget), and one binding per array put `trace`
+at 14. `CreateComputePipeline` failed outright and every frame after it was
+invalid. Vulkan's limit is effectively unbounded, which is why the Windows
+box never saw it. Mitigated, not fixed, by packing each fighter's four
+per-cell arrays into ONE `volume` buffer (brick.h): a fighter now costs 3
+bindings instead of 6, so trace sits at 9 of 10 — **fighter #3 still needs
+the slice work above**, it just fails at N=3 instead of N=2.
+
 **Locked: one BrickSystem, fighters are slices of it.**
 - Per-cell arrays get a fighter stride: `bIndirection[f * CELLS + cellIndex(c)]`.
   ~13 MB per fighter, and **one binding set, one shader** — the only shader

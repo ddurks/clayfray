@@ -102,7 +102,8 @@ std::vector<uint8_t> SnapReader::blob(const char tag[4]) const {
     return out;
 }
 
-std::vector<uint8_t> readbackBuffer(Gpu& gpu, wgpu::Buffer src, uint64_t size) {
+std::vector<uint8_t> readbackBuffer(Gpu& gpu, wgpu::Buffer src, uint64_t size,
+                                    uint64_t srcOffset) {
     std::vector<uint8_t> out;
     wgpu::BufferDescriptor desc{};
     desc.label = "snapshot readback";
@@ -110,7 +111,7 @@ std::vector<uint8_t> readbackBuffer(Gpu& gpu, wgpu::Buffer src, uint64_t size) {
     desc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
     wgpu::Buffer rb = gpu.device.CreateBuffer(&desc);
     wgpu::CommandEncoder enc = gpu.device.CreateCommandEncoder();
-    enc.CopyBufferToBuffer(src, 0, rb, 0, size);
+    enc.CopyBufferToBuffer(src, srcOffset, rb, 0, size);
     wgpu::CommandBuffer cmd = enc.Finish();
     gpu.queue.Submit(1, &cmd);
     bool ok = false;

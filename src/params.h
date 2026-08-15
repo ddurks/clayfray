@@ -78,6 +78,22 @@ struct HandParams {
 // a traced input that changes every frame), so motion runs at the raw frame
 // cost. That is a rendering problem to solve in the renderer, not by making
 // the movement look worse.
+//
+// It was flipped ON once, for that reuse cost, and flipped back after playing
+// it. DON'T FLIP IT AGAIN ON A REUSE MEASUREMENT — reuse % is the wrong
+// scoreboard here, and it is convincing:
+//
+//   Frame reuse does not produce images, it only makes DUPLICATE frames
+//   cheap. Sliding, every frame is unique and costs the full trace: ~17
+//   unique images/s. Stepped, the trace happens 12x/s and ~48 duplicates
+//   ride along: the fps counter reads ~60 while the eye gets 12. Stepping
+//   spends motion fidelity (17 -> 12 unique images/s) to buy a bigger
+//   number. The reuse rate went 0% -> 73% and the game looked worse.
+//
+// Reuse is still worth having for what it was built for — a still camera,
+// where the duplicates are duplicates of a frame nothing was changing anyway.
+// It is not a lever to make motion cheaper. Motion gets cheaper by making the
+// TRACE cheaper.
 struct MotionParams {
     bool stepRoot = false;
 };
@@ -126,6 +142,15 @@ struct LookParams {
     // blit upscales. Chunky low-res + grain reads very stop-motion, and
     // traced pixels are the whole frame cost.
     float resScale = 0.5f; // user-approved default: chunky + fast
+    // FIXED trace resolution, overriding resScale when both are > 0. Frame
+    // cost is per TRACED PIXEL, so a resScale-derived size makes two machines
+    // incomparable the moment their windows or backing scales differ — and
+    // "same window size" is not the same thing as "same traced pixels" on a
+    // display that reports backing pixels. Pin this and the number means the
+    // same thing everywhere. `--res WxH` sets it; the startup [res] line
+    // always prints what is actually being traced, so a mismatch is visible
+    // instead of inferred.
+    int traceW = 0, traceH = 0; // 0,0 = derive from the window via resScale
 
     // M4-P0 animation: play the asset's first clip, looped, sampled on the
     // 12 Hz pose grid. Off = rest pose. (Drives marbles + shadow proxy; the

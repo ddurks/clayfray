@@ -51,6 +51,32 @@ wgpu::Buffer makeStorage(wgpu::Device& device, uint64_t size, const char* label,
     return device.CreateBuffer(&desc);
 }
 
+// A bind group entry that may point at a SUB-RANGE of a buffer. The per-cell
+// arrays are regions of one `volume` buffer (see brick.h), so each pass binds
+// only the region it touches and the write shaders keep their own bindings.
+struct BindBuf {
+    uint32_t binding;
+    wgpu::Buffer buf;
+    uint64_t offset = 0;
+    uint64_t size = wgpu::kWholeSize;
+};
+
+wgpu::BindGroup makeBindGroup(wgpu::Device& device, wgpu::ComputePipeline& pipe,
+                              uint32_t group, const std::vector<BindBuf>& entries) {
+    std::vector<wgpu::BindGroupEntry> e(entries.size());
+    for (size_t i = 0; i < entries.size(); i++) {
+        e[i].binding = entries[i].binding;
+        e[i].buffer = entries[i].buf;
+        e[i].offset = entries[i].offset;
+        e[i].size = entries[i].size;
+    }
+    wgpu::BindGroupDescriptor desc{};
+    desc.layout = pipe.GetBindGroupLayout(group);
+    desc.entryCount = e.size();
+    desc.entries = e.data();
+    return device.CreateBindGroup(&desc);
+}
+
 struct EditParamsCpu {
     int32_t regionMin[4];
     int32_t regionDims[4];
@@ -66,7 +92,7 @@ struct EditParamsCpu {
 // values to the CPU — which matters: a cell index computed from a slightly
 // different SPAN lands in a different brick.
 std::string BrickSystem::wgslConstants() {
-    char buf[1200];
+    char buf[2048];
     std::snprintf(
         buf, sizeof(buf),
         "// GENERATED from BrickSystem in src/brick.h — do not edit here, and\n"
@@ -82,11 +108,19 @@ std::string BrickSystem::wgslConstants() {
         "const CELLS: u32 = %uu;\n"
         "const AXIS_VOX: i32 = %d;\n"
         "const ROW_WORDS: u32 = %uu;\n"
-        "const WARP_RESID_TOL: f32 = %.9g;\n",
+        "const WARP_RESID_TOL: f32 = %.9g;\n"
+        "// Base index (in u32 elements) of each per-cell array inside the one\n"
+        "// `volume` storage buffer the tracer binds — see brick.h.\n"
+        "const CELL_IND: u32 = %uu;\n"
+        "const CELL_SEED: u32 = %uu;\n"
+        "const CELL_COARSE: u32 = %uu;\n"
+        "const CELL_W: u32 = %uu;\n",
         kGrid, kBrickUsable, (double)kVoxel, (double)kSpan, (double)kOrigin[0],
         (double)kOrigin[1], (double)kOrigin[2], (double)kBand, kMaxBricks,
         kDirtyCap, (uint32_t)kGrid * kGrid * kGrid, (int)kAxisVox, kRowWords,
-        (double)(kWarpResidSpans * kSpan));
+        (double)(kWarpResidSpans * kSpan), (uint32_t)(kIndOff / 4),
+        (uint32_t)(kSeedOff / 4), (uint32_t)(kCoarseOff / 4),
+        (uint32_t)(kCellWOff / 4));
     return buf;
 }
 
@@ -96,19 +130,17 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
     wgpu::Device& dev = gpu.device;
     const uint32_t cells = kGrid * kGrid * kGrid;
 
-    indirection = makeStorage(dev, cells * 4ull, "brick indirection");
+    // One buffer for indirection + seeds + coarse + cell weights (see the
+    // region map in brick.h — Metal's 10-storage-buffer stage cap). Created
+    // once at full size: import fills the weights in place, so bind groups
+    // built against it never go stale.
+    volume = makeStorage(dev, kVolumeBytes, "brick volume");
     distPool = makeStorage(dev, kMaxBricks * 256ull * 4ull, "brick dist pool");
     albedoPool = makeStorage(dev, kMaxBricks * 512ull * 4ull, "brick albedo pool");
     weightPool = makeStorage(dev, kMaxBricks * 512ull * 4ull, "brick weight pool");
-    // created once at full size: import fills it in place, so bind groups
-    // built against it never go stale. 2 words per cell: 4 joints + 4 weights.
-    cellWeights = makeStorage(dev, cells * 8ull, "cell weights");
     counters_ = makeStorage(dev, 16, "brick counters");
     freelist_ = makeStorage(dev, kMaxBricks * 4ull, "brick freelist");
-    jfaA_ = makeStorage(dev, cells * 4ull, "jfa A");
     jfaB_ = makeStorage(dev, cells * 4ull, "jfa B");
-    seeds = jfaA_;
-    coarse = makeStorage(dev, cells * 4ull, "coarse dist");
     coarseB_ = makeStorage(dev, cells * 4ull, "coarse dist B");
     static_assert(sizeof(EditParamsCpu) == 80, "must match WGSL EditParams");
     for (int i = 0; i < kOpsPerFrame; i++)
@@ -158,44 +190,40 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
         return false;
 
     auto bind = [&](wgpu::ComputePipeline& pipe, uint32_t group,
-                    std::vector<std::pair<uint32_t, wgpu::Buffer>> entries) {
-        std::vector<wgpu::BindGroupEntry> e(entries.size());
-        for (size_t i = 0; i < entries.size(); i++) {
-            e[i].binding = entries[i].first;
-            e[i].buffer = entries[i].second;
-        }
-        wgpu::BindGroupDescriptor desc{};
-        desc.layout = pipe.GetBindGroupLayout(group);
-        desc.entryCount = e.size();
-        desc.entries = e.data();
-        return gpu_->device.CreateBindGroup(&desc);
+                    std::vector<BindBuf> entries) {
+        return makeBindGroup(gpu_->device, pipe, group, entries);
     };
+    // The `volume` regions these passes write, each at the binding its shader
+    // declares for it (indirection is always 0, seeds 1, coarse 5).
+    const BindBuf vInd{0, volume, kIndOff, kCellBytes};
+    const BindBuf vSeed{1, volume, kSeedOff, kCellBytes};
+    const BindBuf vCoarse{5, volume, kCoarseOff, kCellBytes};
 
     for (int i = 0; i < kOpsPerFrame; i++)
         classifyG0_[i] = bind(classify_, 0, {{0, editParams_[i]}});
-    classifyG1_ = bind(classify_, 1, {{0, indirection}});
+    classifyG1_ = bind(classify_, 1, {vInd});
     classifyG2_ = bind(classify_, 2, {{0, counters_}, {1, freelist_}});
     for (int i = 0; i < kOpsPerFrame; i++)
         fillG0_[i] = bind(fill_, 0, {{0, editParams_[i]}});
-    fillG1_ = bind(fill_, 1, {{0, indirection}, {1, distPool}, {2, albedoPool}});
+    fillG1_ = bind(fill_, 1, {vInd, {1, distPool}, {2, albedoPool}});
     fillG2_ = bind(fill_, 2, {{0, counters_}, {1, freelist_}});
-    jfaInitG_ = bind(jfaInit_, 0, {{0, indirection}, {1, jfaA_}});
+    jfaInitG_ = bind(jfaInit_, 0, {vInd, vSeed});
     for (int i = 0; i < kJfaSteps; i++) {
         jfaStepG_[i] = bind(jfaStep_, 0,
-                            {{1, jfaA_}, {2, jfaB_}, {3, jfaStepParams_[i]}});
+                            {vSeed, {2, jfaB_}, {3, jfaStepParams_[i]}});
     }
     jfaResolveG_ = bind(jfaResolve_, 0,
-                        {{0, indirection}, {1, jfaA_}, {2, jfaB_}, {3, jfaResolveParams_},
-                         {4, distPool}, {5, coarse}});
-    rdCompactG_ = bind(rdCompact_, 0, {{0, indirection}, {2, dirtyList_}, {3, counters_}});
+                        {vInd, vSeed, {2, jfaB_}, {3, jfaResolveParams_},
+                         {4, distPool}, vCoarse});
+    rdCompactG_ = bind(rdCompact_, 0, {vInd, {2, dirtyList_}, {3, counters_}});
     rdPrepG_ = bind(rdPrep_, 0, {{3, counters_}, {4, indirectArgs_}});
-    rdRedistG_ = bind(rdRedist_, 0, {{0, indirection}, {1, distPool}, {2, dirtyList_}});
-    rdClearG_ = bind(rdClear_, 0, {{0, indirection}, {2, dirtyList_}, {3, counters_}});
+    rdRedistG_ = bind(rdRedist_, 0, {vInd, {1, distPool}, {2, dirtyList_}});
+    rdClearG_ = bind(rdClear_, 0, {vInd, {2, dirtyList_}, {3, counters_}});
     // 4 relax rounds alternating direction; even count ends back in `coarse`
     for (int i = 0; i < 4; i++) {
         jfaRelaxG_[i] = bind(jfaRelax_, 0,
                              {{3, jfaStepParams_[i % 2 == 0 ? 6 : 5]}, // srcIsA: 1,0,1,0
-                              {5, coarse},
+                              vCoarse,
                               {6, coarseB_}});
     }
     return true;
@@ -208,7 +236,7 @@ void BrickSystem::debugStats(const char* label) {
     desc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
     wgpu::Buffer rb = gpu_->device.CreateBuffer(&desc);
     wgpu::CommandEncoder enc = gpu_->device.CreateCommandEncoder();
-    enc.CopyBufferToBuffer(indirection, 0, rb, 0, cells * 4ull);
+    enc.CopyBufferToBuffer(volume, kIndOff, rb, 0, cells * 4ull);
     enc.CopyBufferToBuffer(counters_, 0, rb, cells * 4ull, 16);
     wgpu::CommandBuffer cmd = enc.Finish();
     gpu_->queue.Submit(1, &cmd);
@@ -249,7 +277,7 @@ void BrickSystem::debugScanField() {
     desc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
     wgpu::Buffer rb = gpu_->device.CreateBuffer(&desc);
     wgpu::CommandEncoder enc = gpu_->device.CreateCommandEncoder();
-    enc.CopyBufferToBuffer(indirection, 0, rb, 0, cells * 4ull);
+    enc.CopyBufferToBuffer(volume, kIndOff, rb, 0, cells * 4ull);
     enc.CopyBufferToBuffer(distPool, 0, rb, cells * 4ull, distBytes);
     wgpu::CommandBuffer cmd = enc.Finish();
     gpu_->queue.Submit(1, &cmd);
@@ -302,7 +330,7 @@ void BrickSystem::debugScanField() {
     cdesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
     wgpu::Buffer crb = gpu_->device.CreateBuffer(&cdesc);
     wgpu::CommandEncoder cenc = gpu_->device.CreateCommandEncoder();
-    cenc.CopyBufferToBuffer(coarse, 0, crb, 0, cells * 4ull);
+    cenc.CopyBufferToBuffer(volume, kCoarseOff, crb, 0, cells * 4ull);
     wgpu::CommandBuffer ccmd = cenc.Finish();
     gpu_->queue.Submit(1, &ccmd);
     bool cok = false;
@@ -597,31 +625,23 @@ void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
     mesh_ = std::move(mesh);
 
     // per-fighter: this volume's own cell-weight copy and parity scratch
-    gpu_->queue.WriteBuffer(cellWeights, 0, mesh_->cellW.data(),
+    gpu_->queue.WriteBuffer(volume, kCellWOff, mesh_->cellW.data(),
                             mesh_->cellW.size() * 4);
     const uint32_t axisVox = kAxisVox, rowWords = kRowWords;
     vxParityBuf_ = makeStorage(dev, (uint64_t)axisVox * axisVox * rowWords * 4,
                                "voxel parity");
 
     auto bindv = [&](wgpu::ComputePipeline& pipe, uint32_t group,
-                     std::vector<std::pair<uint32_t, wgpu::Buffer>> entries) {
-        std::vector<wgpu::BindGroupEntry> e(entries.size());
-        for (size_t i = 0; i < entries.size(); i++) {
-            e[i].binding = entries[i].first;
-            e[i].buffer = entries[i].second;
-        }
-        wgpu::BindGroupDescriptor desc{};
-        desc.layout = pipe.GetBindGroupLayout(group);
-        desc.entryCount = e.size();
-        desc.entries = e.data();
-        return dev.CreateBindGroup(&desc);
+                     std::vector<BindBuf> entries) {
+        return makeBindGroup(dev, pipe, group, entries);
     };
     // classify's auto layout skips bindings it doesn't touch; fill uses all.
     vxG0_ = bindv(vxFill_, 0,
                   {{0, mesh_->pos}, {1, mesh_->idx}, {2, mesh_->col},
                    {3, mesh_->skin}, {4, mesh_->tris}, {5, vxParityBuf_}});
     vxG1_ = bindv(vxFill_, 1,
-                  {{0, indirection}, {1, distPool}, {2, albedoPool}, {3, weightPool}});
+                  {{0, volume, kIndOff, kCellBytes}, {1, distPool},
+                   {2, albedoPool}, {3, weightPool}});
     vxG2_ = bindv(vxClassify_, 2, {{0, counters_}, {1, freelist_}});
 
     importPending_ = true;
@@ -629,25 +649,16 @@ void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
 }
 
 void BrickSystem::encodeImport(wgpu::CommandEncoder& enc) {
-    enc.ClearBuffer(indirection, 0, (uint64_t)kGrid * kGrid * kGrid * 4);
+    enc.ClearBuffer(volume, kIndOff, kCellBytes);
     enc.ClearBuffer(counters_, 0, 16);
     // per-pipeline bind groups against each auto layout
     auto bindc2 = [&](wgpu::ComputePipeline& pipe, uint32_t group,
-                      std::vector<std::pair<uint32_t, wgpu::Buffer>> es) {
-        std::vector<wgpu::BindGroupEntry> e(es.size());
-        for (size_t i = 0; i < es.size(); i++) {
-            e[i].binding = es[i].first;
-            e[i].buffer = es[i].second;
-        }
-        wgpu::BindGroupDescriptor desc{};
-        desc.layout = pipe.GetBindGroupLayout(group);
-        desc.entryCount = e.size();
-        desc.entries = e.data();
-        return gpu_->device.CreateBindGroup(&desc);
+                      std::vector<BindBuf> es) {
+        return makeBindGroup(gpu_->device, pipe, group, es);
     };
     wgpu::BindGroup cg0 = bindc2(vxClassify_, 0, {{0, mesh_->pos}, {1, mesh_->idx},
                                                   {4, mesh_->tris}, {6, mesh_->inside}});
-    wgpu::BindGroup cg1 = bindc2(vxClassify_, 1, {{0, indirection}});
+    wgpu::BindGroup cg1 = bindc2(vxClassify_, 1, {{0, volume, kIndOff, kCellBytes}});
     wgpu::BindGroup pg0 = bindc2(vxParity_, 0,
                                  {{0, mesh_->pos}, {1, mesh_->idx}, {5, vxParityBuf_}});
 
@@ -741,7 +752,7 @@ bool BrickSystem::measurementsIdle() const {
 
 bool BrickSystem::save(SnapWriter& w) {
     const uint32_t cells = kGrid * kGrid * kGrid;
-    std::vector<uint8_t> ind = readbackBuffer(*gpu_, indirection, cells * 4ull);
+    std::vector<uint8_t> ind = readbackBuffer(*gpu_, volume, cells * 4ull, kIndOff);
     if (ind.empty()) return false;
     // pools are saved as a dense prefix up to the brick high-water mark:
     // alloc is counter-based so live indices are packed low, and freed holes
@@ -760,17 +771,21 @@ bool BrickSystem::save(SnapWriter& w) {
     w.section("BMET", meta, sizeof(meta));
     w.section("BIND", ind.data(), ind.size());
 
+    // Sections keep their pre-merge names and contents; three of them now
+    // read out of a region of `volume` rather than a buffer of their own, so
+    // old snapshots still load.
     struct Sect {
         const char* tag;
         wgpu::Buffer buf;
         uint64_t size;
+        uint64_t offset = 0;
     };
     const Sect sects[] = {
-        {"BCLW", cellWeights, cells * 8ull},
+        {"BCLW", volume, cells * 8ull, kCellWOff},
         {"BCNT", counters_, 16},
         {"BFRE", freelist_, kMaxBricks * 4ull},
-        {"BJFA", jfaA_, cells * 4ull},   // seeds; jfaB_ is per-pass scratch
-        {"BCRS", coarse, cells * 4ull},  // coarseB_ likewise
+        {"BJFA", volume, cells * 4ull, kSeedOff},   // jfaB_ is per-pass scratch
+        {"BCRS", volume, cells * 4ull, kCoarseOff}, // coarseB_ likewise
         {"BDST", distPool, bricks * 256ull * 4ull},
         {"BALB", albedoPool, bricks * 512ull * 4ull},
         {"BWGT", weightPool, bricks * 512ull * 4ull},
@@ -780,7 +795,7 @@ bool BrickSystem::save(SnapWriter& w) {
             w.section(s.tag, nullptr, 0);
             continue;
         }
-        std::vector<uint8_t> data = readbackBuffer(*gpu_, s.buf, s.size);
+        std::vector<uint8_t> data = readbackBuffer(*gpu_, s.buf, s.size, s.offset);
         if (data.empty()) return false;
         w.section(s.tag, data.data(), data.size());
     }
@@ -805,14 +820,15 @@ bool BrickSystem::load(SnapReader& r) {
         const char* tag;
         wgpu::Buffer buf;
         uint64_t size;
+        uint64_t offset = 0;
     };
     const Sect sects[] = {
-        {"BIND", indirection, cells * 4ull},
-        {"BCLW", cellWeights, cells * 8ull},
+        {"BIND", volume, cells * 4ull, kIndOff},
+        {"BCLW", volume, cells * 8ull, kCellWOff},
         {"BCNT", counters_, 16},
         {"BFRE", freelist_, kMaxBricks * 4ull},
-        {"BJFA", jfaA_, cells * 4ull},
-        {"BCRS", coarse, cells * 4ull},
+        {"BJFA", volume, cells * 4ull, kSeedOff},
+        {"BCRS", volume, cells * 4ull, kCoarseOff},
         {"BDST", distPool, bricks * 256ull * 4ull},
         {"BALB", albedoPool, bricks * 512ull * 4ull},
         {"BWGT", weightPool, bricks * 512ull * 4ull},
@@ -825,7 +841,7 @@ bool BrickSystem::load(SnapReader& r) {
                          s.tag, data.size(), (unsigned long long)s.size);
             return false;
         }
-        gpu_->queue.WriteBuffer(s.buf, 0, data.data(), data.size());
+        gpu_->queue.WriteBuffer(s.buf, s.offset, data.data(), data.size());
     }
     pending_.resize(meta[3]);
     if (meta[3] &&
@@ -973,7 +989,7 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
     }
     if (bakePending_) {
         // fresh volume: zero the indirection (empty-outside) and counters
-        enc.ClearBuffer(indirection, 0, kGrid * kGrid * kGrid * 4ull);
+        enc.ClearBuffer(volume, kIndOff, kCellBytes);
         enc.ClearBuffer(counters_, 0, 16);
         BrickEdit bake{};
         bake.mode = 0;
