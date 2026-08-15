@@ -699,13 +699,13 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // inverse is just the transpose-rotation plus the moved origin, and the
     // sampled distance needs no Lipschitz rescale.
     {
-        float cy = std::cos(foePose_.yaw), sy = std::sin(foePose_.yaw);
+        float cy = std::cos(foeDisp_.yaw), sy = std::sin(foeDisp_.yaw);
         // forward: R = yaw(Y), t = foe pos. inverse: R^T, -R^T t
         float inv[16] = {cy, 0.f, sy, 0.f,
                          0.f, 1.f, 0.f, 0.f,
                          -sy, 0.f, cy, 0.f,
                          0.f, 0.f, 0.f, 1.f};
-        const float* t = foePose_.pos;
+        const float* t = foeDisp_.pos;
         inv[12] = -(cy * t[0] + sy * t[2]);
         inv[13] = -t[1];
         inv[14] = -(-sy * t[0] + cy * t[2]);
@@ -732,18 +732,18 @@ int Renderer::clipIndex(const char* name) const {
 void Renderer::resolveSword(const LookParams& look) {
     swordWorld_ = look.sword;
     if (!look.sword.carry) return;
-    float cy = std::cos(fighter_.yaw), sy = std::sin(fighter_.yaw);
+    float cy = std::cos(fighterDisp_.yaw), sy = std::sin(fighterDisp_.yaw);
     const float* p = look.sword.pos;
     // lean tips the held sword with the body: rotate about the travel-perp
     // axis, which in character space is +X (forward is +Z)
-    float cl = std::cos(fighter_.lean), sl = std::sin(fighter_.lean);
+    float cl = std::cos(fighterDisp_.lean), sl = std::sin(fighterDisp_.lean);
     float ly = p[1] * cl - p[2] * sl;
     float lz = p[1] * sl + p[2] * cl;
-    swordWorld_.pos[0] = fighter_.pos[0] + cy * p[0] + sy * lz;
-    swordWorld_.pos[1] = fighter_.pos[1] + ly;
-    swordWorld_.pos[2] = fighter_.pos[2] - sy * p[0] + cy * lz;
-    swordWorld_.yaw = look.sword.yaw + fighter_.yaw;
-    swordWorld_.pitch = look.sword.pitch + fighter_.lean;
+    swordWorld_.pos[0] = fighterDisp_.pos[0] + cy * p[0] + sy * lz;
+    swordWorld_.pos[1] = fighterDisp_.pos[1] + ly;
+    swordWorld_.pos[2] = fighterDisp_.pos[2] - sy * p[0] + cy * lz;
+    swordWorld_.yaw = look.sword.yaw + fighterDisp_.yaw;
+    swordWorld_.pitch = look.sword.pitch + fighterDisp_.lean;
 }
 
 void Renderer::swordGeometry(const SwordParams& s, float hilt[3], float tip[3],
@@ -1010,10 +1010,10 @@ BrickEdit Renderer::queueBrickEdit(BrickEdit e) {
         // scripted edit (ctl/replay/carve-test): authored in rest space, so
         // place its wound by the fighter root. Exact while unposed, and only
         // the gob spawn point rides on it.
-        float cy = std::cos(fighter_.yaw), sy = std::sin(fighter_.yaw);
-        e.worldPos[0] = fighter_.pos[0] + cy * e.pos[0] + sy * e.pos[2];
-        e.worldPos[1] = fighter_.pos[1] + e.pos[1];
-        e.worldPos[2] = fighter_.pos[2] - sy * e.pos[0] + cy * e.pos[2];
+        float cy = std::cos(fighterDisp_.yaw), sy = std::sin(fighterDisp_.yaw);
+        e.worldPos[0] = fighterDisp_.pos[0] + cy * e.pos[0] + sy * e.pos[2];
+        e.worldPos[1] = fighterDisp_.pos[1] + e.pos[1];
+        e.worldPos[2] = fighterDisp_.pos[2] - sy * e.pos[0] + cy * e.pos[2];
     }
     brick_.queueEdit(e);
     return e;
@@ -1335,6 +1335,16 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
 void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                       const FrameInfo& frame, wgpu::TextureView swapchainView,
                       const std::function<void(wgpu::RenderPassEncoder&)>& uiCallback) {
+    // trap 4 applied to the ROOT: latch the sim pose onto the 12 Hz grid and
+    // draw THAT. Everything below (sword, skeleton root, capsules, uniforms)
+    // reads the latched pose, so the whole fighter steps together instead of
+    // a 12 Hz body sliding on a 60 Hz root.
+    if (frame.poseTime != dispPoseTime_) {
+        dispPoseTime_ = frame.poseTime;
+        fighterDisp_ = fighter_;
+        foeDisp_ = foePose_;
+    }
+
     // pose the skeleton at the quantized clock; paused = rest pose
     resolveSword(look);
     if (!bones_.empty()) {
@@ -1342,7 +1352,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         // Falls back to the first clip when the asset has neither name.
         int ci = -1;
         if (look.animPlay && !clips_.empty()) {
-            ci = clipIndex(fighter_.moving ? "bounce" : "idle");
+            ci = clipIndex(fighterDisp_.moving ? "bounce" : "idle");
             if (ci < 0) ci = 0;
         }
         const AnimClip* clip = (ci >= 0 && clips_[ci].duration > 0.f) ? &clips_[ci] : nullptr;
@@ -1355,13 +1365,13 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         // Applied to every skin matrix, so the clip stays authored in
         // character space and everything downstream is already world.
         {
-            const float cy = std::cos(fighter_.yaw), sy = std::sin(fighter_.yaw);
-            const float cl = std::cos(fighter_.lean), sl = std::sin(fighter_.lean);
+            const float cy = std::cos(fighterDisp_.yaw), sy = std::sin(fighterDisp_.yaw);
+            const float cl = std::cos(fighterDisp_.lean), sl = std::sin(fighterDisp_.lean);
             // R = yaw(Y) * lean(X), column-major
             float R[16] = {cy,        0.f, -sy,       0.f,
                            sy * sl,   cl,  cy * sl,   0.f,
                            sy * cl,   -sl, cy * cl,   0.f,
-                           fighter_.pos[0], fighter_.pos[1], fighter_.pos[2], 1.f};
+                           fighterDisp_.pos[0], fighterDisp_.pos[1], fighterDisp_.pos[2], 1.f};
             for (size_t b = 0; b * 16 + 16 <= skinMats_.size(); b++) {
                 float tmp[16];
                 matMul(R, &skinMats_[b * 16], tmp);
@@ -1385,7 +1395,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             // NOT cross(blade, up) — the sword rests in a VERTICAL guard, so
             // a blade-derived lateral axis degenerates exactly in the pose the
             // hands spend most of their time in.
-            const float cyG = std::cos(fighter_.yaw), syG = std::sin(fighter_.yaw);
+            const float cyG = std::cos(fighterDisp_.yaw), syG = std::sin(fighterDisp_.yaw);
             const float rightW[3] = {cyG, 0.f, -syG};
             for (HandIkChain& c : handIk_) {
                 const std::string& nm = bones_[c.wrist].name;
@@ -1428,7 +1438,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     // Player 1 poses itself: its own clip clock, its own skeleton, its own
     // root. It stands and idles rather than following the hero's animation.
     if (foeEnabled_ && !bones_.empty()) {
-        int ci = clipIndex(foePose_.moving ? "bounce" : "idle");
+        int ci = clipIndex(foeDisp_.moving ? "bounce" : "idle");
         if (ci < 0) ci = 0;
         const AnimClip* clip =
             (look.animPlay && !clips_.empty() && clips_[ci].duration > 0.f)
@@ -1441,12 +1451,12 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                                   clip->duration);
         }
         evalPose(bones_, clip, foeAnimT_, foeSkinMats_);
-        const float cy = std::cos(foePose_.yaw), sy = std::sin(foePose_.yaw);
-        const float cl = std::cos(foePose_.lean), sl = std::sin(foePose_.lean);
+        const float cy = std::cos(foeDisp_.yaw), sy = std::sin(foeDisp_.yaw);
+        const float cl = std::cos(foeDisp_.lean), sl = std::sin(foeDisp_.lean);
         float R[16] = {cy,      0.f, -sy,     0.f,
                        sy * sl, cl,  cy * sl, 0.f,
                        sy * cl, -sl, cy * cl, 0.f,
-                       foePose_.pos[0], foePose_.pos[1], foePose_.pos[2], 1.f};
+                       foeDisp_.pos[0], foeDisp_.pos[1], foeDisp_.pos[2], 1.f};
         for (size_t b = 0; b * 16 + 16 <= foeSkinMats_.size(); b++) {
             float tmp[16];
             matMul(R, &foeSkinMats_[b * 16], tmp);

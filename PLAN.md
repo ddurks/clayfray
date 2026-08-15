@@ -484,13 +484,37 @@ the same amount).
 trace plus ~4 ms of per-frame post/submit. Any of the earlier levers closes it;
 the soft-shadow one (26 steps @1.24, worth ~20%) would bring it to ~15.6 ms.
 
-**Known limitation.** Reuse only pays while the traced inputs hold still. The
-CAMERA invalidates on every orbit frame, and the fighter ROOT position moves at
-60 Hz — `fighter_.pos` is not quantised to the pose grid, only the animation
-clip is. So walking currently defeats reuse. Quantising the root to the 12 Hz
-grid would fix that AND is arguably what trap 4 already asks for ("anything
-that moves visually quantises its DISPLAY position to the pose grid"); it is a
-deliberate look change and is NOT done here.
+**Root quantisation (done 2026-08-15).** `fighterDisp_`/`foeDisp_` latch the
+sim pose at each pose step and are what the renderer draws — trap 4 applied to
+the ROOT, which had been sliding at 60 Hz under a body that stepped at 12. The
+sim still runs at 60 Hz; only the DISPLAY pose is quantised. Two effects, both
+wanted: the walk reads as stop-motion instead of gliding, and walking no longer
+invalidates frame reuse. (The sword was already 12 Hz via swordOffset(poseT),
+so updateBladeCut already saw pose-step jumps and kOpsPerFrame=6 already
+bridged them — root quantisation adds no new burden there.)
+
+**Shadow sampling (done 2026-08-15).** softShadow 44 steps @1.13 -> 28 @1.21.
+Both walk t to ~4.5 m; the 1/t weighting means the far samples the old count
+spent most of its steps on barely moved the result. Raw frame 70.2 -> 62.1 ms
+for 2.7% of pixels changed (slightly coarser penumbra). It is the most
+expensive single term in the frame — 25.9 ms of 70 ms measured — because it is
+about half of all field evaluations per shaded pixel.
+
+**Where it stands:** 15.56 ms/presented frame = **64.3 fps** with reuse
+engaged; 61.0 ms = 16.4 fps raw (camera orbiting, which reuse can never help).
+
+**Remaining limitation.** The CAMERA still invalidates on every orbit frame.
+The fix is dynamic resolution while the camera moves (drop resScale during the
+drag, restore when it settles; motion masks the softness), NOT more per-sample
+work — see the abandoned-approaches note below for why that lever is spent.
+
+**Next lever if needed: half-res AO + shadow.** AO and shadow are ~30 ms of the
+raw frame and are REQUIRED to be smooth (trap 3), which is exactly the argument
+for computing them at half resolution and bilaterally upsampling (~1.4x on the
+raw frame). It needs a real restructure — a G-buffer split into march / half-res
+shading / full-res composite — because workgroupBarrier demands uniform control
+flow (the cs entry early-returns out-of-range lanes) and shading currently
+happens per AA SAMPLE, not per pixel.
 
 **Abandoned: posed-volume bake** (branch `m5-perf-and-grip`, 4 commits). It
 works — bakes the warped body into a root-space BrickVolume per fighter at

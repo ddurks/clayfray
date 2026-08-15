@@ -526,6 +526,8 @@ int runWindowed(const RunOpts& o) {
         game.tickCount = (uint64_t)std::llround(simT * kTickRate);
     }
 
+    uint64_t lastTraced = 0, lastPresented = 0;
+    float reuseSkipPct = 0.f;
     uint64_t prevNs = SDL_GetTicksNS();
     int frameCounter = 0;
     int screenshotCounter = 0;
@@ -657,8 +659,19 @@ int runWindowed(const RunOpts& o) {
         }
 
         bool wantScreenshot = false;
+        // reuse rate over a short window, so the panel reacts to what you are
+        // doing right now rather than showing a lifetime average
+        {
+            uint64_t tr = renderer.framesTraced(), pr = renderer.framesPresented();
+            uint64_t dT = tr - lastTraced, dP = pr - lastPresented;
+            if (dP >= 30) {
+                reuseSkipPct = 100.f * (1.f - (float)dT / (float)dP);
+                lastTraced = tr;
+                lastPresented = pr;
+            }
+        }
         uiNewFrame(look, cam, brush, fps, renderer.traceMs(), renderer.postMs(),
-                   renderer.sploot(), wantScreenshot);
+                   renderer.sploot(), reuseSkipPct, wantScreenshot);
 
         wgpu::SurfaceTexture surfaceTex;
         gpu.surface.GetCurrentTexture(&surfaceTex);

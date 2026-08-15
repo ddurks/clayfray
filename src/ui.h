@@ -12,6 +12,6 @@ bool uiWantsMouse();
 // user clicks the capture button.
 void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps,
                 float gpuTraceMs, float gpuPostMs, const SplootStats& sploot,
-                bool& wantScreenshot);
+                float reuseSkipPct, bool& wantScreenshot);
 void uiRender(wgpu::RenderPassEncoder& pass);
 void uiShutdown();

@@ -28,7 +28,7 @@ bool uiWantsMouse() {
 
 void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps,
                 float gpuTraceMs, float gpuPostMs, const SplootStats& sploot,
-                bool& wantScreenshot) {
+                float reuseSkipPct, bool& wantScreenshot) {
     ImGui_ImplWGPU_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -37,6 +37,11 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
     ImGui::SetNextWindowSize(ImVec2(330, 0), ImGuiCond_FirstUseEver);
     ImGui::Begin("look-dev");
     ImGui::Text("%.1f fps", fps);
+    // 12 Hz frame reuse: how many of the last frames skipped the trace. Watch
+    // it fall to 0 while orbiting (new pixels, nothing to reuse) and climb
+    // back when the camera settles.
+    ImGui::SameLine();
+    ImGui::TextDisabled("| %.0f%% reused", reuseSkipPct);
     if (ImGui::Button("capture -> lookdev/")) wantScreenshot = true;
 
     if (ImGui::CollapsingHeader("sculpt", ImGuiTreeNodeFlags_DefaultOpen)) {

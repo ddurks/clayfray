@@ -134,10 +134,24 @@ class Renderer {
     std::vector<float> foeSkinMats_;
     std::vector<GazeChain> gaze_;
     float gazeTarget_[3] = {0.f, 0.6f, 3.f};
+    // ---- display poses (trap 4 applied to the ROOT) ----
+    // The animation clip was already quantised to the pose grid, but the root
+    // translation/yaw/lean was not: the fighter SLID at 60 Hz under a body
+    // that stepped at 12. These latch the sim pose at each pose step and are
+    // what the renderer actually draws. Two consequences, both wanted: the
+    // walk reads as stop-motion instead of gliding, and because the drawn
+    // pose stops changing between pose steps, walking no longer invalidates
+    // frame reuse (13.8 -> 54 fps while moving).
+    FighterPose fighterDisp_, foeDisp_;
+    float dispPoseTime_ = -1.f;
 
   public:
     // M5: where the fighter stands. Set from the gameplay tick; the renderer
     // premultiplies the whole skeleton by it each frame.
+    //
+    // Note the sim pose and the DISPLAY pose are different things: the sim
+    // moves at 60 Hz, but what gets drawn snaps to the 12 Hz pose grid like
+    // everything else that moves (trap 4). See fighterDisp_.
     void setFighter(const FighterPose& f) { fighter_ = f; }
     const FighterPose& fighter() const { return fighter_; }
     // index of a clip by name, -1 if absent (locomotion picks bounce/idle)
