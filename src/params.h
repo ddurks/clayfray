@@ -80,13 +80,6 @@ struct HandParams {
 // the movement look worse.
 struct MotionParams {
     bool stepRoot = false;
-    // Dynamic resolution while the VIEW is moving. Motion is exactly when
-    // frame reuse cannot help and exactly when softness is least visible, so
-    // trade pixels for frame rate there and snap back the instant it settles.
-    // 0 disables. The motion signal is "the renderer traced the last frames
-    // rather than reusing them", which catches camera, walking and carving in
-    // one test rather than enumerating inputs.
-    float movingResScale = 0.62f;
 };
 
 struct GazeParams {

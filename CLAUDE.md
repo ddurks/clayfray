@@ -74,6 +74,18 @@ Iteration rules of thumb:
   instance. Shaders hot-load on save (~30-frame poll), also no rebuild.
 - C++ changes: `snap save` first, rebuild, relaunch `--serve --load NAME` —
   back in the exact scene in seconds.
+- Benchmarking: **run at the SHIPPING config or the number is fiction.** A
+  1280x720 window at `resScale` 0.5 traces **640x360**, which is now the
+  headless `--size` default, so a timing run without `--size` measures what the
+  game runs. Benchmarking at 1280x720 overstated the frame by ~2.7x (57.8 vs
+  21.4 ms). Measure WALL CLOCK per presented frame, differencing two frame
+  counts: GPU pass timestamps (`CLAYFRAY_TS`) only fire on TRACED frames, so
+  they are meaningless once frame reuse is on, and they misreport small
+  dispatches. Always burn a warm-up run first — a shader edit forces a cold
+  pipeline compile on the next launch only, and differencing against that
+  yields negative ms/frame. `CLAYFRAY_NO_REUSE=1` gives the MOVING cost (what
+  governs frame rate whenever anything is in motion); without it you get the
+  idle cost.
 - Scenario regression: `record` a journal (or hand-write one: `<poseTick>
   <ctl command>` per line, see `scenarios/`), then
   `./build/clayfray --replay scenarios/X.journal --screenshot out.png

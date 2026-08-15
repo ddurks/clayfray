@@ -228,7 +228,12 @@ struct RunOpts {
     // visible under magnification on the eyes — the marbles are the one hard
     // high-contrast edge in the scene; clay silhouettes and the grain hide it.
     // Raise back to 2 for beauty/reference renders.
-    int width = 1280, height = 720, frames = 8, aa = 1;
+    // DEFAULT = the shipping internal resolution. A 1280x720 window at
+    // resScale 0.5 traces 640x360, so benchmarking at 1280x720 measured a
+    // configuration the game never runs — and by a wide margin (57.8 ms vs
+    // 21.4 ms per moving frame). Any timing run without an explicit --size now
+    // measures what ships. Pass --size for beauty/reference renders.
+    int width = 640, height = 360, frames = 8, aa = 1;
     double startTime = 2.0;
     // headless camera override (radians / meters); NaN = keep the default.
     // Inspecting an artifact from another angle otherwise needs serve mode.
@@ -527,9 +532,6 @@ int runWindowed(const RunOpts& o) {
     }
 
     long lastCamPose = -1;
-    uint64_t prevTraced = 0;
-    int movingFrames = 0, stillFrames = 0;
-    bool lowRes = false;
     uint64_t lastTraced = 0, lastPresented = 0;
     float reuseSkipPct = 0.f;
     uint64_t prevNs = SDL_GetTicksNS();
@@ -640,33 +642,14 @@ int runWindowed(const RunOpts& o) {
         if (++frameCounter % 30 == 0) renderer.reloadShadersIfChanged();
         if (o.exitAfter > 0 && frameCounter >= o.exitAfter) running = false;
 
-        // Internal resolution scale (throttled so slider drags don't thrash
-        // target recreation), with a lower scale while the view is MOVING.
-        //
-        // The motion signal is whether the renderer traced or reused: that is
-        // one test for camera motion, walking and carving alike. Hysteresis in
-        // both directions matters — a resize itself invalidates the trace, so
-        // reacting to a single traced frame would oscillate forever.
-        {
-            const bool tracedThisFrame = renderer.framesTraced() != prevTraced;
-            prevTraced = renderer.framesTraced();
-            if (tracedThisFrame) {
-                stillFrames = 0;
-                if (movingFrames < 1000) movingFrames++;
-            } else {
-                movingFrames = 0;
-                if (stillFrames < 1000) stillFrames++;
-            }
-            const bool wantLow = look.motion.movingResScale > 0.f && movingFrames > 3;
-            const bool wantFull = stillFrames > 8;
-            if (wantLow) lowRes = true;
-            else if (wantFull) lowRes = false;
-        }
+        // internal resolution scale (throttled so slider drags don't thrash
+        // target recreation). CONSTANT by design — a dynamic drop while the
+        // view moved was tried and removed: resScale is already 0.5, so it
+        // took the window to 0.31 of native for a frame rate the constant 0.5
+        // already reaches, and the resolution switch itself was visible.
         if (frameCounter % 10 == 0) {
-            const float scale =
-                look.resScale * (lowRes ? look.motion.movingResScale : 1.f);
-            int tw = std::max(160, (int)(pw * scale));
-            int th = std::max(90, (int)(ph * scale));
+            int tw = std::max(160, (int)(pw * look.resScale));
+            int th = std::max(90, (int)(ph * look.resScale));
             if (tw != renderer.width() || th != renderer.height()) renderer.resize(tw, th);
         }
 
