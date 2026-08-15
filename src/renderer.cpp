@@ -1194,7 +1194,11 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
         gobSeed_ = gobSeed_ * 1664525u + 1013904223u;
         return (float)(gobSeed_ >> 8) * (1.f / 16777216.f);
     };
-    while (haveWound_ && sploot_.debt > kMinGob && (int)gobs_.size() < 12) {
+    // Spawning changes the in-flight count, which the tracer reads, so it
+    // belongs on the pose grid too — otherwise the array refills at 60 Hz as
+    // fast as landings drain it and reuse never recovers.
+    while (poseStep && haveWound_ && sploot_.debt > kMinGob &&
+           (int)gobs_.size() < 12) {
         float v = std::min(sploot_.debt, kMaxGob);
         sploot_.debt -= v;
         Gob g{};
@@ -1263,7 +1267,9 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
                 float d[3] = {g.pos[0] - cp[0], g.pos[1] - cp[1], g.pos[2] - cp[2]};
                 float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
                 if (dist >= g.radius + pc.r) continue;
-                if (resting) {
+                // same pose-grid rule as the floor landing below: a deposit
+                // queues an edit, which bumps a volume generation
+                if (resting && poseStep) {
                     BrickEdit e;
                     e.mode = 2;
                     e.fromGob = true;
@@ -1302,10 +1308,20 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
             continue;
         }
 
-        // landing: floor mosaic or an existing pile (coarse CPU mirror)
+        // Landing: floor mosaic or an existing pile (coarse CPU mirror).
+        // ON POSE STEPS ONLY, like every other visible event. The gob FLIES at
+        // 60 Hz — trajectories need it — but touching down splats the ground
+        // and drops the gob from the array, and both are traced inputs. Landing
+        // whenever a gob happened to cross the floor made the ground clay
+        // generation and the in-flight count change at frame rate, so the ~2 s
+        // of clay raining down after a hit re-traced EVERY frame: 60 traces a
+        // second instead of 12, right after the hit that most wants the frames.
+        // Deferring costs nothing visually — the drawn position (g.disp) is
+        // already frozen between pose steps, so a gob that dips under the floor
+        // mid-step was never drawn there.
         float top = ground_.approxTopAt(g.pos[0], g.pos[2]);
-        if ((g.pos[1] - 0.4f * g.radius < top && g.vel[1] <= 0.f) ||
-            g.pos[1] < -0.1f) {
+        if (poseStep && ((g.pos[1] - 0.4f * g.radius < top && g.vel[1] <= 0.f) ||
+                         g.pos[1] < -0.1f)) {
             ground_.splat(g.pos[0], g.pos[2], g.vol, g.col);
             sploot_.deposited += g.vol;
             it = gobs_.erase(it);
