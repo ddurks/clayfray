@@ -1542,7 +1542,15 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     // Names the first differing uniform component, or the volume whose
     // generation moved (i.e. something queued an edit).
     static const bool dbgReuse = std::getenv("CLAYFRAY_DEBUG_REUSE") != nullptr;
-    if (dbgReuse && !reuse && traceValid_) {
+    // A re-trace ON a pose step is the floor, not a fault — the image is
+    // supposed to change 12 times a second. Reporting those buries the ones
+    // that matter, and worse, misattributes them: the report names the first
+    // differing slot in index order, so a pose step also carrying a camera
+    // move gets blamed on camPos (slot 0) rather than the pose clock (slot
+    // 3.3). Stay quiet unless a frame re-traced BETWEEN pose steps, which is
+    // the only kind that costs anything.
+    const bool poseStepFrame = uniforms[3][3] != prevUniforms_[3][3];
+    if (dbgReuse && !reuse && traceValid_ && !poseStepFrame) {
         const uint32_t gens[3] = {brick_.generation(), foe_.generation(),
                                   ground_.generation()};
         const char* gname[3] = {"hero volume", "foe volume", "ground clay"};
@@ -1565,7 +1573,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                 break;
             }
         }
-        if (!blamed) std::printf("[reuse] re-trace: no input changed (first frame?)\n");
+        if (!blamed) std::printf("[reuse] re-trace between pose steps: no input changed?\n");
         std::fflush(stdout);
     }
     if (dbgReuse) {
