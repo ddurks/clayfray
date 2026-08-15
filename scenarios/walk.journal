@@ -1,0 +1,102 @@
+# clayfray scenario: the fighter WALKS. Measures the cost of MOTION,
+# which is what governs frame rate — the idle scene reuses ~75% of frames.
+# Root is set once per pose tick, i.e. quantized to the 12 Hz grid.
+0 set fighter.moving 1
+0 set fighter.pos -0.5500 0 0.2000
+0 set fighter.yaw 0.0000
+1 set fighter.pos -0.5280 0 0.2130
+1 set fighter.yaw 0.0648
+2 set fighter.pos -0.5060 0 0.2257
+2 set fighter.yaw 0.1285
+3 set fighter.pos -0.4840 0 0.2380
+3 set fighter.yaw 0.1901
+4 set fighter.pos -0.4620 0 0.2497
+4 set fighter.yaw 0.2484
+5 set fighter.pos -0.4400 0 0.2605
+5 set fighter.yaw 0.3026
+6 set fighter.pos -0.4180 0 0.2703
+6 set fighter.yaw 0.3516
+7 set fighter.pos -0.3960 0 0.2790
+7 set fighter.yaw 0.3948
+8 set fighter.pos -0.3740 0 0.2862
+8 set fighter.yaw 0.4312
+9 set fighter.pos -0.3520 0 0.2921
+9 set fighter.yaw 0.4604
+10 set fighter.pos -0.3300 0 0.2964
+10 set fighter.yaw 0.4818
+11 set fighter.pos -0.3080 0 0.2990
+11 set fighter.yaw 0.4951
+12 set fighter.pos -0.2860 0 0.3000
+12 set fighter.yaw 0.5000
+13 set fighter.pos -0.2640 0 0.2993
+13 set fighter.yaw 0.4965
+14 set fighter.pos -0.2420 0 0.2969
+14 set fighter.yaw 0.4846
+15 set fighter.pos -0.2200 0 0.2929
+15 set fighter.yaw 0.4645
+16 set fighter.pos -0.1980 0 0.2873
+16 set fighter.yaw 0.4366
+17 set fighter.pos -0.1760 0 0.2803
+17 set fighter.yaw 0.4013
+18 set fighter.pos -0.1540 0 0.2718
+18 set fighter.yaw 0.3592
+19 set fighter.pos -0.1320 0 0.2622
+19 set fighter.yaw 0.3111
+20 set fighter.pos -0.1100 0 0.2516
+20 set fighter.yaw 0.2578
+21 set fighter.pos -0.0880 0 0.2400
+21 set fighter.yaw 0.2000
+22 set fighter.pos -0.0660 0 0.2278
+22 set fighter.yaw 0.1389
+23 set fighter.pos -0.0440 0 0.2151
+23 set fighter.yaw 0.0755
+24 set fighter.pos -0.0220 0 0.2022
+24 set fighter.yaw 0.0108
+25 set fighter.pos -0.0000 0 0.1892
+25 set fighter.yaw -0.0541
+26 set fighter.pos 0.0220 0 0.1764
+26 set fighter.yaw -0.1181
+27 set fighter.pos 0.0440 0 0.1640
+27 set fighter.yaw -0.1801
+28 set fighter.pos 0.0660 0 0.1522
+28 set fighter.yaw -0.2390
+29 set fighter.pos 0.0880 0 0.1412
+29 set fighter.yaw -0.2939
+30 set fighter.pos 0.1100 0 0.1312
+30 set fighter.yaw -0.3439
+31 set fighter.pos 0.1320 0 0.1224
+31 set fighter.yaw -0.3880
+32 set fighter.pos 0.1540 0 0.1149
+32 set fighter.yaw -0.4256
+33 set fighter.pos 0.1760 0 0.1088
+33 set fighter.yaw -0.4561
+34 set fighter.pos 0.1980 0 0.1042
+34 set fighter.yaw -0.4788
+35 set fighter.pos 0.2200 0 0.1013
+35 set fighter.yaw -0.4934
+36 set fighter.pos 0.2420 0 0.1001
+36 set fighter.yaw -0.4997
+37 set fighter.pos 0.2640 0 0.1005
+37 set fighter.yaw -0.4976
+38 set fighter.pos 0.2860 0 0.1026
+38 set fighter.yaw -0.4871
+39 set fighter.pos 0.3080 0 0.1063
+39 set fighter.yaw -0.4684
+40 set fighter.pos 0.3300 0 0.1117
+40 set fighter.yaw -0.4417
+41 set fighter.pos 0.3520 0 0.1185
+41 set fighter.yaw -0.4076
+42 set fighter.pos 0.3740 0 0.1267
+42 set fighter.yaw -0.3667
+43 set fighter.pos 0.3960 0 0.1361
+43 set fighter.yaw -0.3195
+44 set fighter.pos 0.4180 0 0.1466
+44 set fighter.yaw -0.2669
+45 set fighter.pos 0.4400 0 0.1580
+45 set fighter.yaw -0.2099
+46 set fighter.pos 0.4620 0 0.1701
+46 set fighter.yaw -0.1493
+47 set fighter.pos 0.4840 0 0.1828
+47 set fighter.yaw -0.0862
+48 set fighter.pos 0.5060 0 0.1957
+48 set fighter.yaw -0.0216

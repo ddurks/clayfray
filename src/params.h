@@ -78,6 +78,22 @@ struct HandParams {
 // a traced input that changes every frame), so motion runs at the raw frame
 // cost. That is a rendering problem to solve in the renderer, not by making
 // the movement look worse.
+//
+// It was flipped ON once, for that reuse cost, and flipped back after playing
+// it. DON'T FLIP IT AGAIN ON A REUSE MEASUREMENT — reuse % is the wrong
+// scoreboard here, and it is convincing:
+//
+//   Frame reuse does not produce images, it only makes DUPLICATE frames
+//   cheap. Sliding, every frame is unique and costs the full trace: ~17
+//   unique images/s. Stepped, the trace happens 12x/s and ~48 duplicates
+//   ride along: the fps counter reads ~60 while the eye gets 12. Stepping
+//   spends motion fidelity (17 -> 12 unique images/s) to buy a bigger
+//   number. The reuse rate went 0% -> 73% and the game looked worse.
+//
+// Reuse is still worth having for what it was built for — a still camera,
+// where the duplicates are duplicates of a frame nothing was changing anyway.
+// It is not a lever to make motion cheaper. Motion gets cheaper by making the
+// TRACE cheaper.
 struct MotionParams {
     bool stepRoot = false;
 };
