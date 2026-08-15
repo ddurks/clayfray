@@ -526,6 +526,7 @@ int runWindowed(const RunOpts& o) {
         game.tickCount = (uint64_t)std::llround(simT * kTickRate);
     }
 
+    long lastCamPose = -1;
     uint64_t lastTraced = 0, lastPresented = 0;
     float reuseSkipPct = 0.f;
     uint64_t prevNs = SDL_GetTicksNS();
@@ -611,14 +612,26 @@ int runWindowed(const RunOpts& o) {
         if (ticks > 15) ticks = 15;
         for (int k = 0; k < ticks; k++) game.tick();
         renderer.setFighter(game.fighter);
-        // keep the walker framed: the orbit target chases it, controls unchanged
-        {
-            float k = std::min(1.f, 4.f * (float)frameDt);
-            cam.target.x += (game.fighter.pos[0] - cam.target.x) * k;
-            cam.target.y += (game.fighter.pos[1] + 0.45f - cam.target.y) * k;
-            cam.target.z += (game.fighter.pos[2] - cam.target.z) * k;
-        }
         simT += ticks * kTickDt;
+        // Keep the walker framed — but on the SAME clock the body is drawn on.
+        // Chasing the 60 Hz sim position while the body steps at 12 Hz slides
+        // the camera against a stepping subject, which reads as jitter (worse
+        // than either being stepped or both smooth), and it changed a traced
+        // input every frame, which defeated frame reuse in exactly the case
+        // root quantisation exists to fix. Runs after simT advances so it sees
+        // the pose tick the renderer will use this frame.
+        {
+            const long camPose = poseTickOf(simT);
+            const bool step = look.motion.stepRoot;
+            if (!step || camPose != lastCamPose) {
+                lastCamPose = camPose;
+                // same easing, re-expressed per pose step when stepping
+                const float k = step ? 0.29f : std::min(1.f, 4.f * (float)frameDt);
+                cam.target.x += (game.fighter.pos[0] - cam.target.x) * k;
+                cam.target.y += (game.fighter.pos[1] + 0.45f - cam.target.y) * k;
+                cam.target.z += (game.fighter.pos[2] - cam.target.z) * k;
+            }
+        }
         fps = fps * 0.95f + (float)(1.0 / (frameDt > 1e-6 ? frameDt : 1e-6)) * 0.05f;
 
         if (++frameCounter % 30 == 0) renderer.reloadShadersIfChanged();

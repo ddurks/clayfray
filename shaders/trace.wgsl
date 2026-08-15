@@ -237,19 +237,19 @@ fn mapPenumbra(p: vec3f) -> f32 {
 // Step count and growth are a pair: both walk t from 0.02 out to ~4.5 m, which
 // is past any occluder in the arena. 44 steps at 1.13 oversampled that range —
 // the penumbra term weights by 1/t, so the far samples it spent most of its
-// steps on barely move the result. 28 at 1.21 covers the same distance for
-// 36% fewer mapPenumbra() calls.
+// steps on barely move the result. 22 at 1.28 covers the same distance for
+// half as many mapPenumbra() calls.
 //
 // This is the single most expensive term in the frame: measured at 25.9 ms of
 // 70 ms (37%), because it is ~half of all field evaluations per shaded pixel
-// (28 shadow vs ~35 march + 4 normal + 5 AO) and mapPenumbra is the heaviest
+// (22 shadow vs ~35 march + 4 normal + 5 AO) and mapPenumbra is the heaviest
 // variant — it adds charProxy's 16-capsule smin on top of the two bodies.
 fn softShadow(ro: vec3f, rd: vec3f, tmax: f32) -> f32 {
   var res = 1.0;
   var t = 0.02;
-  for (var i = 0; i < 28; i++) {
+  for (var i = 0; i < 22; i++) {
     res = min(res, u.material.z * mapPenumbra(ro + rd * t) / t);
-    t *= 1.21;
+    t *= 1.28;
     if (res < 0.004 || t > tmax) {
       break;
     }

@@ -500,8 +500,22 @@ for 2.7% of pixels changed (slightly coarser penumbra). It is the most
 expensive single term in the frame — 25.9 ms of 70 ms measured — because it is
 about half of all field evaluations per shaded pixel.
 
-**Where it stands:** 15.56 ms/presented frame = **64.3 fps** with reuse
-engaged; 61.0 ms = 16.4 fps raw (camera orbiting, which reuse can never help).
+**Camera on the same clock (done 2026-08-15).** The orbit target chased
+`game.fighter.pos` — the UNQUANTISED 60 Hz position — every frame. Against a
+body drawn at 12 Hz that slid the camera relative to a stepping subject, which
+reads as JITTER (worse than either stepped or smooth), and it changed a traced
+input every frame, so walking got ZERO reuse: root quantisation had been paying
+the visual cost and buying nothing. The chase now runs after simT advances (so
+it sees the same pose tick the renderer will) and moves only on pose steps when
+stepRoot is on.
+
+`look.motion.stepRoot` (ctl + panel) toggles the whole thing live: on = 12 Hz
+stop-motion walk with reuse, off = the old 60 Hz slide. The camera follows
+whichever mode is active — mixing them is what produced the jitter.
+
+**Where it stands:** 14.97 ms/presented frame = **66.8 fps** with reuse
+engaged; 58.0 ms = 17.2 fps raw (camera orbiting, which reuse can never help).
+Shadow is now 22 steps @1.28.
 
 **Remaining limitation.** The CAMERA still invalidates on every orbit frame.
 The fix is dynamic resolution while the camera moves (drop resScale during the

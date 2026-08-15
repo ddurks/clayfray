@@ -1339,7 +1339,10 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     // draw THAT. Everything below (sword, skeleton root, capsules, uniforms)
     // reads the latched pose, so the whole fighter steps together instead of
     // a 12 Hz body sliding on a 60 Hz root.
-    if (frame.poseTime != dispPoseTime_) {
+    if (!look.motion.stepRoot) {
+        fighterDisp_ = fighter_; // 60 Hz slide (pre-M-PERF behaviour)
+        foeDisp_ = foePose_;
+    } else if (frame.poseTime != dispPoseTime_) {
         dispPoseTime_ = frame.poseTime;
         fighterDisp_ = fighter_;
         foeDisp_ = foePose_;

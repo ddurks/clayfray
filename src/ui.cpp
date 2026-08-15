@@ -44,6 +44,7 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
     ImGui::TextDisabled("| %.0f%% reused", reuseSkipPct);
     if (ImGui::Button("capture -> lookdev/")) wantScreenshot = true;
 
+    ImGui::Checkbox("12 Hz root (stop-motion walk)", &look.motion.stepRoot);
     if (ImGui::CollapsingHeader("sculpt", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::RadioButton("orbit (1)", &brush.mode, 0);
         ImGui::SameLine();

@@ -62,6 +62,15 @@ struct HandParams {
 // M4.8 gaze. The eye bones are leaves under the head, so this is a pure
 // rotation per eye toward whatever the fighter is looking at (the camera, for
 // now). Quantized to the 12 Hz pose grid like everything else that moves.
+// Stop-motion applies to the ROOT too (trap 4), but it is a visible choice:
+// with it on, a walking fighter steps 12x/s instead of gliding. Off restores
+// the 60 Hz slide. The CAMERA follows whichever mode is active — mixing them
+// (stepped body, smooth camera chase) reads as jitter, which is worse than
+// either.
+struct MotionParams {
+    bool stepRoot = true;
+};
+
 struct GazeParams {
     bool track = true;         // eyes follow the camera as it orbits
     float maxAngle = 1.5708f;  // clamp cone off the head's forward, radians
@@ -121,6 +130,7 @@ struct LookParams {
     SwordParams sword;
     HandParams hands;
     GazeParams gaze;
+    MotionParams motion;
 };
 
 // Conservation ledger readout for the panel (all volumes in m^3).
