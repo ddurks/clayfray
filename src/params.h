@@ -62,13 +62,24 @@ struct HandParams {
 // M4.8 gaze. The eye bones are leaves under the head, so this is a pure
 // rotation per eye toward whatever the fighter is looking at (the camera, for
 // now). Quantized to the 12 Hz pose grid like everything else that moves.
-// Stop-motion applies to the ROOT too (trap 4), but it is a visible choice:
-// with it on, a walking fighter steps 12x/s instead of gliding. Off restores
-// the 60 Hz slide. The CAMERA follows whichever mode is active — mixing them
-// (stepped body, smooth camera chase) reads as jitter, which is worse than
-// either.
+// Whether the ROOT translation steps on the 12 Hz pose grid like the rest of
+// the stop-motion, or slides at 60 Hz.
+//
+// DEFAULT OFF, and the reason is worth keeping: trap 4 covers the POSE, and
+// extending it to translation does not work at this frame rate. Real
+// stop-motion animates on 2s at 24 fps, so a held position spans 2 frames.
+// We present at 60, so it spans 5 — and a ~9 cm translation jump (1.1 m/s
+// over 1/12 s) is nowhere near as forgiving as a held pose or a boil reseed.
+// It reads as jumpy whichever way the camera is handled: chase the sim
+// position and the subject jumps inside the frame, chase the stepped position
+// and the whole world jumps. There is no framing that hides it.
+//
+// The cost of leaving it off is that walking cannot reuse frames (the root is
+// a traced input that changes every frame), so motion runs at the raw frame
+// cost. That is a rendering problem to solve in the renderer, not by making
+// the movement look worse.
 struct MotionParams {
-    bool stepRoot = true;
+    bool stepRoot = false;
 };
 
 struct GazeParams {

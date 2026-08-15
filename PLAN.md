@@ -509,9 +509,20 @@ the visual cost and buying nothing. The chase now runs after simT advances (so
 it sees the same pose tick the renderer will) and moves only on pose steps when
 stepRoot is on.
 
-`look.motion.stepRoot` (ctl + panel) toggles the whole thing live: on = 12 Hz
-stop-motion walk with reuse, off = the old 60 Hz slide. The camera follows
-whichever mode is active — mixing them is what produced the jitter.
+**Root stepping is OFF by default — REJECTED on look.** Stepping the root at
+12 Hz reads as jumpy at 60 Hz presentation whichever way the camera is handled:
+chase the sim position and the SUBJECT jumps inside the frame, chase the
+stepped position and the WHOLE WORLD jumps. No framing hides it. The reason it
+fails where 12 Hz animation succeeds: real stop-motion animates on 2s at 24 fps
+so a held position spans 2 frames; we present at 60, so it spans 5, and a ~9 cm
+translation jump (1.1 m/s over 1/12 s) is far less forgiving than a held pose
+or a boil reseed. Trap 4 covers the POSE; extending it to translation does not
+survive contact. `look.motion.stepRoot` (ctl `motion.stepRoot` + panel) keeps
+it available for experiments.
+
+**Consequence:** walking cannot reuse frames — the root is a traced input that
+changes every frame — so MOTION runs at the raw frame cost. That is a rendering
+problem to fix in the renderer, not by degrading the movement.
 
 **Where it stands:** 14.97 ms/presented frame = **66.8 fps** with reuse
 engaged; 58.0 ms = 17.2 fps raw (camera orbiting, which reuse can never help).
