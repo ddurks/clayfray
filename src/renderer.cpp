@@ -415,6 +415,47 @@ bool Renderer::reloadShadersIfChanged() {
 //   mouse     pick uv     — pick runs every frame regardless, on its own pass
 // Volume CONTENTS are not in the uniform buffer at all, so the caller folds in
 // the brick/ground generation counters separately.
+// Slot -> what lives there, so a re-trace report reads as "gobs" rather than
+// "slot 271". Mirrors the Uniforms layout (trap 2); boundaries match the
+// hardcoded writes in packUniforms.
+const char* Renderer::uniformSlotName(int s) {
+    static const char* head[14] = {"camPos",   "camRight", "camUp",    "camFwd",
+                                   "res",      "keyPos",   "keyColor", "rimDir",
+                                   "rimColor", "ambient",  "material", "post",
+                                   "post2",    "mouse"};
+    if (s < 14) return head[s];
+    if (s < 30) return "marbles (eyes)";
+    if (s == 30) return "marbleMeta";
+    if (s == 31) return "capsMeta";
+    if (s == 32) return "capsCenter";
+    if (s < 65) return "capsules (hero shadow proxy)";
+    if (s == 65) return "boneMeta";
+    if (s < 258) return "pieces (hero articulation)";
+    if (s == 258) return "gobMeta (in-flight count)";
+    if (s < 283) return "gobs (flying clay)";
+    if (s == 283) return "groundMeta (clay top bound)";
+    if (s == 284) return "swordA (hilt)";
+    if (s == 285) return "swordB (tip)";
+    if (s == 286) return "swordCol";
+    if (s < 291) return "foeInv";
+    if (s == 291) return "foeMeta";
+    if (s == 292) return "foeCenter";
+    if (s < 485) return "pieces (foe articulation)";
+    return "foeBoneMeta";
+}
+
+// Which uniform components the reuse digest is allowed to see. Kept beside
+// traceInputDigest so the digest and the CLAYFRAY_DEBUG_REUSE report below
+// cannot drift into disagreeing about what counts as a change.
+bool Renderer::digestIncludes(int s, int c) {
+    if (s == 13) return false;               // pick uv
+    if (s == 11) return false;               // post
+    if (s == 2 && c == 3) return false;      // frame.time
+    if (s == 4 && c == 2) return false;      // grainFrame
+    if (s == 12 && c != 3) return false;     // post2: keep only debugMode
+    return true;
+}
+
 uint64_t Renderer::traceInputDigest(const float u[kUniformSlots][4]) const {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](float f) {
@@ -425,13 +466,8 @@ uint64_t Renderer::traceInputDigest(const float u[kUniformSlots][4]) const {
         h *= 1099511628211ull;
     };
     for (int s = 0; s < kUniformSlots; s++) {
-        if (s == 13) continue;               // pick uv
-        if (s == 11) continue;               // post
         for (int c = 0; c < 4; c++) {
-            if (s == 2 && c == 3) continue;  // frame.time
-            if (s == 4 && c == 2) continue;  // grainFrame
-            if (s == 12 && c != 3) continue; // post2: keep only debugMode
-            mix(u[s][c]);
+            if (digestIncludes(s, c)) mix(u[s][c]);
         }
     }
     return h;
@@ -1499,6 +1535,54 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     }
     const bool reuse = reuseEnabled_ && traceValid_ && digest == traceDigest_;
     framesPresented_++;
+
+    // Why did this frame re-trace? Frame reuse is the difference between
+    // motion costing one trace per pose step and one per frame, so when it
+    // drops to 0% the useful question is which input refuses to settle.
+    // Names the first differing uniform component, or the volume whose
+    // generation moved (i.e. something queued an edit).
+    static const bool dbgReuse = std::getenv("CLAYFRAY_DEBUG_REUSE") != nullptr;
+    // A re-trace ON a pose step is the floor, not a fault — the image is
+    // supposed to change 12 times a second. Reporting those buries the ones
+    // that matter, and worse, misattributes them: the report names the first
+    // differing slot in index order, so a pose step also carrying a camera
+    // move gets blamed on camPos (slot 0) rather than the pose clock (slot
+    // 3.3). Stay quiet unless a frame re-traced BETWEEN pose steps, which is
+    // the only kind that costs anything.
+    const bool poseStepFrame = uniforms[3][3] != prevUniforms_[3][3];
+    if (dbgReuse && !reuse && traceValid_ && !poseStepFrame) {
+        const uint32_t gens[3] = {brick_.generation(), foe_.generation(),
+                                  ground_.generation()};
+        const char* gname[3] = {"hero volume", "foe volume", "ground clay"};
+        bool blamed = false;
+        for (int i = 0; i < 3; i++) {
+            if (gens[i] != prevGens_[i]) {
+                std::printf("[reuse] re-trace: %s generation %u -> %u\n", gname[i],
+                            prevGens_[i], gens[i]);
+                blamed = true;
+            }
+        }
+        for (int s = 0; s < kUniformSlots && !blamed; s++) {
+            for (int c = 0; c < 4; c++) {
+                if (!digestIncludes(s, c)) continue;
+                if (uniforms[s][c] == prevUniforms_[s][c]) continue;
+                std::printf("[reuse] re-trace: %s (slot %d.%d)  %.9g -> %.9g\n",
+                            uniformSlotName(s), s, c,
+                            (double)prevUniforms_[s][c], (double)uniforms[s][c]);
+                blamed = true;
+                break;
+            }
+        }
+        if (!blamed) std::printf("[reuse] re-trace between pose steps: no input changed?\n");
+        std::fflush(stdout);
+    }
+    if (dbgReuse) {
+        std::memcpy(prevUniforms_, uniforms, sizeof(prevUniforms_));
+        prevGens_[0] = brick_.generation();
+        prevGens_[1] = foe_.generation();
+        prevGens_[2] = ground_.generation();
+    }
+
     if (!reuse) {
         framesTraced_++;
         traceDigest_ = digest;

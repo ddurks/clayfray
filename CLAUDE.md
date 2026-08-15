@@ -222,6 +222,7 @@ reference renders — diff against them by eye after a lighting/shading change.
 | `CLAYFRAY_NO_REDIST` / `_NO_ANIM` / `_NO_PIECES` | disable redistance / animation / chunk articulation |
 | `CLAYFRAY_AO` / `_DETAIL` / `_SHADOWK` | override look params (float) |
 | `CLAYFRAY_DEBUG_PICK=1` | print world vs REST position under the cursor (trap 6) |
+| `CLAYFRAY_DEBUG_REUSE=1` | name the input behind every re-trace that happens BETWEEN pose steps (a re-trace ON a pose step is the 12 Hz floor, so it stays quiet — silence means optimal) — a uniform (by slot NAME, e.g. "gobs (flying clay)") or the volume whose generation moved. Frame reuse is what makes motion affordable, so when the `[reuse] traced N of M` line collapses toward 0% skipped, this says which input refuses to settle |
 | `CLAYFRAY_TEST_ADDSTRESS` / `_TEST_NULLEDITS` | `--carve-test` variants (pool stress / null-edit JFA) |
 
 ## Known defect: repeated readbacks stall (Windows/Vulkan, 2026-08-13)
