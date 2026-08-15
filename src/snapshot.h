@@ -43,4 +43,7 @@ class SnapReader {
 
 // Blocking GPU->CPU buffer readback (dev tooling only — a save hitch is
 // fine). Empty vector on failure. `size` must be a multiple of 4.
-std::vector<uint8_t> readbackBuffer(Gpu& gpu, wgpu::Buffer src, uint64_t size);
+// `srcOffset` reads a sub-range: the per-cell arrays are regions of one
+// buffer (see brick.h), and each snapshot section is still saved separately.
+std::vector<uint8_t> readbackBuffer(Gpu& gpu, wgpu::Buffer src, uint64_t size,
+                                    uint64_t srcOffset = 0);

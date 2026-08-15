@@ -293,28 +293,25 @@ void Renderer::buildBindGroups() {
         traceBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        wgpu::BindGroupEntry entries[9] = {};
+        // One binding covers indirection + seeds + coarse + cell weights: they
+        // are regions of brick_.volume, and Metal allows a stage only 10
+        // storage buffers (brick.h). Six here plus fighter 1's three = 9.
+        wgpu::BindGroupEntry entries[6] = {};
         entries[0].binding = 0;
-        entries[0].buffer = brick_.indirection;
+        entries[0].buffer = brick_.volume;
         entries[1].binding = 1;
         entries[1].buffer = brick_.distPool;
         entries[2].binding = 2;
         entries[2].buffer = brick_.albedoPool;
-        entries[3].binding = 3;
-        entries[3].buffer = brick_.seeds;
-        entries[4].binding = 4;
-        entries[4].buffer = brick_.coarse;
-        entries[5].binding = 6;
-        entries[5].buffer = brick_.cellWeights;
-        entries[6].binding = 7;
-        entries[6].buffer = ground_.base;
-        entries[7].binding = 8;
-        entries[7].buffer = ground_.height;
-        entries[8].binding = 9;
-        entries[8].buffer = ground_.color;
+        entries[3].binding = 7;
+        entries[3].buffer = ground_.base;
+        entries[4].binding = 8;
+        entries[4].buffer = ground_.height;
+        entries[5].binding = 9;
+        entries[5].buffer = ground_.color;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = tracePipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 9;
+        desc.entryCount = 6;
         desc.entries = entries;
         traceBrickBind_ = dev.CreateBindGroup(&desc);
     }
@@ -331,50 +328,41 @@ void Renderer::buildBindGroups() {
         pickBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        // pick's charDist + charAlbedo touch indirection + dist + albedo +
-        // seeds + weights; auto layout excludes the unused coarse binding
-        wgpu::BindGroupEntry entries[5] = {};
+        // Same three as trace, minus the ground: pick marches the body only.
+        // (Before the volume regions merged, trace and pick needed different
+        // entry counts here — pick's auto layout dropped the coarse field it
+        // never reads. One binding now carries every per-cell array, so both
+        // layouts agree.)
+        wgpu::BindGroupEntry entries[3] = {};
         entries[0].binding = 0;
-        entries[0].buffer = brick_.indirection;
+        entries[0].buffer = brick_.volume;
         entries[1].binding = 1;
         entries[1].buffer = brick_.distPool;
         entries[2].binding = 2;
         entries[2].buffer = brick_.albedoPool;
-        entries[3].binding = 3;
-        entries[3].buffer = brick_.seeds;
-        entries[4].binding = 6;
-        entries[4].buffer = brick_.cellWeights;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = pickPipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 5;
+        desc.entryCount = 3;
         desc.entries = entries;
         pickBrickBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        // group(2): fighter 1's volume. Same five arrays the rigid sampling
-        // path reads — no skin weights, it doesn't articulate. Bound for BOTH
-        // pipelines because brick_read.wgsl references them statically, so
-        // Tint keeps the bindings alive even on paths pick never takes.
-        wgpu::BindGroupEntry entries[5] = {};
+        // group(2): fighter 1's volume, laid out exactly like fighter 0's.
+        // Bound for BOTH pipelines because brick_read.wgsl references these
+        // statically, so Tint keeps the bindings alive even on paths pick
+        // never takes.
+        wgpu::BindGroupEntry entries[3] = {};
         entries[0].binding = 0;
-        entries[0].buffer = foe_.indirection;
+        entries[0].buffer = foe_.volume;
         entries[1].binding = 1;
         entries[1].buffer = foe_.distPool;
         entries[2].binding = 2;
         entries[2].buffer = foe_.albedoPool;
-        entries[3].binding = 3;
-        entries[3].buffer = foe_.seeds;
-        entries[4].binding = 4;
-        entries[4].buffer = foe_.coarse;
         wgpu::BindGroupDescriptor desc{};
         desc.entries = entries;
-        desc.entryCount = 5;
+        desc.entryCount = 3;
         desc.layout = tracePipeline_.GetBindGroupLayout(2);
         traceFoeBind_ = dev.CreateBindGroup(&desc);
-        // pick never takes the AO/penumbra path, so its auto layout drops the
-        // coarse field — same asymmetry group(1) already has above. Feeding
-        // the trace-sized set here fails validation.
-        desc.entryCount = 4;
         desc.layout = pickPipeline_.GetBindGroupLayout(2);
         pickFoeBind_ = dev.CreateBindGroup(&desc);
     }

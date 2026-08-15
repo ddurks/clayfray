@@ -18,24 +18,25 @@ const IND_INSIDE: u32 = 0x40000000u;
 const IND_IDX_MASK: u32 = 0x000FFFFFu;
 const IND_CHEB_MASK: u32 = 0x000000FFu;
 
-@group(1) @binding(0) var<storage, read> bIndirection: array<u32>;
+// The four per-cell arrays (indirection, JFA seeds, coarse distance, cell
+// skin weights) are ONE buffer here, addressed through the CELL_* base
+// indices in the //#constants block. That is not packing for its own sake:
+// a Metal shader stage gets 10 storage buffers, and two fighters plus the
+// ground at one binding per array needs 14 — the trace pipeline would not
+// create at all. See the region map in src/brick.h.
+@group(1) @binding(0) var<storage, read> bCells: array<u32>;
 @group(1) @binding(1) var<storage, read> bDist: array<u32>;    // 256 u32 per brick (512 f16)
 @group(1) @binding(2) var<storage, read> bAlbedo: array<u32>;  // 512 u32 per brick
-@group(1) @binding(3) var<storage, read> bSeeds: array<u32>;   // nearest surface cell (JFA)
-@group(1) @binding(4) var<storage, read> bCoarse: array<f32>;  // per-cell signed distance (m)
-@group(1) @binding(6) var<storage, read> bCellW: array<u32>;    // per-cell 4-slot skin: [joints u8x4][weights u8x4]
 
 // ---------- fighter 1 (the opponent) ----------
 // A second body, in its own volume. Same layout, same code: every read below
 // goes through an accessor that picks the volume by `gFighter`, so one set of
 // sampling functions serves both fighters and nothing here is duplicated.
-// Fighter 1 is RIGID (it stands and gets cut, it does not articulate), so it
-// needs no skin weights — hence no bCellW twin.
-@group(2) @binding(0) var<storage, read> fIndirection: array<u32>;
+// Fighter 1 is RIGID (it stands and gets cut, it does not articulate), so its
+// cell-weight region is allocated but never read.
+@group(2) @binding(0) var<storage, read> fCells: array<u32>;
 @group(2) @binding(1) var<storage, read> fDist: array<u32>;
 @group(2) @binding(2) var<storage, read> fAlbedo: array<u32>;
-@group(2) @binding(3) var<storage, read> fSeeds: array<u32>;
-@group(2) @binding(4) var<storage, read> fCoarse: array<f32>;
 
 // Which body the sampling functions are currently reading, and its pose data.
 // Set them, call, set them back — see foeDist/foeAlbedo at the bottom. This is
@@ -64,8 +65,8 @@ fn pieceAt(i: i32) -> Piece {
 }
 
 fn rdIndir(i: u32) -> u32 {
-  if (gFighter == 0u) { return bIndirection[i]; }
-  return fIndirection[i];
+  if (gFighter == 0u) { return bCells[CELL_IND + i]; }
+  return fCells[CELL_IND + i];
 }
 fn rdDist(i: u32) -> u32 {
   if (gFighter == 0u) { return bDist[i]; }
@@ -76,13 +77,16 @@ fn rdAlb(i: u32) -> u32 {
   return fAlbedo[i];
 }
 fn rdSeed(i: u32) -> u32 {
-  if (gFighter == 0u) { return bSeeds[i]; }
-  return fSeeds[i];
+  if (gFighter == 0u) { return bCells[CELL_SEED + i]; }
+  return fCells[CELL_SEED + i];
 }
+// The coarse region is f32 data in the shared u32 buffer.
 fn rdCoarse(i: u32) -> f32 {
-  if (gFighter == 0u) { return bCoarse[i]; }
-  return fCoarse[i];
+  if (gFighter == 0u) { return bitcast<f32>(bCells[CELL_COARSE + i]); }
+  return bitcast<f32>(fCells[CELL_COARSE + i]);
 }
+// Skin weights: fighter 0 only (see above), so no gFighter branch.
+fn rdCellW(i: u32) -> u32 { return bCells[CELL_W + i]; }
 
 fn cellIndex(c: vec3i) -> u32 {
   return u32(c.x + c.y * GRID + c.z * GRID * GRID);
@@ -260,14 +264,14 @@ fn cellSkinAt(q: vec3f) -> CellSkin {
   let v = (q - VOL_ORIGIN) / VOXEL;
   var out: CellSkin;
   let cellN = clamp(vec3i(floor(v / BRICK_USABLE)), vec3i(0), vec3i(GRID - 1));
-  out.jw = bCellW[cellIndex(cellN) * 2u];
+  out.jw = rdCellW(cellIndex(cellN) * 2u);
   let g = clamp(v / BRICK_USABLE - 0.5, vec3f(0.0), vec3f(f32(GRID) - 1.001));
   let c0 = vec3i(floor(g));
   out.f = g - floor(g);
   for (var k = 0; k < 8; k++) {
     let c = min(c0 + vec3i(k & 1, (k >> 1) & 1, (k >> 2) & 1), vec3i(GRID - 1));
     let ci = cellIndex(c) * 2u;
-    out.cw[k] = vec2u(bCellW[ci], bCellW[ci + 1u]);
+    out.cw[k] = vec2u(rdCellW(ci), rdCellW(ci + 1u));
   }
   return out;
 }
@@ -359,8 +363,8 @@ fn forwardResid(p: vec3f, qh: vec3f,
   let v = (qh - VOL_ORIGIN) / VOXEL;
   let cell = clamp(vec3i(floor(v / BRICK_USABLE)), vec3i(0), vec3i(GRID - 1));
   let ci = cellIndex(cell) * 2u;
-  let jw = bCellW[ci];
-  let ww = bCellW[ci + 1u];
+  let jw = rdCellW(ci);
+  let ww = rdCellW(ci + 1u);
   var back = vec3f(0.0);
   var wsum = 0.0;
   for (var sl = 0u; sl < 4u; sl++) {
