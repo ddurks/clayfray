@@ -965,6 +965,7 @@ void BrickSystem::encodeRedistance(wgpu::CommandEncoder& enc) {
 
 void BrickSystem::encode(wgpu::CommandEncoder& enc) {
     if (importPending_) {
+        gen_++;
         encodeImport(enc);
         encodeJfa(enc);
         importPending_ = false;
@@ -976,6 +977,7 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
         enc.ClearBuffer(counters_, 0, 16);
         BrickEdit bake{};
         bake.mode = 0;
+        gen_++;
         encodeOp(enc, bake, 0);
         encodeJfa(enc);
         bakePending_ = false;
@@ -986,6 +988,7 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
       // volume, so ONE JFA + redistance after the batch refreshes all of them —
       // the sweep substeps of a sword cut land in the same frame instead of
       // unzipping one per frame.
+      gen_++;
       const int batch = std::min((int)pending_.size(), kOpsPerFrame);
       for (int op = 0; op < batch; op++) {
         BrickEdit e = pending_.front();

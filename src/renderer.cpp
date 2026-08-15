@@ -174,11 +174,13 @@ bool Renderer::init(Gpu& gpu, int width, int height) {
     if (!buildPipelines()) return false;
     buildBindGroups();
     shaderDirStamp_ = shaderDirStamp();
+    reuseEnabled_ = std::getenv("CLAYFRAY_NO_REUSE") == nullptr;
     return true;
 }
 
 void Renderer::resize(int width, int height) {
     if (width == width_ && height == height_) return;
+    traceValid_ = false; // new targets: the cached trace is gone
     width_ = width;
     height_ = height;
     buildTargets();
@@ -411,9 +413,40 @@ bool Renderer::reloadShadersIfChanged() {
     std::printf("reloading shaders\n");
     ground_.rebuildPipelines(loadShader("ground.wgsl"));
     if (buildPipelines()) buildBindGroups();
+    traceValid_ = false; // recompiled shaders may trace differently
     // character source may have changed; rebuild the volume from it
     brick_.requestBake();
     return true;
+}
+
+// Digest of everything the TRACE pass reads. Deliberately excludes the three
+// things that change every frame without changing the traced image:
+//   camUp.w   frame.time  — not read by any shader
+//   res.z     grainFrame  — post only (so grain still animates over a reuse)
+//   post.xyzw, post2.xyz  — post only; post2.w is debugMode and IS traced
+//   mouse     pick uv     — pick runs every frame regardless, on its own pass
+// Volume CONTENTS are not in the uniform buffer at all, so the caller folds in
+// the brick/ground generation counters separately.
+uint64_t Renderer::traceInputDigest(const float u[kUniformSlots][4]) const {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](float f) {
+        uint32_t bits;
+        std::memcpy(&bits, &f, 4);
+        if (bits == 0x80000000u) bits = 0u; // -0.0 and 0.0 are the same input
+        h ^= bits;
+        h *= 1099511628211ull;
+    };
+    for (int s = 0; s < kUniformSlots; s++) {
+        if (s == 13) continue;               // pick uv
+        if (s == 11) continue;               // post
+        for (int c = 0; c < 4; c++) {
+            if (s == 2 && c == 3) continue;  // frame.time
+            if (s == 4 && c == 2) continue;  // grainFrame
+            if (s == 12 && c != 3) continue; // post2: keep only debugMode
+            mix(u[s][c]);
+        }
+    }
+    return h;
 }
 
 void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
@@ -1438,7 +1471,24 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     foe_.encode(encoder); // fighter 1's own import/edit/JFA passes
     ground_.encode(encoder);
 
-    {
+    // ---- 12 Hz frame reuse ----
+    // Fold the volume generations in: a carve or a landed gob changes what the
+    // tracer would see without changing a single uniform. The generations are
+    // read AFTER encode() above, so an edit queued this frame re-traces this
+    // frame rather than a frame late.
+    uint64_t digest = traceInputDigest(uniforms);
+    for (uint32_t g : {brick_.generation(), foe_.generation(), ground_.generation()}) {
+        digest = (digest ^ g) * 1099511628211ull;
+    }
+    const bool reuse = reuseEnabled_ && traceValid_ && digest == traceDigest_;
+    framesPresented_++;
+    if (!reuse) {
+        framesTraced_++;
+        traceDigest_ = digest;
+        traceValid_ = true;
+    }
+
+    if (!reuse) {
         wgpu::PassTimestampWrites tsw{};
         wgpu::ComputePassDescriptor passDesc{};
         if (querySet_) {

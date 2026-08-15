@@ -437,6 +437,13 @@ int runHeadless(const RunOpts& o) {
                     s.carved * 1e6f, s.deposited * 1e6f, s.inFlight * 1e6f, s.gobs,
                     s.debt * 1e6f);
     }
+    std::printf("[reuse] traced %llu of %llu frames (%.1f%% skipped)\n",
+                (unsigned long long)renderer.framesTraced(),
+                (unsigned long long)renderer.framesPresented(),
+                renderer.framesPresented()
+                    ? 100.0 * (1.0 - (double)renderer.framesTraced() /
+                                         (double)renderer.framesPresented())
+                    : 0.0);
     if (renderer.traceMs() > 0.f) {
         std::printf("[gpu] trace %.2f ms  post %.2f ms (smoothed, %dx%d aa=%d)\n",
                     renderer.traceMs(), renderer.postMs(), o.width, o.height, o.aa);

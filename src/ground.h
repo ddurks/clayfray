@@ -37,6 +37,11 @@ class GroundClay {
     bool save(SnapWriter& w);
     bool load(SnapReader& r);
 
+    // Bumped whenever encode() emits work that changes the field. The
+    // renderer folds this into its frame-reuse digest: the field's CONTENTS
+    // are not in the uniform buffer, so nothing else would notice a splat.
+    uint32_t generation() const { return gen_; }
+
     wgpu::Buffer base, height, color;
 
   private:
@@ -54,6 +59,7 @@ class GroundClay {
     wgpu::Buffer params_[kOpsPerFrame];
     wgpu::BindGroup initG_, splatG_[kOpsPerFrame];
     bool basePending_ = true;
+    uint32_t gen_ = 0;
     float maxH_ = 0.f;
     // 64x64 thickness mirror so gobs land on top of existing piles
     static constexpr int kMirror = 64;

@@ -72,6 +72,19 @@ class Renderer {
     int width() const { return width_; }
     int height() const { return height_; }
 
+    // ---- 12 Hz frame reuse ----
+    // The pose grid is the stop-motion clock (CLAUDE.md trap 4), so with a
+    // still camera four out of every five 60 Hz frames are BIT-IDENTICAL to
+    // the one before — verified by rendering consecutive frames and diffing.
+    // Re-tracing them is pure waste. The trace result is kept and reused until
+    // something the tracer reads actually changes; POST still runs every frame,
+    // so the 25 Hz film grain and the bloom keep animating over the cached
+    // trace for free.
+    uint64_t framesTraced() const { return framesTraced_; }
+    uint64_t framesPresented() const { return framesPresented_; }
+    // Force a re-trace (resize, shader reload, anything not in the digest).
+    void invalidateTrace() { traceValid_ = false; }
+
     // smoothed GPU pass times, ms (0 when timestamps unsupported)
     float traceMs() const { return traceMs_; }
     float postMs() const { return postMs_; }
@@ -224,6 +237,12 @@ class Renderer {
     wgpu::Buffer queryResolve_, queryRead_;
     bool queryMapPending_ = false;
     float traceMs_ = 0.f, postMs_ = 0.f;
+    // frame reuse
+    uint64_t traceDigest_ = 0;
+    bool traceValid_ = false;
+    bool reuseEnabled_ = true;
+    uint64_t framesTraced_ = 0, framesPresented_ = 0;
+    uint64_t traceInputDigest(const float u[kUniformSlots][4]) const;
 
     // Shared with in-flight MapAsync callbacks; false once destroyed.
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);

@@ -196,6 +196,7 @@ bool GroundClay::load(SnapReader& r) {
 void GroundClay::encode(wgpu::CommandEncoder& enc) {
     if (basePending_) {
         basePending_ = false;
+        gen_++;
         enc.ClearBuffer(height, 0, (uint64_t)kN * kN * 4);
         enc.ClearBuffer(color, 0, (uint64_t)kN * kN * 4);
         wgpu::ComputePassEncoder pass = enc.BeginComputePass();
@@ -205,6 +206,7 @@ void GroundClay::encode(wgpu::CommandEncoder& enc) {
         pass.End();
     }
     if (pending_.empty()) return;
+    gen_++;
     int n = std::min((int)pending_.size(), kOpsPerFrame);
     for (int i = 0; i < n; i++) {
         const Op& op = pending_[i];

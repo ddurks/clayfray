@@ -164,6 +164,10 @@ class BrickSystem {
         else bakePending_ = true;
     }
     bool hasPendingWork() const { return bakePending_ || !pending_.empty(); }
+    // Bumped whenever encode() emits work that changes the volume (import,
+    // bake, or an edit). The volume's CONTENTS are not in the uniform buffer,
+    // so this is what tells the renderer's frame reuse that a carve happened.
+    uint32_t generation() const { return gen_; }
     // Encodes at most one op (bake or oldest queued edit) plus the JFA
     // refresh. Call once per frame before the trace pass.
     void encode(wgpu::CommandEncoder& enc);
@@ -225,6 +229,7 @@ class BrickSystem {
     wgpu::BindGroup jfaInitG_, jfaStepG_[kJfaSteps], jfaResolveG_;
     std::vector<BrickEdit> pending_;
     bool bakePending_ = true;
+    uint32_t gen_ = 0;
 
     void encodeImport(wgpu::CommandEncoder& enc);
     wgpu::ShaderModule voxelizeMod_;

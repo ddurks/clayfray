@@ -444,6 +444,66 @@ hot-load; this adds the rest. See CLAUDE.md "Agent dev loop" for commands.
   make rebuild+relaunch+`--load` ~10 s and always ABI-correct), param-file
   watch, pause-on-NaN
 
+## Milestone PERF — 12 Hz frame reuse (SHIPPED 2026-08-15)
+
+*Goal: 60 fps. Achieved 3.9x by not rendering the same image five times.*
+
+**The observation.** The pose grid is the stop-motion clock (trap 4). Rendering
+consecutive 60 Hz frames within one 12 Hz pose step and diffing them shows they
+are BIT-IDENTICAL (0/230400 px); the frame that crosses a pose boundary differs
+by 75%. Four of every five frames were being re-traced for nothing.
+
+**The fix.** Keep the trace result and reuse it until something the TRACER
+reads changes. POST still runs every frame, so the 25 Hz film grain and the
+bloom keep animating over a cached trace for free.
+
+The invalidation digest hashes the uniform slots the trace reads, deliberately
+excluding the three things that change every frame without changing the traced
+image: `camUp.w` (frame.time — read by no shader), `res.z` (grainFrame — post
+only), `mouse` (pick runs every frame on its own 1-workgroup pass), and
+`post`/`post2.xyz` (post only; `post2.w` is debugMode and IS traced). Volume
+CONTENTS are not in the uniform buffer at all, so BrickSystem and GroundClay
+each carry a `generation()` bumped whenever their encode emits work — that is
+what makes a carve or a landed gob re-trace.
+
+**Measured** (1280x720 aa=1, wall clock per PRESENTED frame — GPU pass
+timestamps no longer tell the story, they only fire on traced frames):
+
+| | ms/frame | fps | traced |
+|---|---|---|---|
+| reuse off | 72.24 | 13.8 | 360/360 |
+| reuse on | 18.53 | **54.0** | 72/360 (80% skipped) |
+
+Output is byte-identical. Gates: --carve-test exit 0 with the ledger exact
+(2175.0 ml carved == landed) and reuse correctly falling to 66% skipped while
+carving; both journal replays exit 0 and match to within the pre-existing
+redistance noise floor (1-4 px at max delta 1 — two reuse-OFF runs differ by
+the same amount).
+
+**The remaining gap to 60 fps** is ~1.9 ms. 72.24/5 = 14.4 ms of amortised
+trace plus ~4 ms of per-frame post/submit. Any of the earlier levers closes it;
+the soft-shadow one (26 steps @1.24, worth ~20%) would bring it to ~15.6 ms.
+
+**Known limitation.** Reuse only pays while the traced inputs hold still. The
+CAMERA invalidates on every orbit frame, and the fighter ROOT position moves at
+60 Hz — `fighter_.pos` is not quantised to the pose grid, only the animation
+clip is. So walking currently defeats reuse. Quantising the root to the 12 Hz
+grid would fix that AND is arguably what trap 4 already asks for ("anything
+that moves visually quantises its DISPLAY position to the pose grid"); it is a
+deliberate look change and is NOT done here.
+
+**Abandoned: posed-volume bake** (branch `m5-perf-and-grip`, 4 commits). It
+works — bakes the warped body into a root-space BrickVolume per fighter at
+4.7 ms — but delivers only 1.25x, because the march turns out to be STEP-COUNT
+bound, not sample-cost bound: removing the character from map() drops the march
+from 34.7 ms to 5.4 ms, while capping iterations barely moves it. Baking makes
+each sample cheaper, which helps the point-query shading (1.56x) and barely
+touches the march (1.06x). Per-ray bounding volumes were tried too: 1.11x, with
+a ceiling of ~1.4x even at an unrealistically tight bound. Note for anyone
+re-reading old numbers: `CLAYFRAY_NO_PIECES` sets `foeBoneMeta.x = 0` so
+`foeDist` returns 1e9 — it does not render the opponent, and is NOT a valid
+cost model for a whole-scene change.
+
 ## Milestone 5 — Dueling core (REVISED — was "Gameplay core")
 
 *Goal: two fighters, 1 s predictive ticks, sword slicing. Playable-if-rough,
