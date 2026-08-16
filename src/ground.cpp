@@ -91,10 +91,16 @@ bool GroundClay::rebuildPipelines(const std::string& src) {
     desc.compute.module = mod;
     desc.label = "ground initBase";
     desc.compute.entryPoint = "initBase";
-    initPipe_ = dev.CreateComputePipeline(&desc);
+    {
+        GpuPipelineScope scope(dev, "ground initBase");
+        initPipe_ = dev.CreateComputePipeline(&desc);
+    }
     desc.label = "ground splat";
     desc.compute.entryPoint = "splat";
-    splatPipe_ = dev.CreateComputePipeline(&desc);
+    {
+        GpuPipelineScope scope(dev, "ground splat");
+        splatPipe_ = dev.CreateComputePipeline(&desc);
+    }
     if (!initPipe_ || !splatPipe_) return false;
     buildBindGroups();
     return true;

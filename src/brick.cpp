@@ -32,7 +32,13 @@ wgpu::ComputePipeline makePipeline(wgpu::Device& device, wgpu::ShaderModule mod,
     desc.compute.module = mod;
     desc.compute.entryPoint = entry;
     auto t0 = std::chrono::steady_clock::now();
-    wgpu::ComputePipeline p = device.CreateComputePipeline(&desc);
+    wgpu::ComputePipeline p;
+    {
+        // Names the pipeline if it is rejected — e.g. by the 8-storage-buffer
+        // core limit, which `meshFill` sits exactly on (gpu.cpp).
+        GpuPipelineScope scope(device, entry);
+        p = device.CreateComputePipeline(&desc);
+    }
     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (s > 0.5) {
         std::printf("[startup] %s pipeline: %.1fs\n", entry, s);

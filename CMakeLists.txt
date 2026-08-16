@@ -168,12 +168,61 @@ if(EMSCRIPTEN)
     # visitor would download and nothing would read. Cost of naming it: a NEW
     # asset needs a line here or it is silently absent on web.
     "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/assets/fighter.glb@/assets/fighter.glb"
-    # The clay volumes are GPU buffers, so the wasm heap only carries mesh
-    # import staging and the edit/gob queues. 64 MB is a starting reservation,
-    # NOT a measured figure — nothing has run yet (stage 1 builds, stage 2
-    # runs) — and growth covers being wrong. Re-check it once the tab boots.
+    # ---- wasm heap sizing (stage 2: now measured, not reserved) ----
+    #
+    # The big buffers are NOT here. distPool (16 MiB) + albedoPool (32 MiB) +
+    # volume + JFA scratch — call it ~50 MiB per fighter — are wgpu::Buffers,
+    # i.e. GPU-side allocations the wasm heap never sees. Sizing this to cover
+    # them was the stage-1 guess and it overshot by ~4x.
+    #
+    # What DOES land in the wasm heap is dominated by ONE number, and it is
+    # not a number anyone would guess — it has to be read off a run. The
+    # startup line `import: 14848 tris binned (8000190 refs)` is the whole
+    # budget: the voxelizer bins every triangle into every cell its
+    # band-dilated AABB touches, and at kBand = 12 voxels that fans 14,848
+    # triangles out to EIGHT MILLION cell references, ~539 per triangle.
+    #
+    #   tri refs `ids`            8,000,190 * 4        = 30.5 MiB
+    #   `merged` = offsets + ids  8,125,191 * 4        = 31.0 MiB
+    #     ^ a full COPY of ids, alive at the same time as ids (brick.cpp,
+    #       just before the "cell tris" upload) — together they ARE the peak
+    #   cell offsets (kGrid^3+1)                        = 0.48 MiB
+    #   inside bits (kGrid^3)                           = 0.48 MiB
+    #   posNrm 0.66 + normals 0.32                      = 0.98 MiB
+    #   CharacterAsset vectors (27,776 verts/14,848 tris) ~1.6 MiB
+    #   .glb read buffer + MEMFS preload package        ~1.9 MiB
+    #   static data (measured from the linked .wasm)      0.16 MiB
+    #   ImGui + SDL + libc + Dawn's client-side objects   a few MiB
+    #
+    # Peak ~= 70 MiB, and it is a STARTUP TRANSIENT: once the import uploads
+    # to the GPU, everything above but the asset vectors is freed. That does
+    # not help the reservation, because wasm memory never shrinks — whatever
+    # the module grows to during import it holds for the session. So size for
+    # the peak up front and skip the growth memcpys rather than pretend the
+    # steady state (~5 MiB) is the requirement.
+    #
+    # 96 MiB = the ~70 MiB peak plus room for a somewhat denser asset. Note
+    # the stage-1 guess of 64 MiB was slightly UNDER the real peak, so it
+    # would have grown during startup on every load.
+    #
+    # WORTH FIXING LATER: `merged` is a pure copy that exists only to upload
+    # offsets and ids as one buffer. Two WriteBuffer calls into the same
+    # buffer at offsets 0 and offsets.size()*4 are byte-identical and would
+    # cut 31 MiB off the peak, letting this drop to 64 MiB or below. Left
+    # alone here because it is shared native/web code and this branch is
+    # meant to be additive.
+    #
+    # ALLOW_MEMORY_GROWTH stays ON regardless: it is what makes being wrong
+    # about the number above recoverable rather than fatal.
     -sALLOW_MEMORY_GROWTH=1
-    -sINITIAL_MEMORY=67108864)
+    -sINITIAL_MEMORY=100663296
+    # Emscripten defaults the stack to 64 KB; this code was written against a
+    # native 8 MB one. Nothing here has a frame over ~2 KB (the largest local
+    # buffer in src/ is a 2048-byte char array), so 64 KB would probably do —
+    # but a Release build has STACK_OVERFLOW_CHECK off, which makes an
+    # overflow silent heap corruption rather than an error. 1 MiB is 3% of the
+    # heap above and removes the question.
+    -sSTACK_SIZE=1048576)
   if(CLAYFRAY_WEB_JSPI)
     # -sJSPI is a LINK setting (em++ warns and ignores it on a compile line);
     # the define is what flips CLAYFRAY_HAS_BLOCKING_GPU_WAIT in platform.h,

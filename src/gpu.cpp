@@ -7,7 +7,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
@@ -131,7 +133,49 @@ void cacheStore(size_t keySize, const uint8_t* key, size_t valueSize,
 
 } // namespace
 
-bool Gpu::init(SDL_Window* window) {
+namespace {
+bool gPipelineFailed = false;
+} // namespace
+
+bool gpuAnyPipelineFailed() { return gPipelineFailed; }
+
+GpuPipelineScope::GpuPipelineScope(const wgpu::Device& device, const char* what)
+    : device_(device), what_(what) {
+    if (device_) device_.PushErrorScope(wgpu::ErrorFilter::Validation);
+}
+
+GpuPipelineScope::~GpuPipelineScope() {
+    if (!device_) return;
+    const char* what = what_;
+    device_.PopErrorScope(
+        wgpu::CallbackMode::AllowSpontaneous,
+        [what](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg) {
+            if (type == wgpu::ErrorType::NoError) return;
+            gPipelineFailed = true;
+            std::fprintf(stderr,
+                         "[wgpu] PIPELINE '%s' FAILED TO CREATE: %.*s\n"
+                         "       Every pass using it is a silent no-op from "
+                         "here on — expect a black screen.\n",
+                         what, (int)msg.length, msg.data);
+            // The one failure mode that is portable-by-construction and only
+            // shows up on conformant/mobile browsers: core WebGPU guarantees
+            // just 8 storage buffers per stage (CLAUDE.md trap 8), and desktop
+            // adapters report far more, so a shader over budget runs fine on
+            // the dev box and dies on a phone.
+            const std::string_view m(msg.data, msg.length);
+            if (m.find("torage") != std::string_view::npos &&
+                (m.find("imit") != std::string_view::npos ||
+                 m.find("xceed") != std::string_view::npos)) {
+                std::fprintf(stderr,
+                             "       This looks like a storage-buffer limit. "
+                             "Core WebGPU guarantees only 8 per stage; see "
+                             "CLAUDE.md trap 8 for the region-packing fix.\n");
+            }
+            std::fflush(stderr);
+        });
+}
+
+bool Gpu::createInstance() {
     wgpu::InstanceDescriptor instDesc{};
 #if CLAYFRAY_HAS_BLOCKING_GPU_WAIT
     // Asking for TimedWaitAny is not a hint on web: emdawnwebgpu's
@@ -148,7 +192,10 @@ bool Gpu::init(SDL_Window* window) {
         std::fprintf(stderr, "wgpu: failed to create instance\n");
         return false;
     }
+    return true;
+}
 
+wgpu::RequestAdapterOptions Gpu::adapterOptions() const {
     wgpu::RequestAdapterOptions adapterOpts{};
     adapterOpts.powerPreference = wgpu::PowerPreference::HighPerformance;
 #ifdef _WIN32
@@ -161,27 +208,26 @@ bool Gpu::init(SDL_Window* window) {
         adapterOpts.backendType = wgpu::BackendType::Vulkan;
     }
 #endif
-    auto requestAdapter = [this](const wgpu::RequestAdapterOptions& opts) {
-        wgpu::Future af = instance.RequestAdapter(
-            &opts, wgpu::CallbackMode::WaitAnyOnly,
-            [this](wgpu::RequestAdapterStatus status, wgpu::Adapter a, wgpu::StringView msg) {
-                if (status == wgpu::RequestAdapterStatus::Success) {
-                    adapter = std::move(a);
-                } else {
-                    std::fprintf(stderr, "wgpu: adapter request failed: %.*s\n",
-                                 (int)msg.length, msg.data);
-                }
-            });
-        gpuBlockOn(instance, af, "adapter request");
-    };
-    requestAdapter(adapterOpts);
-    if (!adapter && adapterOpts.backendType == wgpu::BackendType::Vulkan) {
-        std::fprintf(stderr, "wgpu: no Vulkan adapter, falling back to default backend\n");
-        adapterOpts.backendType = wgpu::BackendType::Undefined;
-        requestAdapter(adapterOpts);
-    }
-    if (!adapter) return false;
+    return adapterOpts;
+}
 
+wgpu::Future Gpu::requestAdapter(const wgpu::RequestAdapterOptions& opts,
+                                 wgpu::CallbackMode mode, std::function<void()> then) {
+    return instance.RequestAdapter(
+        &opts, mode,
+        [this, then = std::move(then)](wgpu::RequestAdapterStatus status, wgpu::Adapter a,
+                                       wgpu::StringView msg) {
+            if (status == wgpu::RequestAdapterStatus::Success) {
+                adapter = std::move(a);
+            } else {
+                std::fprintf(stderr, "wgpu: adapter request failed: %.*s\n",
+                             (int)msg.length, msg.data);
+            }
+            if (then) then();
+        });
+}
+
+void Gpu::reportAdapter() {
     wgpu::AdapterInfo info{};
     adapter.GetInfo(&info);
     std::printf("wgpu adapter: %.*s (%.*s)%s\n", (int)info.device.length, info.device.data,
@@ -189,10 +235,37 @@ bool Gpu::init(SDL_Window* window) {
                 adapter.HasFeature(wgpu::FeatureName::TimestampQuery)
                     ? ""
                     : " [no gpu timestamps; wall-clock benchmarking only]");
+    std::fflush(stdout);
+    hasTimestamps = adapter.HasFeature(wgpu::FeatureName::TimestampQuery);
+}
 
+wgpu::Future Gpu::requestDevice(wgpu::CallbackMode mode, std::function<void()> then) {
     wgpu::DeviceDescriptor devDesc{};
-    // request the adapter's full limits: the voxelizer needs 10 storage
-    // buffers per stage (default cap is 8)
+    // Request the adapter's full limits.
+    //
+    // The old justification here — "the voxelizer needs 10 storage buffers per
+    // stage" — was TRUE WHEN WRITTEN and is now STALE. It counted `meshFill`
+    // back when it also reached `mSkin` and `bWeights`; commit 3eee63d (the
+    // skeleton-free three-brush rig) deleted both, and an entry-point-level
+    // audit of every shader now puts the worst case at exactly 8:
+    //
+    //     voxelize.wgsl meshFill  8 of 8   (zero spare)
+    //     trace.wgsl    cs        7 of 8   (one spare, trap 8)
+    //     pick.wgsl     cs        7 of 8
+    //
+    // What matters is the per-ENTRY-POINT count, not the 11 storage vars
+    // voxelize.wgsl declares: every pipeline here uses an AUTO layout, so Dawn
+    // derives the bind group layout from what that entry point statically
+    // reaches. `meshFill` never reaches group 2, `meshClassify` never reaches
+    // mCol/voxParity — see the note at brick.cpp's vxG0_ construction.
+    //
+    // So nothing in the tree needs raised limits any more, and a core-minimum
+    // browser can create every pipeline. This stays as-is because dropping to
+    // default limits is a device-configuration change that wants a run on real
+    // hardware to confirm, not a compile. Be aware of the cost of keeping it:
+    // asking for the adapter's real (larger) limits means the dev box will
+    // happily create a pipeline that a core-minimum device rejects, which is
+    // exactly the trap-8 failure that only shows up on someone else's phone.
     wgpu::Limits adapterLimits{};
     adapter.GetLimits(&adapterLimits);
     devDesc.requiredLimits = &adapterLimits;
@@ -247,17 +320,21 @@ bool Gpu::init(SDL_Window* window) {
     }
 #endif
 
-    wgpu::Future df = adapter.RequestDevice(
-        &devDesc, wgpu::CallbackMode::WaitAnyOnly,
-        [this](wgpu::RequestDeviceStatus status, wgpu::Device d, wgpu::StringView msg) {
+    return adapter.RequestDevice(
+        &devDesc, mode,
+        [this, then = std::move(then)](wgpu::RequestDeviceStatus status, wgpu::Device d,
+                                       wgpu::StringView msg) {
             if (status == wgpu::RequestDeviceStatus::Success) {
                 device = std::move(d);
             } else {
                 std::fprintf(stderr, "wgpu: device request failed: %.*s\n",
                              (int)msg.length, msg.data);
             }
+            if (then) then();
         });
-    gpuBlockOn(instance, df, "device request");
+}
+
+bool Gpu::finishInit(SDL_Window* window) {
     if (!device) return false;
     queue = device.GetQueue();
 
@@ -307,6 +384,75 @@ bool Gpu::init(SDL_Window* window) {
         if (caps.formatCount > 0) surfaceFormat = caps.formats[0];
     }
     return true;
+}
+
+bool Gpu::init(SDL_Window* window) {
+    // The desktop sequence, unchanged in every observable way: request,
+    // block, request, block, finish. WaitAnyOnly is the cheapest callback
+    // mode when something really is going to wait on the future.
+    if (!createInstance()) return false;
+
+    wgpu::RequestAdapterOptions adapterOpts = adapterOptions();
+    gpuBlockOn(instance, requestAdapter(adapterOpts, wgpu::CallbackMode::WaitAnyOnly),
+               "adapter request");
+    if (!adapter && adapterOpts.backendType == wgpu::BackendType::Vulkan) {
+        std::fprintf(stderr, "wgpu: no Vulkan adapter, falling back to default backend\n");
+        adapterOpts.backendType = wgpu::BackendType::Undefined;
+        gpuBlockOn(instance, requestAdapter(adapterOpts, wgpu::CallbackMode::WaitAnyOnly),
+                   "adapter request");
+    }
+    if (!adapter) return false;
+    reportAdapter();
+
+    gpuBlockOn(instance, requestDevice(wgpu::CallbackMode::WaitAnyOnly), "device request");
+    if (!device) return false;
+    return finishInit(window);
+}
+
+void Gpu::initAsync(SDL_Window* window, std::function<void(bool)> onReady) {
+#if CLAYFRAY_HAS_BLOCKING_GPU_WAIT
+    // Native (and the JSPI escape hatch) can just do it the old way and call
+    // back immediately. Keeping ONE caller shape means main.cpp's startup path
+    // is the same code on both platforms, which is what stops the two from
+    // drifting.
+    onReady(init(window));
+#else
+    // Browser: no waiting allowed anywhere in here. AllowSpontaneous is the
+    // mode whose callback the event loop delivers on its own (during
+    // processEvents / between tasks) — WaitAnyOnly would simply never fire,
+    // because nothing is permitted to call WaitAny.
+    //
+    // There is no Vulkan-fallback branch on this path: the backend preference
+    // it retries is #ifdef _WIN32 and a browser has exactly one adapter
+    // source. If RequestAdapter fails here, it failed for real (usually
+    // "WebGPU not available" — an unsupported browser or a non-secure origin).
+    if (!createInstance()) {
+        onReady(false);
+        return;
+    }
+    // shared_ptr, not capture-by-value: the continuation is copied into a
+    // wgpu callback, and the SECOND continuation is copied out of the first.
+    // One heap cell keeps `onReady` callable exactly once at the end of the
+    // chain without moving a std::function through two nested lambdas.
+    auto ready = std::make_shared<std::function<void(bool)>>(std::move(onReady));
+    const wgpu::RequestAdapterOptions opts = adapterOptions();
+    requestAdapter(opts, wgpu::CallbackMode::AllowSpontaneous, [this, window, ready]() {
+        if (!adapter) {
+            std::fprintf(stderr,
+                         "wgpu: no adapter. In a browser this is almost always "
+                         "WebGPU itself being unavailable: it needs a "
+                         "WebGPU-capable browser AND a secure origin "
+                         "(https:// or http://localhost — opening the .html "
+                         "as a file:// URL will not work).\n");
+            (*ready)(false);
+            return;
+        }
+        reportAdapter();
+        requestDevice(wgpu::CallbackMode::AllowSpontaneous, [this, window, ready]() {
+            (*ready)(device && finishInit(window));
+        });
+    });
+#endif
 }
 
 void Gpu::configureSurface(int pixelWidth, int pixelHeight) {

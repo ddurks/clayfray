@@ -246,7 +246,13 @@ bool Renderer::buildPipelines() {
         desc.label = "trace";
         desc.compute.module = mod;
         desc.compute.entryPoint = "cs";
-        tracePipeline_ = dev.CreateComputePipeline(&desc);
+        {
+            // trace sits at 7 of the 8 storage buffers core WebGPU
+            // guarantees (trap 8) — if a conformant device ever rejects it,
+            // this is the line that says so instead of a black screen.
+            GpuPipelineScope scope(dev, "trace");
+            tracePipeline_ = dev.CreateComputePipeline(&desc);
+        }
         lap("trace");
     }
     {
@@ -255,7 +261,10 @@ bool Renderer::buildPipelines() {
         desc.label = "pick";
         desc.compute.module = mod;
         desc.compute.entryPoint = "cs";
-        pickPipeline_ = dev.CreateComputePipeline(&desc);
+        {
+            GpuPipelineScope scope(dev, "pick");
+            pickPipeline_ = dev.CreateComputePipeline(&desc);
+        }
         lap("pick");
     }
     {
@@ -273,6 +282,7 @@ bool Renderer::buildPipelines() {
         desc.vertex.entryPoint = "vs";
         desc.fragment = &frag;
         desc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+        GpuPipelineScope scope(dev, "post");
         postPipeline_ = dev.CreateRenderPipeline(&desc);
     }
     if (gpu_->surface) {
@@ -290,6 +300,7 @@ bool Renderer::buildPipelines() {
         desc.vertex.entryPoint = "vs";
         desc.fragment = &frag;
         desc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+        GpuPipelineScope scope(dev, "blit");
         blitPipeline_ = dev.CreateRenderPipeline(&desc);
     }
     return tracePipeline_ && postPipeline_ && pickPipeline_;

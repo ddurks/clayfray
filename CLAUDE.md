@@ -13,12 +13,17 @@ cmake --build build                 # configures via FetchContent on first run
 ./build/clayfray --screenshot out.png --frames 8 --size 960x540 --aa 2
 ```
 
-### Web target (Emscripten) — STAGE 1: it BUILDS, it does not yet RUN
+### Web target (Emscripten) — STAGE 2: it RUNS
 
 ```sh
 emcmake cmake -S . -B build-web -DCMAKE_BUILD_TYPE=Release
 cmake --build build-web        # -> build-web/clayfray.{html,js,wasm,data}
+python3 -m http.server -d build-web 8000   # then open localhost:8000/clayfray.html
 ```
+
+**It must be SERVED, not opened as a file.** WebGPU requires a secure origin,
+so `file://` gives "no adapter" and a black canvas. `localhost` counts as
+secure; a bare LAN IP does not.
 
 Dependencies come from Emscripten's own ports (`--use-port=sdl3
 --use-port=emdawnwebgpu`), not the FetchContent'd native Dawn — a wasm module
@@ -39,10 +44,32 @@ differs (`/shaders`, since the source tree's absolute path means nothing
 inside the module). A NEW asset needs a `--preload-file` line in CMakeLists or
 it is silently missing on web.
 
-Stage 1 deliberately stops short of running: `runWindowed` still owns a
-`while` loop and `Gpu::init` still blocks on the adapter/device futures. Stage
-2 is `emscripten_set_main_loop` plus turning those two waits into callbacks —
-and per trap 9 they are the only two left.
+**Startup is inverted on web, and that is the whole shape of stage 2.** Two
+things had to stop being straight-line code:
+
+- `Gpu::init` blocked on the adapter and device futures. It is now split into
+  stages (`createInstance` / `requestAdapter` / `reportAdapter` /
+  `requestDevice` / `finishInit`) that BOTH platforms call in the same order.
+  Native drives them with `gpuBlockOn` exactly as before; web drives them with
+  `AllowSpontaneous` continuations via `Gpu::initAsync`. Native's `initAsync`
+  just calls `init` and invokes the callback immediately, so `runWindowed` has
+  ONE startup shape on both targets.
+- `runWindowed` owned a `while` loop. The body is now `frameOnce(AppState&)`
+  over a heap-allocated `AppState`; native keeps its `while`, web hands
+  `frameOnce` to `emscripten_set_main_loop_arg` (fps 0 = rAF) and RETURNS.
+  Falling off the end of `main()` on web is correct — the registered callback
+  keeps the module alive. `AppState` is heap-allocated because `CtlRefs`
+  stores raw pointers into it and the browser callback holds a `void*`.
+
+Everything after the device callback (renderer init, asset load, uiInit) lives
+in `appStartAfterGpu`, because on web it runs a browser task or two after
+`runWindowed` has already returned.
+
+Canvas sizing: the window is created at the `#canvas` CSS size, not 1280x720,
+and re-polled every 10 frames against the last size we set (never against the
+current window size — comparing those oscillates). DPR is REPORTED in the
+`[res]` line but deliberately not multiplied in, matching the desktop's
+no-`HIGH_PIXEL_DENSITY` choice; `--res`/`look.traceW/traceH` still win.
 
 Headless flags: `--screenshot PATH --size WxH --frames N --time T --aa N`,
 `--cam AZ,EL,DIST` (inspect from another angle without serve mode),
@@ -325,6 +352,40 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    grow an existing region instead. Fighter #3 needs the per-fighter stride in
    PLAN.md ("fighters are SLICES"), not three more bindings.
 
+   **Count per ENTRY POINT, not per module — and `voxelize.wgsl` is why.** It
+   declares ELEVEN `var<storage>` across 3 groups, which looks like an
+   instant violation and is not. Every pipeline here uses an AUTO layout
+   (`desc.layout` left unset, then `GetBindGroupLayout(n)`), so Dawn derives
+   the layout from what that entry point STATICALLY REACHES through its call
+   graph. The full audit, cross-validated against the bind groups the C++
+   actually builds:
+
+   | entry point | reachable storage bindings |
+   |---|---|
+   | `voxelize.wgsl` `meshFill` | **8 of 8 — AT THE LIMIT** |
+   | `trace.wgsl` `cs` | 7 |
+   | `pick.wgsl` `cs` | 7 |
+   | `voxelize.wgsl` `meshClassify` | 6 |
+   | `redistance.wgsl` `apron` | 5 |
+   | everything else | ≤ 5 |
+
+   So the tree is portable to a core-minimum device — but `meshFill` has
+   **ZERO spare**, which was never written down and is the tighter constraint
+   than trace's one. `brick.cpp` already depends on this ("classify's auto
+   layout skips bindings it doesn't touch; fill uses all"). Adding ONE storage
+   binding reachable from `meshFill` breaks the voxelizer on any conformant
+   mobile browser while working perfectly on desktop.
+
+   The old `gpu.cpp` comment claiming "the voxelizer needs 10 storage buffers
+   per stage" was true when written and went stale at commit 3eee63d: the
+   skeleton-free rig deleted `mSkin` and `bWeights`, which `meshFill` used to
+   reach. Nothing in the tree needs raised limits now.
+
+   A rejected pipeline is otherwise SILENT — Dawn returns an invalid object
+   that every later pass no-ops on. `GpuPipelineScope` (gpu.h) wraps each
+   creation in a validation error scope so the failure names the pipeline, and
+   startup prints a banner if any failed.
+
    Keep every write-side binding of those regions `read_write`: Dawn rejects a
    buffer that is writable and read-only within one pass and tracks that per
    BUFFER, not per bound range — so one `read` binding on any region breaks
@@ -360,6 +421,28 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    sleep-spins for map callbacks that only the JS event loop can deliver, so
    it is compiled out too. Any new "wait until X arrives" loop belongs behind
    `CLAYFRAY_DEV_TOOLS`, not in the frame path.
+
+   As of stage 2 `gpuBlockOn` has **no callers left on web at all** — the
+   adapter and device requests were the last two, and they are now
+   continuations (see the Web target section). It stays because native still
+   uses it and because it is the one place a future blocking wait must go.
+
+10. **The voxelizer's triangle binning is the app's biggest CPU allocation,
+    by two orders of magnitude — and nothing about the mesh predicts it.**
+    `import: 14848 tris binned (8000190 refs)` at startup: each triangle is
+    binned into every cell its band-dilated AABB touches, and `kBand` = 12
+    voxels fans 14.8k triangles out to **8 million** cell refs, ~539 each.
+    That is 30.5 MiB for `ids` plus another 31.0 MiB for `merged` (a full
+    copy of it, alive simultaneously), i.e. a **~70 MiB startup transient**
+    on a scene whose steady state is about 5 MiB.
+
+    Desktop never noticed. The browser must reserve for it, which is what
+    `-sINITIAL_MEMORY` in CMakeLists is sized from — and wasm memory never
+    shrinks, so the module holds the transient peak for the whole session.
+    Estimating this from vertex counts is hopeless; read the `import:` line.
+    Halving it is easy and unclaimed: `merged` exists only to upload offsets
+    and ids as one buffer, and two `WriteBuffer` calls at offsets 0 and
+    `offsets.size()*4` are byte-identical.
 
 ## Verifying a conservation (M4.6) change
 
