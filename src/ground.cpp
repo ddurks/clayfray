@@ -91,10 +91,16 @@ bool GroundClay::rebuildPipelines(const std::string& src) {
     desc.compute.module = mod;
     desc.label = "ground initBase";
     desc.compute.entryPoint = "initBase";
-    initPipe_ = dev.CreateComputePipeline(&desc);
+    {
+        GpuPipelineScope scope(dev, "ground initBase");
+        initPipe_ = dev.CreateComputePipeline(&desc);
+    }
     desc.label = "ground splat";
     desc.compute.entryPoint = "splat";
-    splatPipe_ = dev.CreateComputePipeline(&desc);
+    {
+        GpuPipelineScope scope(dev, "ground splat");
+        splatPipe_ = dev.CreateComputePipeline(&desc);
+    }
     if (!initPipe_ || !splatPipe_) return false;
     buildBindGroups();
     return true;
@@ -185,6 +191,12 @@ float GroundClay::approxTopAt(float x, float z) const {
     return 0.015f + thicknessAt(x, z);
 }
 
+#if !CLAYFRAY_DEV_TOOLS
+// Snapshots are desktop-only (see the header of snapshot.cpp).
+bool GroundClay::save(SnapWriter&) { return false; }
+bool GroundClay::load(SnapReader&) { return false; }
+#else
+
 bool GroundClay::save(SnapWriter& w) {
     uint32_t meta[4] = {kN, kMirror, basePending_ ? 1u : 0u, 0};
     w.section("GMET", meta, sizeof(meta));
@@ -233,6 +245,7 @@ bool GroundClay::load(SnapReader& r) {
     pending_.clear();
     return true;
 }
+#endif // CLAYFRAY_DEV_TOOLS
 
 void GroundClay::encode(wgpu::CommandEncoder& enc) {
     if (basePending_) {

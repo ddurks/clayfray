@@ -20,6 +20,11 @@
 
 namespace {
 
+// CLAYFRAY_SHADER_DIR is the SOURCE tree's shaders/ on desktop (that is what
+// makes hot reload work) and "/shaders" on web, where the linker preloads the
+// same directory into MEMFS at that path. Either way this is a plain runtime
+// read of the same files — the web build needed no new loading path, only a
+// different root. See CMakeLists.txt.
 std::string shaderPath(const char* name) {
     return std::string(CLAYFRAY_SHADER_DIR) + "/" + name;
 }
@@ -62,6 +67,7 @@ std::string loadShader(const char* name) {
             out << line << "\n";
         }
     }
+#if CLAYFRAY_DEV_TOOLS
     // CLAYFRAY_DUMP_WGSL=1 writes what the GPU actually compiles to
     // build/wgsl_dump/. The //#constants block is generated, so a bad emit is
     // invisible in the source tree — this is the only way to see it.
@@ -73,10 +79,13 @@ std::string loadShader(const char* name) {
             f << out.str();
         }
     }
+#endif
     return out.str();
 }
 
-// Newest mtime across the shader directory; drives hot reload.
+#if CLAYFRAY_DEV_TOOLS
+// Newest mtime across the shader directory; drives hot reload. Web has no
+// editor writing into MEMFS, so the whole poll goes with the dev loop.
 long shaderDirStamp() {
     namespace fs = std::filesystem;
     long newest = 0;
@@ -92,6 +101,7 @@ long shaderDirStamp() {
     }
     return newest;
 }
+#endif
 
 wgpu::ShaderModule makeModule(wgpu::Device& device, const std::string& src,
                               const char* label) {
@@ -178,7 +188,9 @@ bool Renderer::init(Gpu& gpu, int width, int height) {
     buildTargets();
     if (!buildPipelines()) return false;
     buildBindGroups();
-    shaderDirStamp_ = shaderDirStamp();
+#if CLAYFRAY_DEV_TOOLS
+    shaderDirStamp_ = shaderDirStamp(); // hot-reload baseline
+#endif
     reuseEnabled_ = std::getenv("CLAYFRAY_NO_REUSE") == nullptr;
     return true;
 }
@@ -234,7 +246,13 @@ bool Renderer::buildPipelines() {
         desc.label = "trace";
         desc.compute.module = mod;
         desc.compute.entryPoint = "cs";
-        tracePipeline_ = dev.CreateComputePipeline(&desc);
+        {
+            // trace sits at 7 of the 8 storage buffers core WebGPU
+            // guarantees (trap 8) — if a conformant device ever rejects it,
+            // this is the line that says so instead of a black screen.
+            GpuPipelineScope scope(dev, "trace");
+            tracePipeline_ = dev.CreateComputePipeline(&desc);
+        }
         lap("trace");
     }
     {
@@ -243,7 +261,10 @@ bool Renderer::buildPipelines() {
         desc.label = "pick";
         desc.compute.module = mod;
         desc.compute.entryPoint = "cs";
-        pickPipeline_ = dev.CreateComputePipeline(&desc);
+        {
+            GpuPipelineScope scope(dev, "pick");
+            pickPipeline_ = dev.CreateComputePipeline(&desc);
+        }
         lap("pick");
     }
     {
@@ -261,6 +282,7 @@ bool Renderer::buildPipelines() {
         desc.vertex.entryPoint = "vs";
         desc.fragment = &frag;
         desc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+        GpuPipelineScope scope(dev, "post");
         postPipeline_ = dev.CreateRenderPipeline(&desc);
     }
     if (gpu_->surface) {
@@ -278,6 +300,7 @@ bool Renderer::buildPipelines() {
         desc.vertex.entryPoint = "vs";
         desc.fragment = &frag;
         desc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+        GpuPipelineScope scope(dev, "blit");
         blitPipeline_ = dev.CreateRenderPipeline(&desc);
     }
     return tracePipeline_ && postPipeline_ && pickPipeline_;
@@ -399,6 +422,9 @@ void Renderer::buildBindGroups() {
 }
 
 bool Renderer::reloadShadersIfChanged() {
+#if !CLAYFRAY_DEV_TOOLS
+    return false;
+#else
     long stamp = shaderDirStamp();
     if (stamp == shaderDirStamp_) return false;
     shaderDirStamp_ = stamp;
@@ -409,6 +435,7 @@ bool Renderer::reloadShadersIfChanged() {
     // character source may have changed; rebuild the volume from it
     brick_.requestBake();
     return true;
+#endif
 }
 
 // Digest of everything the TRACE pass reads. Deliberately excludes the three
@@ -2626,6 +2653,12 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
 }
 
 bool Renderer::screenshot(const std::string& path) {
+#if !CLAYFRAY_DEV_TOOLS
+    // Blocking texture readback + a PNG written to a filesystem the user can
+    // never open. Web capture is the browser's job, not ours.
+    (void)path;
+    return false;
+#else
     const uint32_t bytesPerRow = ((uint32_t)width_ * 4 + 255) & ~255u;
     const uint64_t bufSize = (uint64_t)bytesPerRow * height_;
 
@@ -2655,7 +2688,7 @@ bool Renderer::screenshot(const std::string& path) {
                 std::fprintf(stderr, "readback map failed: %.*s\n", (int)msg.length,
                              msg.data);
         });
-    gpu_->instance.WaitAny(f, UINT64_MAX);
+    if (!gpuBlockOn(gpu_->instance, f, "screenshot readback")) return false;
     if (!ok) return false;
 
     const uint8_t* data = (const uint8_t*)readback.GetConstMappedRange(0, bufSize);
@@ -2669,9 +2702,18 @@ bool Renderer::screenshot(const std::string& path) {
     int rc = stbi_write_png(path.c_str(), width_, height_, 4, pixels.data(), width_ * 4);
     if (rc) std::printf("wrote %s (%dx%d)\n", path.c_str(), width_, height_);
     return rc != 0;
+#endif
 }
 
 void Renderer::syncMeasurements() {
+#if !CLAYFRAY_DEV_TOOLS
+    // A sleep-spin on the main thread is a blocking wait wearing a different
+    // hat, and it would hang the tab just as hard: the map callbacks it waits
+    // for are delivered by the JS event loop this loop is refusing to return
+    // to. Only snapshots and the headless loops need the ledger pinned to a
+    // frame boundary, and both are desktop-only.
+    return;
+#else
     // Copies were submitted with the frame; they only need the event pump,
     // not more renders. Bounded wait so a lost map can't hang the app.
     for (int guard = 0; !brick_.measurementsIdle() && guard < 20000; guard++) {
@@ -2682,7 +2724,20 @@ void Renderer::syncMeasurements() {
     if (!brick_.measurementsIdle()) {
         std::fprintf(stderr, "[snap] warning: volume measurements still in flight\n");
     }
+#endif
 }
+
+#if !CLAYFRAY_DEV_TOOLS
+// Snapshots are desktop-only (see the header of snapshot.cpp). Kept as
+// definitions rather than #if'd at the call sites, so ctl's `snap` verb and
+// main's --load need no platform knowledge.
+bool Renderer::saveSnapshot(const std::string&, double, const std::string&) {
+    return false;
+}
+bool Renderer::loadSnapshot(const std::string&, double*, const std::string&) {
+    return false;
+}
+#else
 
 namespace {
 // CPU-side conservation/pose state (RCPU section). Same-build raw bytes,
@@ -2813,6 +2868,7 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
                 gobs_.size());
     return true;
 }
+#endif // CLAYFRAY_DEV_TOOLS
 
 int Renderer::addPlayer(const FighterPose& at) {
     if (playerCount_ >= kMaxPlayers) {

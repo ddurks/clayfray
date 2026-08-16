@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en-us">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>clayfray</title>
+<style>
+  /* The stock emcc shell leaves the canvas at the HTML default 300x150, which
+     is why the startup [res] line read "TRACING 160x90" — the canvas is sized
+     from CSS and nothing had sized it. Frame cost is per TRACED pixel, so this
+     file is load bearing, not decoration. */
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0a0a0c;
+    color: #b9b6ae;
+    font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  }
+  #canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    outline: none;
+    /* Chunky low-res upscaled is the intended look (resScale 0.5 + grain), so
+       do not let the browser smooth it. */
+    image-rendering: pixelated;
+  }
+  #status {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    pointer-events: none;
+    text-shadow: 0 1px 3px #000;
+  }
+  #status.hidden { display: none; }
+  /* Console output, collapsed by default: the startup log ([res], asset:,
+     rig:, import:) is the first thing to read when something looks wrong. */
+  #log {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    max-height: 30vh;
+    margin: 0;
+    padding: 6px 10px;
+    overflow-y: auto;
+    background: rgba(0,0,0,.72);
+    white-space: pre-wrap;
+    font-size: 11px;
+    display: none;
+  }
+  #log.show { display: block; }
+  #logtoggle {
+    position: fixed;
+    right: 8px; bottom: 8px;
+    padding: 4px 9px;
+    background: rgba(0,0,0,.6);
+    border: 1px solid #3a3a40;
+    border-radius: 4px;
+    color: #b9b6ae;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+<div id="status">loading…</div>
+<pre id="log"></pre>
+<button id="logtoggle">log</button>
+<script>
+  const statusEl = document.getElementById('status');
+  const logEl = document.getElementById('log');
+  const canvas = document.getElementById('canvas');
+
+  document.getElementById('logtoggle').onclick = () => logEl.classList.toggle('show');
+
+  // Keep the drawing buffer in step with the CSS box. The C++ side polls the
+  // canvas size every few frames and resizes its swapchain to match, so this
+  // only has to keep the backing store honest.
+  function sizeCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width  = Math.max(1, Math.round(canvas.clientWidth  * dpr));
+    canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  }
+  window.addEventListener('resize', sizeCanvas);
+  sizeCanvas();
+
+  // Distinguish the two failures, because they have different fixes and
+  // conflating them sends people chasing TLS when the real cause is a flag.
+  // http://localhost IS a secure origin; file:// is not.
+  if (!window.isSecureContext) {
+    statusEl.innerHTML =
+      '<b>Insecure origin.</b><br>WebGPU needs https:// or http://localhost' +
+      '<br>(a file:// URL will not work).';
+    logEl.classList.add('show');
+  } else if (!navigator.gpu) {
+    const safari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    statusEl.innerHTML = safari
+      ? '<b>WebGPU is switched off in this Safari.</b><br>' +
+        'Safari &gt; Settings &gt; Advanced &gt; "Show features for web developers",' +
+        '<br>then Develop &gt; Feature Flags &gt; WebGPU. Reload after enabling.' +
+        '<br><br>Chrome works without any of that.'
+      : '<b>This browser has no WebGPU.</b><br>' +
+        'Chrome/Edge 113+, or Safari 26+ with the WebGPU feature flag on.';
+    logEl.classList.add('show');
+  }
+
+  var Module = {
+    canvas,
+    print: (...a) => {
+      const line = a.join(' ');
+      console.log(line);
+      logEl.textContent += line + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    },
+    printErr: (...a) => {
+      const line = a.join(' ');
+      console.error(line);
+      logEl.textContent += line + '\n';
+      logEl.classList.add('show'); // an error is worth showing unprompted
+    },
+    setStatus: (t) => {
+      if (!t) { statusEl.classList.add('hidden'); return; }
+      statusEl.classList.remove('hidden');
+      statusEl.textContent = t;
+    },
+    onRuntimeInitialized: () => statusEl.classList.add('hidden'),
+  };
+
+  window.onerror = () => {
+    statusEl.classList.remove('hidden');
+    statusEl.textContent = 'crashed — see the log';
+    logEl.classList.add('show');
+  };
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

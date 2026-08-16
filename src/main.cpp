@@ -12,6 +12,11 @@
 #include <thread>
 #include <vector>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/html5.h>
+#endif
+
 #include "asset.h"
 #include "camera.h"
 #include "ctl.h"
@@ -219,7 +224,13 @@ long poseTickOf(double t) { return (long)std::floor(t * 12.0 + 1e-9); }
 
 // break-on-condition (ctl `break ledger T`): pause instead of exiting so
 // the state is inspectable via stats/shot/snap. One-shot; re-arm to renew.
+// Only ctl can arm it, so it goes where ctl goes.
 void checkBreak(CtlServer& ctl, const Renderer& renderer, SimClock& clock) {
+#if !CLAYFRAY_DEV_TOOLS
+    (void)ctl;
+    (void)renderer;
+    (void)clock;
+#else
     if (ctl.breakLedgerTol < 0.f) return;
     const SplootStats& s = renderer.sploot();
     float res = (s.carved - (s.deposited + s.inFlight + s.debt)) * 1e6f;
@@ -231,6 +242,7 @@ void checkBreak(CtlServer& ctl, const Renderer& renderer, SimClock& clock) {
                      res, ctl.breakLedgerTol);
         ctl.breakLedgerTol = -1.f;
     }
+#endif
 }
 
 std::string gCharacterPath; // --character; empty = built-in analytic fighter
@@ -277,6 +289,12 @@ struct RunOpts {
     int exitAfter = 0;           // windowed smoke test
 };
 
+#if CLAYFRAY_DEV_TOOLS
+// Every headless mode (--screenshot, --carve-test, --serve, --replay) is a
+// desktop harness: no swapchain, a fixed 1/60 s step regardless of wall clock,
+// and GPU backpressure held by blocking on the queue. A browser has none of
+// those levers — it hands you a canvas and a frame callback — so the web
+// target builds the windowed path only.
 int runHeadless(const RunOpts& o) {
     Gpu gpu;
     if (!gpu.init(nullptr)) return 1;
@@ -509,27 +527,81 @@ int runHeadless(const RunOpts& o) {
     }
     return 0;
 }
+#endif // CLAYFRAY_DEV_TOOLS
 
-int runWindowed(const RunOpts& o) {
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
-        std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-        return 1;
-    }
-    // no HIGH_PIXEL_DENSITY: retina-native quadruples the traced pixels for
-    // ~4x the frame time, and the film look hides the difference
-    SDL_Window* window = SDL_CreateWindow("clayfray", 1280, 720, SDL_WINDOW_RESIZABLE);
-    if (!window) {
-        std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
-        return 1;
-    }
-
+// Everything one frame of the windowed app touches, in one object with a
+// STABLE address.
+//
+// Native could keep these as locals in runWindowed — the `while` loop is right
+// there. A browser cannot: it owns the loop, calls us back one frame at a
+// time, and runWindowed has long since returned by the first frame. So the
+// state is heap-allocated and both platforms drive the same frameOnce() over
+// it. Stable address matters twice over: CtlRefs stores raw pointers into
+// these members, and the emscripten callback holds a void* to the whole thing.
+struct AppState {
+    RunOpts o;
+    SDL_Window* window = nullptr;
     Gpu gpu;
-    if (!gpu.init(window)) return 1;
-    int pw = 0, ph = 0;
-    SDL_GetWindowSizeInPixels(window, &pw, &ph);
-    gpu.configureSurface(pw, ph);
-
+    Renderer renderer;
     LookParams look;
+    GameState game;
+    OrbitCamera cam;
+    BrushState brush;
+    SimClock clock;
+    CtlServer ctl;
+
+    double simT = 0.0;
+    bool ctlQuit = false;
+    bool running = true;
+    float fps = 0.f;
+    FpsMeter fpsMeter;
+
+    int pw = 0, ph = 0;            // backing (pixel) size of the window
+    long lastCamPose = -1;
+    uint64_t lastTraced = 0, lastPresented = 0;
+    float reuseSkipPct = 0.f;
+    uint64_t prevNs = 0;
+    int frameCounter = 0;
+    int screenshotCounter = 0;
+#ifdef __EMSCRIPTEN__
+    // last canvas CSS size we resized to, so the poll below reacts to the PAGE
+    // changing size and not to its own previous write (which would oscillate)
+    int lastCssW = 0, lastCssH = 0;
+#endif
+};
+
+#ifdef __EMSCRIPTEN__
+// The canvas decides the resolution on web, not a hardcoded 1280x720: the
+// element is laid out by the page's CSS and may be any size at all.
+//
+// DPR is REPORTED but deliberately NOT multiplied into the backing store, for
+// the same reason SDL_CreateWindow does not pass SDL_WINDOW_HIGH_PIXEL_DENSITY
+// on the desktop: tracing at retina density quadruples the traced pixels for
+// ~4x the frame time, and the film grain hides the difference. Reporting it
+// anyway is what keeps the `[res]` line honest — a 2x display genuinely is
+// showing an upscaled image, and that must be visible in the log rather than
+// inferred.
+bool webCanvasCssSize(int& w, int& h, double& dpr) {
+    double cw = 0, ch = 0;
+    dpr = emscripten_get_device_pixel_ratio();
+    if (emscripten_get_element_css_size("#canvas", &cw, &ch) != EMSCRIPTEN_RESULT_SUCCESS)
+        return false;
+    if (cw < 1 || ch < 1) return false;
+    w = (int)cw;
+    h = (int)ch;
+    return true;
+}
+#endif
+
+// Post-GPU startup: everything that needs a device. Split out of runWindowed
+// because on web it runs from the device callback, a browser task or two after
+// runWindowed returned (see Gpu::initAsync).
+bool appStartAfterGpu(AppState& s) {
+    const RunOpts& o = s.o;
+    SDL_GetWindowSizeInPixels(s.window, &s.pw, &s.ph);
+    s.gpu.configureSurface(s.pw, s.ph);
+
+    LookParams& look = s.look;
     look.traceW = o.traceW;
     look.traceH = o.traceH;
     // Trace size is decided ONCE here and reported, rather than drifting in
@@ -537,9 +609,9 @@ int runWindowed(const RunOpts& o) {
     // trace at full window size and a --res run would not honour the flag
     // until frame 10.
     const int traceW0 = look.traceW > 0 ? look.traceW
-                                        : std::max(160, (int)(pw * look.resScale));
+                                        : std::max(160, (int)(s.pw * look.resScale));
     const int traceH0 = look.traceH > 0 ? look.traceH
-                                        : std::max(90, (int)(ph * look.resScale));
+                                        : std::max(90, (int)(s.ph * look.resScale));
     {
         // ALWAYS report what is actually traced. Frame cost is per traced
         // pixel, and the window size does not tell you that: SDL reports
@@ -547,60 +619,101 @@ int runWindowed(const RunOpts& o) {
         // display, and resScale then divides them. Two machines "both at
         // 1280x720" can be tracing 4x different pixel counts, which silently
         // invalidates every timing comparison between them.
+        //
+        // The browser adds a third way to be wrong — the canvas is sized by
+        // the page's CSS and the display has its own pixel ratio — so web
+        // appends the DPR. Without it, "960x540 backing" on a 2x laptop reads
+        // as if it were 1920x1080 of real pixels when it is an upscale.
         int lw = 0, lh = 0;
-        SDL_GetWindowSize(window, &lw, &lh);
-        std::printf("[res] window %dx%d logical, %dx%d backing -> TRACING %dx%d%s\n",
-                    lw, lh, pw, ph, traceW0, traceH0,
+        SDL_GetWindowSize(s.window, &lw, &lh);
+        char note[64] = "";
+#ifdef __EMSCRIPTEN__
+        std::snprintf(note, sizeof(note), ", canvas dpr %.2f (not applied)",
+                      emscripten_get_device_pixel_ratio());
+#endif
+        std::printf("[res] window %dx%d logical, %dx%d backing%s -> TRACING %dx%d%s\n",
+                    lw, lh, s.pw, s.ph, note, traceW0, traceH0,
                     look.traceW > 0 ? " (pinned by --res)" : " (resScale)");
         std::fflush(stdout);
     }
 
-    Renderer renderer;
-    if (!renderer.init(gpu, traceW0, traceH0)) return 1;
-    if (!loadCharacterInto(renderer)) return 1;
+    if (!s.renderer.init(s.gpu, traceW0, traceH0)) return false;
+    if (!loadCharacterInto(s.renderer)) return false;
     // player 2: an identical fighter standing in front, facing the hero
-    renderer.addPlayer(FighterPose{{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false});
-    if (!uiInit(window, gpu)) return 1;
+    s.renderer.addPlayer(FighterPose{{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false});
+    if (!uiInit(s.window, s.gpu)) return false;
 
-    GameState game;
-    OrbitCamera cam;
-    BrushState brush;
-
-    SimClock clock;
-    double simT = 0.0;
-    bool ctlQuit = false;
-    float fps = 0.f;
-    FpsMeter fpsMeter;
-    CtlServer ctl;
     CtlRefs refs;
-    refs.look = &look;
-    refs.cam = &cam;
-    refs.brush = &brush;
-    refs.fighter = &game.fighter;
-    refs.renderer = &renderer;
-    refs.clock = &clock;
-    refs.simT = &simT;
-    refs.fps = &fps;
-    refs.wantQuit = &ctlQuit;
+    refs.look = &s.look;
+    refs.cam = &s.cam;
+    refs.brush = &s.brush;
+    refs.fighter = &s.game.fighter;
+    refs.renderer = &s.renderer;
+    refs.clock = &s.clock;
+    refs.simT = &s.simT;
+    refs.fps = &s.fps;
+    refs.wantQuit = &s.ctlQuit;
     refs.charPath = gCharacterPath;
-    ctl.init("ctl", refs);
+    s.ctl.init(CLAYFRAY_DEV_TOOLS ? "ctl" : "", refs);
 
+#if CLAYFRAY_DEV_TOOLS
     if (!o.loadName.empty()) {
-        if (!renderer.loadSnapshot(snapFilePath(o.loadName), &simT, gCharacterPath)) {
-            return 2;
+        if (!s.renderer.loadSnapshot(snapFilePath(o.loadName), &s.simT, gCharacterPath)) {
+            return false;
         }
-        game.tickCount = (uint64_t)std::llround(simT * kTickRate);
+        s.game.tickCount = (uint64_t)std::llround(s.simT * kTickRate);
+    }
+#endif
+
+    // A pipeline that failed to create leaves an invalid object that every
+    // later pass silently no-ops on, so say so ONCE here rather than let the
+    // user stare at a black canvas. The scope callbacks are async, so this
+    // catches whatever has been delivered by now; the per-pipeline message
+    // from GpuPipelineScope is the authoritative one either way.
+    if (gpuAnyPipelineFailed()) {
+        std::fprintf(stderr,
+                     "[startup] at least one pipeline failed to create — the "
+                     "render will be black or partial. See the [wgpu] lines "
+                     "above.\n");
     }
 
-    long lastCamPose = -1;
-    uint64_t lastTraced = 0, lastPresented = 0;
-    float reuseSkipPct = 0.f;
-    uint64_t prevNs = SDL_GetTicksNS();
-    int frameCounter = 0;
-    int screenshotCounter = 0;
-    bool running = true;
+    s.prevNs = SDL_GetTicksNS();
+    return true;
+}
 
-    while (running && !ctlQuit) {
+// ONE frame. Native calls this from its `while`; the browser calls it from
+// requestAnimationFrame. Nothing in here may block — see platform.h note 1.
+void frameOnce(AppState& s) {
+    // Local aliases keep the body below textually identical to the loop this
+    // was hoisted out of, which is what makes the restructure reviewable.
+    SDL_Window* window = s.window;
+    Gpu& gpu = s.gpu;
+    Renderer& renderer = s.renderer;
+    LookParams& look = s.look;
+    GameState& game = s.game;
+    OrbitCamera& cam = s.cam;
+    BrushState& brush = s.brush;
+    SimClock& clock = s.clock;
+    CtlServer& ctl = s.ctl;
+    const RunOpts& o = s.o;
+    bool& running = s.running;
+    bool& ctlQuit = s.ctlQuit;
+    int& pw = s.pw;
+    int& ph = s.ph;
+    double& simT = s.simT;
+    float& fps = s.fps;
+    FpsMeter& fpsMeter = s.fpsMeter;
+    long& lastCamPose = s.lastCamPose;
+    uint64_t& lastTraced = s.lastTraced;
+    uint64_t& lastPresented = s.lastPresented;
+    float& reuseSkipPct = s.reuseSkipPct;
+    uint64_t& prevNs = s.prevNs;
+    int& frameCounter = s.frameCounter;
+    int& screenshotCounter = s.screenshotCounter;
+    (void)ctlQuit;
+    (void)screenshotCounter;
+
+    {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             uiProcessEvent(&ev);
@@ -700,7 +813,12 @@ int runWindowed(const RunOpts& o) {
         }
         fps = fpsMeter.tick(frameDt);
 
-        if (++frameCounter % 30 == 0) renderer.reloadShadersIfChanged();
+        frameCounter++;
+#if CLAYFRAY_DEV_TOOLS
+        // shader hot reload: a stat() sweep of the source tree's shaders/,
+        // which on web would be a sweep of read-only preloaded MEMFS
+        if (frameCounter % 30 == 0) renderer.reloadShadersIfChanged();
+#endif
         if (o.exitAfter > 0 && frameCounter >= o.exitAfter) running = false;
 
         // internal resolution scale (throttled so slider drags don't thrash
@@ -709,6 +827,29 @@ int runWindowed(const RunOpts& o) {
         // took the window to 0.31 of native for a frame rate the constant 0.5
         // already reaches, and the resolution switch itself was visible.
         if (frameCounter % 10 == 0) {
+#ifdef __EMSCRIPTEN__
+            // The page can resize the canvas at any time (window resize, a
+            // responsive layout, devtools opening) and that arrives as a CSS
+            // change, not as an SDL event we can rely on. Poll it on the same
+            // throttle as the trace-size check.
+            //
+            // Compared against the last size WE acted on, never against the
+            // current window size: SDL_SetWindowSize writes the canvas back,
+            // so comparing the two would let a rounding difference oscillate
+            // forever, resizing render targets every 10 frames.
+            {
+                int cw = 0, ch = 0;
+                double dpr = 1.0;
+                if (webCanvasCssSize(cw, ch, dpr) &&
+                    (cw != s.lastCssW || ch != s.lastCssH)) {
+                    s.lastCssW = cw;
+                    s.lastCssH = ch;
+                    SDL_SetWindowSize(window, cw, ch);
+                    SDL_GetWindowSizeInPixels(window, &pw, &ph);
+                    gpu.configureSurface(pw, ph);
+                }
+            }
+#endif
             // A pinned size wins over resScale: frame cost is per traced
             // pixel, so this is what makes two machines comparable.
             int tw = look.traceW > 0 ? look.traceW
@@ -774,27 +915,135 @@ int runWindowed(const RunOpts& o) {
             frameLook.sword.pos[1] += lift;
             renderer.render(cam, frameLook, makeFrameInfo(simT, 1), view,
                             [](wgpu::RenderPassEncoder& pass) { uiRender(pass); });
+#ifndef __EMSCRIPTEN__
+            // The browser presents the canvas itself when the rAF callback
+            // returns, so there is nothing to call — and emdawnwebgpu makes
+            // that explicit: wgpuSurfacePresent is a hard abort() there ("use
+            // requestAnimationFrame via html5.h instead"), not a no-op. Same
+            // shape as trap 9: browser-illegal calls kill the module rather
+            // than failing softly.
             gpu.surface.Present();
+#endif
         } else {
             // Skipped frame (e.g. mid-resize); ImGui frame must still be closed out.
             ImGui::Render();
         }
 
+#if CLAYFRAY_DEV_TOOLS
         if (wantScreenshot) {
             char path[64];
             std::snprintf(path, sizeof(path), "lookdev/capture_%03d.png",
                           screenshotCounter++);
             renderer.screenshot(path);
         }
+#else
+        (void)wantScreenshot;
+        (void)screenshotCounter;
+#endif
         gpu.processEvents();
         ctl.finishFrame();
         checkBreak(ctl, renderer, clock);
     }
+}
 
+void appShutdown(AppState& s) {
     uiShutdown();
-    SDL_DestroyWindow(window);
+    SDL_DestroyWindow(s.window);
     SDL_Quit();
+}
+
+#ifdef __EMSCRIPTEN__
+// The browser's frame callback. emscripten_set_main_loop_arg with fps 0 means
+// requestAnimationFrame, i.e. the display's own cadence — which is also the
+// backpressure that Gpu::waitForGpu provides for the headless desktop loops.
+void webFrame(void* userData) {
+    AppState& s = *static_cast<AppState*>(userData);
+    frameOnce(s);
+    if (!s.running || s.ctlQuit) {
+        emscripten_cancel_main_loop();
+        appShutdown(s);
+    }
+}
+#endif
+
+int runWindowed(const RunOpts& o) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+        std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    // Desktop opens a 1280x720 window; the browser has no such freedom — the
+    // canvas is however big the page's CSS made it, and 1280x720 would either
+    // overflow the layout or be silently stretched. Ask the element.
+    int winW = 1280, winH = 720;
+#ifdef __EMSCRIPTEN__
+    {
+        int cw = 0, ch = 0;
+        double dpr = 1.0;
+        if (webCanvasCssSize(cw, ch, dpr)) {
+            winW = cw;
+            winH = ch;
+        } else {
+            std::fprintf(stderr,
+                         "[web] could not read #canvas CSS size; falling back "
+                         "to %dx%d\n",
+                         winW, winH);
+        }
+    }
+#endif
+    // no HIGH_PIXEL_DENSITY: retina-native quadruples the traced pixels for
+    // ~4x the frame time, and the film look hides the difference
+    SDL_Window* window = SDL_CreateWindow("clayfray", winW, winH, SDL_WINDOW_RESIZABLE);
+    if (!window) {
+        std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    // Heap, not stack: on web this outlives runWindowed by the whole session
+    // (see AppState). Native deletes it at the bottom; web never does, because
+    // the tab closing is the only end of life there.
+    AppState* s = new AppState();
+    s->o = o;
+    s->window = window;
+#ifdef __EMSCRIPTEN__
+    s->lastCssW = winW;
+    s->lastCssH = winH;
+#endif
+
+#if CLAYFRAY_HAS_BLOCKING_GPU_WAIT
+    // Native: initAsync completes synchronously, so this reads exactly like
+    // the straight-line startup it replaced.
+    bool gpuOk = false;
+    s->gpu.initAsync(window, [&gpuOk](bool ok) { gpuOk = ok; });
+    if (!gpuOk || !appStartAfterGpu(*s)) {
+        delete s;
+        return 1;
+    }
+    while (s->running && !s->ctlQuit) frameOnce(*s);
+    appShutdown(*s);
+    delete s;
     return 0;
+#else
+    // Browser: RETURN, don't loop. Everything downstream of the device runs
+    // from the callback, and the frame loop is handed to the browser. Falling
+    // off the end of main() here is correct and expected — the module stays
+    // alive because emscripten_set_main_loop_arg registered a callback.
+    s->gpu.initAsync(window, [s](bool ok) {
+        if (!ok) {
+            std::fprintf(stderr, "[web] GPU init failed; nothing will render\n");
+            return;
+        }
+        if (!appStartAfterGpu(*s)) {
+            std::fprintf(stderr, "[web] renderer init failed; nothing will render\n");
+            return;
+        }
+        // fps 0 = requestAnimationFrame; simulate_infinite_loop false = let
+        // runWindowed's caller return normally rather than throwing the
+        // unwind exception, which would be caught as an error by the shell.
+        emscripten_set_main_loop_arg(webFrame, s, 0, /*simulate_infinite_loop=*/false);
+    });
+    return 0;
+#endif
 }
 
 } // namespace
@@ -875,8 +1124,19 @@ int main(int argc, char** argv) {
         if (!aaSet) o.aa = 1;
     }
 
+#if CLAYFRAY_DEV_TOOLS
     if (!o.screenshotPath.empty() || o.serve || !o.replayPath.empty()) {
         return runHeadless(o);
     }
+#else
+    // Flag PARSING stays identical on web so the two builds cannot drift over
+    // what a flag means; only the modes that need a real OS are unreachable.
+    if (!o.screenshotPath.empty() || o.serve || !o.replayPath.empty() ||
+        !o.loadName.empty()) {
+        std::fprintf(stderr,
+                     "[web] headless modes and snapshots are desktop-only; "
+                     "running windowed\n");
+    }
+#endif
     return runWindowed(o);
 }

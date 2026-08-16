@@ -8,6 +8,31 @@
 
 #include "renderer.h"
 
+#if !CLAYFRAY_DEV_TOOLS
+// The ctl port is the desktop agent loop: it scans a directory EVERY FRAME for
+// command files and writes responses back. Under Emscripten that directory is
+// MEMFS, so nothing can ever appear in it and nothing can read what we write —
+// the scan would be a pure per-frame cost for a channel with no other end.
+// Journal replay goes with it (same execute() path, and its input is a file).
+//
+// The class survives as no-ops so both run loops keep their unconditional
+// ctl.poll()/finishFrame() calls; SimClock, which is header-only and is real
+// gameplay state, is untouched.
+bool loadJournal(const std::string&, std::vector<JournalEntry>&) { return false; }
+std::string snapFilePath(const std::string& name) { return name; }
+void CtlServer::init(const std::string&, const CtlRefs& refs) { refs_ = refs; }
+void CtlServer::poll(long) { activity_ = false; }
+void CtlServer::finishFrame() {}
+bool CtlServer::execute(const std::string&, long, std::string& out) {
+    out += "err ctl is not built into the web target\n";
+    return false;
+}
+bool CtlServer::startRecord(const std::string&) { return false; }
+void CtlServer::stopRecord() {}
+void CtlServer::recordEdit(const BrickEdit&, long) {}
+
+#else
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -489,3 +514,5 @@ void CtlServer::finishFrame() {
     }
     pending_.clear();
 }
+
+#endif // CLAYFRAY_DEV_TOOLS

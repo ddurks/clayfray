@@ -22,3 +22,6 @@ snapshots/
 
 # agent worktrees (transient)
 .claude/worktrees/
+
+# emscripten build output
+build-web/
