@@ -86,6 +86,11 @@ fn groundClayDist(p: vec3f) -> f32 {
 // This is the SHADING HOT PATH: 5 AO taps + up to 44 penumbra steps per lit
 // pixel. The early-outs skip the fetch; the thickness gate keeps the empty
 // footprint from occluding the floor (the whole-arena darkening bug).
+// What a clay-free column reports as its distance to clay. Large enough that
+// the penumbra term (min(res, k*d/t)) leaves bare floor alone, which is the
+// whole point of the branch that uses it.
+const G_CLAY_FAR: f32 = 1.0;
+
 fn groundClaySmooth(p: vec3f) -> f32 {
   let maxTop = u.groundMeta.w;
   if (maxTop <= 0.0) {
@@ -103,9 +108,27 @@ fn groundClaySmooth(p: vec3f) -> f32 {
   if (bound > 0.15) {
     return bound;
   }
-  // no clay here: report far so bare floor keeps its own AO / shadows
+  // No clay in THIS column: report far, so bare floor keeps its own AO and
+  // shadows. This used to `return max(bound, 0.05)`, which is the opposite of
+  // what the comment says and is what made shadows creep across the scene as
+  // gobs piled up:
+  //
+  //   `bound` is p.y - maxTop, and maxTop only ever GROWS (ground.cpp keeps
+  //   maxH_ = max(maxH_, ...), so a pile raises it permanently). Once any pile
+  //   is tall, `bound` is negative for everything near the floor, the cheap
+  //   `bound > 0.15` exit above stops firing over more and more of the scene,
+  //   and all of it lands here and reports a CONSTANT 5 cm to clay. The
+  //   penumbra term is min(res, k * d / t), so a fixed tiny d darkens
+  //   everything — and because maxH_ never falls, it never recovers.
+  //
+  // The honest answer for a clay-free column is "no clay here", and this is
+  // the SMOOTH field (trap 3) — AO and penumbra only, never marched — so it
+  // may report far without any risk of overstepping a surface. The cost is
+  // that a pile no longer shadows the bare floor immediately beside it; a
+  // lateral distance-to-clay field would fix that properly and is the right
+  // follow-up if the contact shadow is missed.
   if (groundThicknessAt(p.xz) < G_THMIN) {
-    return max(bound, 0.05);
+    return max(bound, G_CLAY_FAR);
   }
   return p.y - groundTopAt(p.xz);
 }
