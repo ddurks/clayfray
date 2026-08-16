@@ -265,10 +265,17 @@ fn mapPenumbra(p: vec3f) -> f32 {
 // steps on barely move the result. 22 at 1.28 covers the same distance for
 // half as many mapPenumbra() calls.
 //
-// This is the single most expensive term in the frame: measured at 25.9 ms of
-// 70 ms (37%), because it is ~half of all field evaluations per shaded pixel
-// (22 shadow vs ~35 march + 4 normal + 5 AO) and mapPenumbra is the heaviest
-// variant — it adds charProxy's 16-capsule smin on top of the two bodies.
+// It is ~half of all field evaluations per shaded pixel (22 shadow vs ~35
+// march + 4 normal + 5 AO) and mapPenumbra is the heaviest variant — it adds
+// charProxy's capsule smin on top of the bodies.
+//
+// It was "the single most expensive term in the frame, 25.9 ms of 70 (37%)".
+// That was measured before the affine rig, when per-sample skinning made
+// every field evaluation dear. Re-measured at 640x360: the WHOLE of shade()
+// — this plus AO, albedo, lighting and grain — is ~6.0 ms of a 22.0 ms
+// moving frame (27%), and the MARCH is now the biggest single item at ~9.9.
+// Cheapening this alone can no longer buy much; cheapening a field
+// evaluation buys everywhere.
 fn softShadow(ro: vec3f, rd: vec3f, tmax: f32) -> f32 {
   var res = 1.0;
   var t = 0.02;

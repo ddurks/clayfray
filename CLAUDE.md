@@ -306,9 +306,55 @@ Iteration rules of thumb:
   ablations "worth" 16 and 12 ms were worth 3 and 0 once measured warm.
   `CLAYFRAY_NO_REUSE=1` gives the MOVING cost (what governs frame rate
   whenever anything is in motion); without it you get the idle cost.
-- Env-var ablations (`CLAYFRAY_NO_PIECES`, `_AO`, `_SHADOWK`) don't touch
-  shader source, so they never hit the cold-compile trap. Prefer them for
-  cost attribution; reach for a shader edit only to test a fix.
+- Env-var ablations don't touch shader source, so they never hit the
+  cold-compile trap — but **know which ones remove WORK and which only remove
+  the LOOK**, because the difference reads as "this term is free":
+  - `CLAYFRAY_AO` / `_DETAIL` scale the RESULT, not the cost. `calcAO` runs
+    all five `mapLoose` taps whatever `u.ambient.w` is, and the grain
+    evaluates its noise gradients before multiplying by `u.material.x`. They
+    measure ~0% and tell you nothing about price.
+  - `CLAYFRAY_DEBUG_NORMALS=1` DOES: it skips `shade()` entirely, so
+    base-minus-this is the whole shading bill (AO + soft shadow + albedo +
+    lighting + grain).
+  - `CLAYFRAY_NO_PIECES=1` is not a clean articulation ablation either — it
+    draws the rest volume UNPOSED, i.e. three brushes side by side, which is
+    more clay on screen. It measures SLOWER than posed.
+  - `CLAYFRAY_SHADOWK` only moves `softShadow`'s early-out; at k=64 it was
+    within noise, so it will not split AO from shadows. That split needs a
+    shader edit.
+  These are applied by `applyLookEnv()` and reach BOTH the windowed and
+  headless paths. They used to be read inside `runHeadless` only, which made
+  every ablation silently a no-op under `--exit-after` — the very flag
+  `tools/fairbench.sh` drives.
+- **THIS MACHINE THROTTLES, AND IT IS BIGGER THAN ANY EFFECT YOU ARE HUNTING.**
+  Measured across one session: an identical `moving` baseline drifted 22.0 ->
+  23.5 -> 23.6 -> 30.2 ms, and inside a single run the samples went 21.6 ->
+  31.0. A 40 s cooldown was not enough to recover. So: never compare a number
+  from one invocation against a number from another, quote absolutes only
+  from a cold first run, and treat the WITHIN-RUN interleaved delta as the
+  only trustworthy figure. `tools/fairbench.sh` exists for exactly this.
+- **Where the frame actually goes** (M2, 640x360, `--res 640x360`, cold
+  machine, windowed loop). Idle vs moving differ only by the trace, so the
+  reuse ratio splits them: `idle = R + 0.2T`, `moving = R + T`.
+
+  | | ms | share of a moving frame |
+  |---|---|---|
+  | moving (every frame traces) | **22.0** (45 fps) | |
+  | idle (reuse on, 80% skipped) | 9.3 (108 fps) | |
+  | -> trace `T` | 15.9 | 72% |
+  | ---- of which `shade()` | ~6.0 | 27% |
+  | ---- of which march + normals | ~9.9 | 45% |
+  | -> everything else `R` | 6.1 | 28% |
+
+  `R` is post + blit + ImGui + present + sim + CPU, and 6.1 ms of it at this
+  resolution is the surprise — it is a bigger line item than shading.
+  **The march is the single biggest cost**, not the shadows: the old note in
+  trace.wgsl calling `softShadow` "the single most expensive term at 25.9 of
+  70 ms" predates the affine rig, which deleted the per-sample skinning that
+  made every field evaluation expensive. Articulation is now free.
+
+  Idle's 108 fps is not 108 images: the pose grid is 12 Hz, so a still camera
+  produces 12 unique frames a second and ~96 duplicates.
 - **Conditional skips do not pay here.** Several "skip the expensive path
   when X" experiments came out image-identical and SLOWER (58.5 -> 59.7,
   60.1, 60.7). A branch only helps if every lane in the wavefront takes it,

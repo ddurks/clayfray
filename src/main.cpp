@@ -261,6 +261,36 @@ void checkBreak(CtlServer& ctl, const Renderer& renderer, SimClock& clock) {
 #endif
 }
 
+// Debug/ablation overrides from the environment, applied to BOTH the windowed
+// and headless paths.
+//
+// These used to live inline in runHeadless, which made them a trap rather than
+// a tool: the windowed loop is the one that ships, and `--exit-after` (what
+// tools/fairbench.sh drives) never saw them — so an ablation would silently
+// measure nothing and read as "this term is free".
+//
+// NOTE WHAT THEY DO AND DO NOT ABLATE. `aoStrength` and `detailAmount` scale
+// the RESULT, not the work: calcAO still runs all five mapLoose taps and the
+// grain still evaluates its noise gradients, they just get multiplied by zero.
+// Use them to see a look, not to price one. The ones that genuinely remove
+// GPU work are `debugMode` (1 skips shade() entirely — no AO, no soft shadow,
+// no albedo, no lighting) and a large `shadowSoft`, which makes softShadow's
+// 22-step loop hit its early-out sooner.
+void applyLookEnv(LookParams& look) {
+    if (std::getenv("CLAYFRAY_DEBUG_FLAT")) {
+        look.aoStrength = 0.f;
+        look.detailAmount = 0.f;
+        look.shadowSoft = 32.f;
+    }
+    if (std::getenv("CLAYFRAY_DEBUG_NORMALS")) look.debugMode = 1.f;
+    if (std::getenv("CLAYFRAY_NO_ANIM")) look.animPlay = false;
+    if (std::getenv("CLAYFRAY_DEBUG_FLATALBEDO")) look.debugMode = 2.f;
+    if (std::getenv("CLAYFRAY_DEBUG_GRAD")) look.debugMode = 3.f;
+    if (const char* k = std::getenv("CLAYFRAY_SHADOWK")) look.shadowSoft = (float)atof(k);
+    if (const char* a = std::getenv("CLAYFRAY_AO")) look.aoStrength = (float)atof(a);
+    if (const char* d = std::getenv("CLAYFRAY_DETAIL")) look.detailAmount = (float)atof(d);
+}
+
 std::string gCharacterPath; // --character; empty = built-in analytic fighter
 
 bool loadCharacterInto(Renderer& renderer) {
@@ -374,18 +404,7 @@ int runHeadless(const RunOpts& o) {
     LookParams look;
     look.traceW = o.traceW;
     look.traceH = o.traceH;
-    if (std::getenv("CLAYFRAY_DEBUG_FLAT")) {
-        look.aoStrength = 0.f;
-        look.detailAmount = 0.f;
-        look.shadowSoft = 32.f;
-    }
-    if (std::getenv("CLAYFRAY_DEBUG_NORMALS")) look.debugMode = 1.f;
-    if (std::getenv("CLAYFRAY_NO_ANIM")) look.animPlay = false;
-    if (std::getenv("CLAYFRAY_DEBUG_FLATALBEDO")) look.debugMode = 2.f;
-    if (std::getenv("CLAYFRAY_DEBUG_GRAD")) look.debugMode = 3.f;
-    if (const char* k = std::getenv("CLAYFRAY_SHADOWK")) look.shadowSoft = (float)atof(k);
-    if (const char* a = std::getenv("CLAYFRAY_AO")) look.aoStrength = (float)atof(a);
-    if (const char* d = std::getenv("CLAYFRAY_DETAIL")) look.detailAmount = (float)atof(d);
+    applyLookEnv(look);
 
     double t = o.startTime;
     SimClock clock;
@@ -648,6 +667,10 @@ bool appStartAfterGpu(AppState& s) {
     LookParams& look = s.look;
     look.traceW = o.traceW;
     look.traceH = o.traceH;
+    // Same debug/ablation overrides the headless path gets. The windowed loop
+    // is the one that ships and the one tools/fairbench.sh measures, so an
+    // ablation it cannot see is worse than no ablation — it reads as "free".
+    applyLookEnv(look);
     // Trace size is decided ONCE here and reported, rather than drifting in
     // from the every-10-frames resize below: the first frames would otherwise
     // trace at full window size and a --res run would not honour the flag
