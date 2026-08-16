@@ -276,6 +276,34 @@ void checkBreak(CtlServer& ctl, const Renderer& renderer, SimClock& clock) {
 // GPU work are `debugMode` (1 skips shade() entirely — no AO, no soft shadow,
 // no albedo, no lighting) and a large `shadowSoft`, which makes softShadow's
 // 22-step loop hit its early-out sooner.
+// How many fighters to put on the field, for cost attribution.
+// CLAYFRAY_PLAYERS=1 leaves the hero alone; the default is 2.
+//
+// This exists because "what does one more body cost in the march?" is the
+// question that decides whether the player cap is a rendering problem or a
+// memory one, and there was no way to ask it: every path hardcoded one
+// addPlayer() call. Clamped to kMaxPlayers.
+int wantedPlayers() {
+    const char* n = std::getenv("CLAYFRAY_PLAYERS");
+    if (!n) return 2;
+    int v = std::atoi(n);
+    if (v < 1) v = 1;
+    if (v > Renderer::kMaxPlayers) v = Renderer::kMaxPlayers;
+    return v;
+}
+
+// Spreads `count - 1` opponents around the hero so none of them is hidden
+// behind another — an occluded body still costs march steps, but it would
+// make the number depend on where they happened to stand.
+void addOpponents(Renderer& renderer, int count) {
+    static const FighterPose kSpots[3] = {
+        {{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false},
+        {{-1.05f, 0.f, 0.35f}, 1.40f, 0.f, false},
+        {{0.10f, 0.f, -0.95f}, 0.20f, 0.f, false},
+    };
+    for (int i = 1; i < count; i++) renderer.addPlayer(kSpots[(i - 1) % 3]);
+}
+
 void applyLookEnv(LookParams& look) {
     if (std::getenv("CLAYFRAY_DEBUG_FLAT")) {
         look.aoStrength = 0.f;
@@ -348,7 +376,7 @@ int runHeadless(const RunOpts& o) {
     if (!renderer.init(gpu, o.width, o.height)) return 1;
     if (!loadCharacterInto(renderer)) return 1;
     // player 2: an identical fighter standing in front, facing the hero
-    renderer.addPlayer(FighterPose{{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false});
+    addOpponents(renderer, wantedPlayers());
 
     if (o.carveTest && std::getenv("CLAYFRAY_TEST_ADDSTRESS")) {
         // far-from-body adds: pool stress + volume-boundary rejection test
@@ -707,7 +735,7 @@ bool appStartAfterGpu(AppState& s) {
     if (!s.renderer.init(s.gpu, traceW0, traceH0)) return false;
     if (!loadCharacterInto(s.renderer)) return false;
     // player 2: an identical fighter standing in front, facing the hero
-    s.renderer.addPlayer(FighterPose{{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false});
+    addOpponents(s.renderer, wantedPlayers());
     if (!uiInit(s.window, s.gpu)) return false;
 
     CtlRefs refs;
