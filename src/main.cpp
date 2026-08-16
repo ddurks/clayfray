@@ -915,7 +915,15 @@ void frameOnce(AppState& s) {
             frameLook.sword.pos[1] += lift;
             renderer.render(cam, frameLook, makeFrameInfo(simT, 1), view,
                             [](wgpu::RenderPassEncoder& pass) { uiRender(pass); });
+#ifndef __EMSCRIPTEN__
+            // The browser presents the canvas itself when the rAF callback
+            // returns, so there is nothing to call — and emdawnwebgpu makes
+            // that explicit: wgpuSurfacePresent is a hard abort() there ("use
+            // requestAnimationFrame via html5.h instead"), not a no-op. Same
+            // shape as trap 9: browser-illegal calls kill the module rather
+            // than failing softly.
             gpu.surface.Present();
+#endif
         } else {
             // Skipped frame (e.g. mid-resize); ImGui frame must still be closed out.
             ImGui::Render();

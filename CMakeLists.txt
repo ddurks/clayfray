@@ -230,8 +230,16 @@ if(EMSCRIPTEN)
     target_compile_definitions(clayfray PRIVATE CLAYFRAY_WEB_JSPI)
     target_link_options(clayfray PRIVATE -sJSPI)
   endif()
-  # emit the stock emcc shell, whose <canvas id="canvas"> is what both SDL and
-  # the WebGPU surface bind to (see the selector lookup in gpu.cpp)
+  # Our own shell, not the stock emcc one. The stock shell leaves <canvas> at
+  # the HTML default 300x150 and never sizes it, and since the C++ derives the
+  # trace resolution from the canvas CSS box that came out as "TRACING 160x90".
+  # web/shell.html sizes the canvas to the viewport, keeps the drawing buffer
+  # in step with DPR, and surfaces the startup log — which is the first thing
+  # to read when a frame does not appear.
+  target_link_options(clayfray PRIVATE
+    "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/web/shell.html")
+  set_source_files_properties(${CMAKE_SOURCE_DIR}/web/shell.html PROPERTIES
+    GENERATED FALSE)
   set_target_properties(clayfray PROPERTIES SUFFIX ".html")
 else()
   # the SOURCE tree, not an install dir: editing a .wgsl and having the running
