@@ -2318,6 +2318,19 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     updateConservation(look, frame);
 
     float uniforms[kUniformSlots][4];
+    // Latch what the eyes look at, on the pose grid, INDEPENDENT of whether a
+    // skeleton exists. The bone-chain gaze below is gated on gaze_ (the eye
+    // bone leaves), which is empty under the brush rig — and that gate was
+    // also freezing this target, so the pupils aimed at its initial value and
+    // stared at a fixed world point no matter where the camera went. The
+    // pupil-rotation gaze in packUniforms reads this.
+    if (look.gaze.track && frame.poseTime != gazePoseTime_) {
+        gazePoseTime_ = frame.poseTime;
+        const Vec3 cp = cam.pos();
+        gazeTarget_[0] = cp.x;
+        gazeTarget_[1] = cp.y;
+        gazeTarget_[2] = cp.z;
+    }
     packUniforms(cam, look, frame, uniforms);
     gpu_->queue.WriteBuffer(uniformBuf_, 0, uniforms, sizeof(uniforms));
 

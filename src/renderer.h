@@ -134,6 +134,9 @@ class Renderer {
     std::vector<float> foeSkinMats_;
     std::vector<GazeChain> gaze_;
     float gazeTarget_[3] = {0.f, 0.6f, 3.f};
+    // pose step the gaze target was last latched on; separate from
+    // lastPoseTime_, which updateConservation advances at a different point
+    float gazePoseTime_ = -1.f;
     // ---- display poses (trap 4 applied to the ROOT) ----
     // The animation clip was already quantised to the pose grid, but the root
     // translation/yaw/lean was not: the fighter SLID at 60 Hz under a body
