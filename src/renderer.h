@@ -300,6 +300,30 @@ class Renderer {
     float prevTip_[3] = {0, 0, 0}, prevHilt_[3] = {0, 0, 0};
     bool haveBlade_ = false;
 
+    // ---- sword slice sploot ----
+    // A slice is a CONTIGUOUS RUN OF CUTTING POSE STEPS: it opens on the first
+    // blade edit and closes on the first pose step that queued none. One swing
+    // can therefore eject more than one blob (the flourish enters and leaves
+    // the body more than once) and each one is a real, separate wound.
+    //
+    // THE LEDGER INVARIANT: sliceVol_ is a RESERVATION against sploot_.debt,
+    // never a second pot of clay. Blade volume is billed to carved/debt by
+    // absorbMeasured exactly as before; sliceVol_ only withholds that much
+    // debt from the dribble spawner until the slice closes. So
+    // carved == deposited + inFlight + debt holds at every instant, and every
+    // way this can go wrong (measurement dropped, gob array full, conserve
+    // toggled off, snapshot loaded, app exits mid-swing) degrades to the old
+    // dribble rather than stranding clay.
+    float sliceVol_ = 0.f;    // debt withheld for this slice's single gob
+    float sliceExit_[3] = {0, 0.5f, 0};    // world EXIT end of the last cut
+    float sliceSweep_[3] = {1, 0, 0};      // blade travel there, unit
+    float sliceNrm_[3] = {0, 1, 0};        // wound normal there, unit
+    float sliceCol_[3] = {0.024f, 0.19f, 0.25f};
+    bool sliceOpen_ = false;   // a slice is accumulating or awaiting flush
+    bool sliceCutStep_ = false; // a blade edit was queued since the last pose step
+    int slicePending_ = 0;     // blade edits queued, measurement not yet back
+    int sliceWait_ = 0;        // pose steps spent waiting to flush
+
     Gpu* gpu_ = nullptr;
     BrickSystem brick_;
     // M5 fighter 1: its OWN carveable volume, so cutting it cannot touch the

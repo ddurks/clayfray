@@ -126,6 +126,10 @@ void CtlServer::buildRegistry() {
     addF("sword.grip0", &l->sword.grip0);
     addF("sword.grip1", &l->sword.grip1);
     addF("sword.color", l->sword.color, 3);
+    addB("sword.sliceGob", &l->sword.sliceGob);
+    addF("sword.sliceSpeed", &l->sword.sliceSpeed);
+    addF("sword.sliceLift", &l->sword.sliceLift);
+    addF("sword.sliceOut", &l->sword.sliceOut);
     addB("motion.stepRoot", &l->motion.stepRoot);
     // M-PERF: affine body + two rigid mitts vs the 13-piece inverse-LBS warp.
     // CLAYFRAY_NO_AFFINE=1 pins it off for a benchmark run.

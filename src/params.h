@@ -31,6 +31,19 @@ struct SwordParams {
     float grip0 = 0.05f;             // near-hilt grip (one hand), m along blade
     float grip1 = 0.19f;             // stacked grip (other hand), m along blade
     float color[3] = {0.35f, 0.85f, 1.0f}; // debug lightsaber cyan (emissive)
+
+    // ---- slice sploot (M4.6 ledger, sword side) ----
+    // A SLICE ejects ONE gob carrying the whole volume the cut removed,
+    // launched as the blade leaves the body — not the ledger's default
+    // dribble of 2..35 ml pellets, which reads as a sneeze rather than a
+    // wound. The brush keeps the dribble; this is sword-only.
+    bool sliceGob = true;    // off = blade carves dribble like the brush
+    float sliceSpeed = 1.5f; // launch speed, m/s (the blade's shove)
+    float sliceLift = 0.8f;  // extra +Y m/s so the blob arcs instead of skidding
+    // 0 = fly purely along the blade's sweep, 1 = purely along the wound
+    // normal (straight out of the cut). Between the two reads as clay thrown
+    // off the edge of a moving blade.
+    float sliceOut = 0.45f;
 };
 
 // M4.7 floating hands. The rig has no arms — the mitts are detached, and

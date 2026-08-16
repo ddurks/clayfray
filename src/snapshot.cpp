@@ -10,11 +10,15 @@ constexpr char kMagic[4] = {'C', 'F', 'S', 'N'};
 // 5: M-RIG dropped the skeleton. Sections "BCLW" (per-cell skin field) and
 //    "BWGT" (per-voxel bone weights) are gone with their buffers, and the
 //    volume buffer lost its fourth region, so kVolumeBytes shrank too.
-// 6: mobile right-sizing. kMaxBricks 49152 -> 16384 resizes "BFRE" and the
-//    pool prefixes, and the allocator's counter block grew 16 -> 32 bytes for
-//    the pool-spill counter, resizing "BCNT". The ground's base/height/color
-//    became one region-packed buffer, but "GBAS"/"GHGT"/"GCOL" keep their
-//    names, sizes and contents, so that half is snapshot-transparent.
+// 6: two format changes landed together, one bump covers both.
+//    (a) mobile right-sizing. kMaxBricks 49152 -> 16384 resizes "BFRE" and
+//        the pool prefixes, and the allocator's counter block grew 16 -> 32
+//        bytes for the pool-spill counter, resizing "BCNT". The ground's
+//        base/height/color became one region-packed buffer, but
+//        "GBAS"/"GHGT"/"GCOL" keep their names, sizes and contents, so that
+//        half is snapshot-transparent.
+//    (b) BrickEdit gained `fromBlade` (sword slices pool into one gob), and
+//        "BPND" stores BrickEdit raw, so its stride moved.
 constexpr uint32_t kVersion = 6;
 
 uint32_t tagWord(const char tag[4]) {

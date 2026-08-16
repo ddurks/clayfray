@@ -1728,6 +1728,15 @@ void Renderer::absorbMeasured() {
             std::memcpy(woundDir_, m.edit.outDir, sizeof(woundDir_));
             std::memcpy(woundCol_, m.edit.srcColor, sizeof(woundCol_));
             haveWound_ = true;
+            if (m.edit.fromBlade) {
+                // Billing is UNCHANGED above (carved += v, debt += v). All this
+                // does is withhold that much debt from the dribble spawner so
+                // the whole slice can leave as one blob — the clay is on the
+                // ledger the entire time.
+                if (slicePending_ > 0) slicePending_--;
+                sliceVol_ += m.volume;
+                sliceOpen_ = true;
+            }
         } else if (m.edit.mode == 2 && m.edit.fromGob) {
             // a landed gob became body clay; smin over/under-fill goes back
             // on the ledger so nothing is created or destroyed
@@ -1896,7 +1905,29 @@ void Renderer::updateBladeCut(const LookParams& look) {
         matTransformPoint(invBone, wB, e.posB);
         for (int k = 0; k < 3; k++) e.worldPos[k] = (wA[k] + wB[k]) * 0.5f;
         std::memcpy(e.outDir, nrm, sizeof(e.outDir)); // gobs spray off the cut
-        if (foe_.editInBounds(e)) foe_.queueEdit(e);
+        e.fromBlade = true; // pool this into the slice gob, don't dribble it
+        // editInBounds is what queueEdit re-checks, so testing it here keeps
+        // slicePending_ counting exactly the edits that will be measured — an
+        // edit silently dropped at the volume boundary (trap 5) must not leave
+        // the slice waiting forever for a measurement that never comes.
+        if (foe_.editInBounds(e)) {
+            foe_.queueEdit(e);
+            // The gob spawns where the blade LEAVES the body, so latch wB —
+            // the tip-side end of the span inside the opponent — rather than
+            // the midpoint the edit carries for the dribble path. Overwritten
+            // by each later substep, so at flush time this is the last place
+            // the blade was still cutting: the exit.
+            std::memcpy(sliceExit_, wB, sizeof(sliceExit_));
+            std::memcpy(sliceNrm_, nrm, sizeof(sliceNrm_));
+            std::memcpy(sliceCol_, e.srcColor, sizeof(sliceCol_));
+            // blade travel this frame, unit — `sweep` is exactly |tip - pT|
+            float inv = sweep > 1e-6f ? 1.f / sweep : 0.f;
+            for (int k = 0; k < 3; k++) sliceSweep_[k] = (tip[k] - pT[k]) * inv;
+            sliceOpen_ = true;
+            sliceCutStep_ = true;
+            slicePending_++;
+            sliceWait_ = 0;
+        }
     }
 }
 
@@ -1907,6 +1938,10 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
     if (!look.conserveClay) {
         sploot_.debt = 0.f;
         haveWound_ = false;
+        // the reservation is a claim on debt that no longer exists
+        sliceVol_ = 0.f;
+        sliceOpen_ = false;
+        sliceWait_ = 0;
     }
 
     float dt = 0.f;
@@ -1922,12 +1957,100 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
         gobSeed_ = gobSeed_ * 1664525u + 1013904223u;
         return (float)(gobSeed_ >> 8) * (1.f / 16777216.f);
     };
+    // ---- sword slice: ONE gob carrying the whole cut ----
+    // The dribble below is right for a brush (many small taps), and wrong for
+    // a blade: a slice that takes 300 ml should throw a 41 mm blob, not 12
+    // pellets. So blade volume is WITHHELD from the dribble while the cut runs
+    // and leaves in a single gob when the blade exits.
+    if (!look.sword.sliceGob) {
+        // toggled off mid-slice: release the hold, the debt dribbles as before
+        sliceVol_ = 0.f;
+        sliceOpen_ = false;
+        sliceWait_ = 0;
+    }
+    // The reservation can never exceed the debt it claims — a gob re-stick
+    // reconciling smin over-fill can push debt down underneath it.
+    if (sliceVol_ > sploot_.debt) sliceVol_ = sploot_.debt;
+
+    const bool cutStep = sliceCutStep_;
+    if (poseStep) sliceCutStep_ = false;
+    // A slice ENDS at the first pose step that queued no blade edit: the blade
+    // left the body, or dropped under the cutting speed, or the swing stopped.
+    // Watching for the absence of edits (rather than for a swing state) is what
+    // makes an INTERRUPTED swing behave — nothing has to signal an ending.
+    if (poseStep && sliceOpen_ && !cutStep) {
+        sliceWait_++;
+        // Wait for the measurements too, or the "whole" slice would be only
+        // the part the GPU had reported by then (they land 1-2 frames late).
+        // But bound the wait: pollVolumes DROPS a measurement whose volume
+        // generation a snapshot load replaced, so slicePending_ can stall
+        // forever. After kSliceWait pose steps, eject what we have.
+        const int kSliceWait = 8; // ~0.67 s at 12 Hz
+        const bool timedOut = sliceWait_ >= kSliceWait;
+        if (slicePending_ <= 0 || timedOut) {
+            bool done = true;
+            if (sliceVol_ > kMinGob && (int)gobs_.size() < 12) {
+                float v = std::min(sliceVol_, sploot_.debt);
+                sploot_.debt -= v;
+                Gob g{};
+                g.vol = v;
+                g.radius = std::cbrt(v * 3.f / (4.f * 3.14159265f));
+                // Launch: mostly the blade's own sweep (clay thrown off a
+                // moving edge), part straight out of the wound so it clears
+                // the body. NO random spray — one blob reads as a thing that
+                // was cut off, and skipping rnd() leaves the dribble's seeded
+                // stream bit-identical for scenes with no sword.
+                float f = std::min(std::max(look.sword.sliceOut, 0.f), 1.f);
+                float d[3], len = 0.f;
+                for (int i = 0; i < 3; i++) {
+                    d[i] = sliceSweep_[i] * (1.f - f) + sliceNrm_[i] * f;
+                    len += d[i] * d[i];
+                }
+                len = std::sqrt(len);
+                if (len > 1e-5f) {
+                    for (int i = 0; i < 3; i++) d[i] /= len;
+                } else {
+                    d[0] = sliceNrm_[0];
+                    d[1] = sliceNrm_[1];
+                    d[2] = sliceNrm_[2];
+                }
+                for (int i = 0; i < 3; i++) {
+                    // spawn at the EXIT end of the cut, pushed clear along the
+                    // wound normal by its own radius (the dribble's rule, and
+                    // a 41 mm blob needs it more than an 8 mm one)
+                    g.pos[i] = sliceExit_[i] + sliceNrm_[i] * (g.radius + 0.02f);
+                    g.vel[i] = d[i] * look.sword.sliceSpeed;
+                }
+                g.vel[1] += look.sword.sliceLift;
+                std::memcpy(g.col, sliceCol_, sizeof(g.col));
+                std::memcpy(g.disp, g.pos, sizeof(g.disp));
+                // bigger blob, longer clearance before body collision arms
+                g.grace = 0.3f;
+                gobs_.push_back(g);
+            } else if (sliceVol_ > kMinGob && !timedOut) {
+                done = false; // array full — hold the reservation, retry next step
+            }
+            if (done) {
+                // Closing does NOT move volume: anything not ejected is still
+                // sploot_.debt and the dribble drains it. That is the whole
+                // safety story — a slice can fail to fire, never leak.
+                sliceVol_ = 0.f;
+                sliceOpen_ = false;
+                sliceWait_ = 0;
+                slicePending_ = 0;
+            }
+        }
+    }
+    // Debt still owed to an open slice is invisible to the dribble, so a brush
+    // carve during a swing still dribbles normally off its own volume.
+    const float sliceHold = sliceOpen_ ? sliceVol_ : 0.f;
+
     // Spawning changes the in-flight count, which the tracer reads, so it
     // belongs on the pose grid too — otherwise the array refills at 60 Hz as
     // fast as landings drain it and reuse never recovers.
-    while (poseStep && haveWound_ && sploot_.debt > kMinGob &&
+    while (poseStep && haveWound_ && sploot_.debt - sliceHold > kMinGob &&
            (int)gobs_.size() < 12) {
-        float v = std::min(sploot_.debt, kMaxGob);
+        float v = std::min(sploot_.debt - sliceHold, kMaxGob);
         sploot_.debt -= v;
         Gob g{};
         g.vol = v;
@@ -2657,6 +2780,17 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
     haveWound_ = rc.haveWound != 0;
     gobSeed_ = rc.gobSeed;
     animT_ = rc.animT;
+    // Drop any in-progress slice rather than serialising it. sliceVol_ is only
+    // a hold on debt, and rc.debt above is the authoritative figure, so letting
+    // the restored debt dribble is correct and exactly balanced — carrying a
+    // stale reservation across a load could instead withhold more debt than
+    // the restored ledger has. Measurements from the pre-load volume are
+    // dropped by snapGen_, so slicePending_ must be cleared with it.
+    sliceVol_ = 0.f;
+    sliceOpen_ = false;
+    sliceCutStep_ = false;
+    slicePending_ = 0;
+    sliceWait_ = 0;
     // Spring state is optional: a snapshot taken before the affine rig landed
     // has no RRIG, and starting from neutral is a valid pose.
     {
