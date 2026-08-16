@@ -211,6 +211,22 @@ struct GameState {
     double timeSeconds() const { return (double)tickCount * kTickDt; }
 };
 
+// The held sword breathes on the 12 Hz grid (GameState::swordOffset). Both
+// the windowed loop and headless need it or they disagree about what the
+// character looks like at rest — so it is applied through one helper rather
+// than copied.
+LookParams swordBobbed(GameState& g, const FighterPose& pose,
+                       const LookParams& look, double t) {
+    g.fighter = pose; // swordOffset reads `moving` for the bob's amplitude
+    LookParams out = look;
+    float sy, sp, lift;
+    g.swordOffset((float)(std::floor(t * 12.0) / 12.0), sy, sp, lift);
+    out.sword.yaw += sy;
+    out.sword.pitch += sp;
+    out.sword.pos[1] += lift;
+    return out;
+}
+
 FrameInfo makeFrameInfo(double t, int aa) {
     FrameInfo f;
     f.time = (float)t;
@@ -379,6 +395,13 @@ int runHeadless(const RunOpts& o) {
     CtlServer ctl;
     // headless has no keyboard, so locomotion is whatever ctl/replay sets
     FighterPose fighter;
+    // The idle sword bob lives in GameState::swordOffset, and until now only
+    // frameOnce (windowed + web) applied it — so headless renders drew a
+    // fighter holding a DEAD sword. That makes --screenshot disagree with the
+    // running game, which is exactly what look-dev and the GIF read from.
+    // Headless has no keyboard so nothing ever swings; this contributes the
+    // bob only, driven by the ctl/replay pose.
+    GameState bobState;
     CtlRefs refs;
     refs.look = &look;
     refs.cam = &cam;
@@ -422,7 +445,8 @@ int runHeadless(const RunOpts& o) {
                 t += n * kTickDt;
                 auto t0 = std::chrono::steady_clock::now();
                 renderer.setFighter(fighter);
-                renderer.render(cam, look, makeFrameInfo(t, o.aa), nullptr, nullptr);
+                renderer.render(cam, swordBobbed(bobState, fighter, look, t),
+                                makeFrameInfo(t, o.aa), nullptr, nullptr);
                 gpu.processEvents();
                 if (++inFlight >= kMaxFramesInFlight) {
                     gpu.waitForGpu();
@@ -466,7 +490,8 @@ int runHeadless(const RunOpts& o) {
             ji++;
         }
         renderer.setFighter(fighter);
-        renderer.render(cam, look, makeFrameInfo(t, o.aa), nullptr, nullptr);
+        renderer.render(cam, swordBobbed(bobState, fighter, look, t),
+                        makeFrameInfo(t, o.aa), nullptr, nullptr);
         // headless still needs the event pump or async readbacks (volume
         // ledger, capacity poll) starve until exit
         gpu.processEvents();
