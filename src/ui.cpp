@@ -26,7 +26,7 @@ bool uiWantsMouse() {
     return ImGui::GetIO().WantCaptureMouse;
 }
 
-void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps,
+void uiNewFrame(LookParams& look, BrushState& brush, float fps,
                 float gpuTraceMs, float gpuPostMs, const SplootStats& sploot,
                 float reuseSkipPct, bool& wantScreenshot) {
     ImGui_ImplWGPU_NewFrame();
@@ -35,6 +35,12 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
 
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(330, 0), ImGuiCond_FirstUseEver);
+    // WHAT BELONGS HERE: knobs whose right value is still a judgement call you
+    // make by looking. Everything settled has been cut — the rig's grip and
+    // alignment, the sword's placement, the clip controls for clips this asset
+    // does not have. None of it is LOST: ctl still exposes every LookParams
+    // field by struct path (`tools/ctl.sh "set hands.gripRoll 0.4"`), which is
+    // the better home for a value you set once and never touch again.
     ImGui::Begin("look-dev");
     ImGui::Text("%.1f fps", fps);
     // 12 Hz frame reuse: how many of the last frames skipped the trace. Watch
@@ -56,12 +62,13 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
     }
 
     if (ImGui::CollapsingHeader("animation", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // Off = the M4-P1 13-piece inverse-LBS warp and the skeletal clips;
-        // on = one affine body plus two rigid mitts, animated by the spring
-        // below. The clip sliders only bite in the off state.
-        ImGui::Checkbox("affine rig (3 pieces, procedural)", &look.affineRig);
-        ImGui::Checkbox("play clip (off = rest pose)", &look.animPlay);
-        ImGui::SliderFloat("speed", &look.animSpeed, 0.f, 2.f);
+        // OFF draws the rest volume unposed — all three brushes side by side
+        // where they were authored. That is the "is the rig wrong or is the
+        // VOLUME wrong?" A/B, not a rig you would ship. (The clip play/speed
+        // sliders went with it: this asset has no clips, so they were two
+        // controls for nothing. `look.animPlay` survives in ctl for a
+        // hypothetical rigged asset.)
+        ImGui::Checkbox("affine rig (off = unposed rest volume)", &look.affineRig);
         if (look.affineRig) {
             RigParams& r = look.rig;
             ImGui::SliderFloat("squish stiffness", &r.squishK, 10.f, 200.f);
@@ -75,30 +82,16 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
         }
     }
 
-    if (ImGui::CollapsingHeader("sword / IK (M4.7)", ImGuiTreeNodeFlags_DefaultOpen)) {
-        SwordParams& s = look.sword;
-        ImGui::Checkbox("hold sword (hands follow via IK)", &s.enabled);
-        ImGui::DragFloat3("hilt pos", s.pos, 0.005f, -1.f, 1.5f);
-        ImGui::SliderFloat("yaw", &s.yaw, -3.14f, 3.14f);
-        ImGui::SliderFloat("pitch", &s.pitch, -1.57f, 1.57f);
-        ImGui::SliderFloat("length", &s.length, 0.2f, 1.4f);
-        ImGui::SliderFloat("blade radius", &s.radius, 0.005f, 0.05f);
-        ImGui::ColorEdit3("blade glow", s.color);
-        HandParams& h = look.hands;
-        ImGui::Separator();
-        ImGui::Checkbox("floating hands follow grips", &h.ik);
-        // 0 = auto: rest COM->wrist distance * reachScale
-        ImGui::SliderFloat("reach (0 = auto)", &h.reach, 0.f, 1.5f);
-        ImGui::SliderFloat("auto reach scale", &h.reachScale, 0.5f, 3.f);
-        ImGui::SliderFloat("palm along mitt", &h.palmFrac, 0.f, 1.f);
-        ImGui::Checkbox("wrap mitts around handle", &h.orient);
-        ImGui::SliderInt("grip axis (blade thru)", &look.hands.gripAxis, 0, 2);
-        ImGui::SliderFloat("grip roll", &h.gripRoll, -3.14f, 3.14f);
-        ImGui::SliderFloat("grip spread (sword radii)", &h.gripSpread, 0.f, 6.f);
-        ImGui::SliderFloat("finger curl (about handle)", &h.gripCurl, -2.0f, 2.0f);
-        ImGui::Separator();
+    if (ImGui::CollapsingHeader("sword / eyes", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Two toggles, because only two of these change what the app DOES.
+        // The sword's placement (hilt pos/yaw/pitch/length/radius/glow) is
+        // driven by the harness's guard-and-swing pose, so dragging it here
+        // fought the animation; and the mitt alignment (reach, palm, orient,
+        // grip axis/roll/spread) was tuned once against the authored hand and
+        // has not moved since. All still live in ctl by struct path.
+        ImGui::Checkbox("hold sword (mitts take the grab brush)", &look.sword.enabled);
+        ImGui::Checkbox("floating hands follow grips", &look.hands.ik);
         ImGui::Checkbox("eyes track camera", &look.gaze.track);
-        ImGui::SliderFloat("gaze cone", &look.gaze.maxAngle, 0.f, 3.14f);
     }
 
     if (ImGui::CollapsingHeader("sploot", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -116,9 +109,10 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
         ImGui::SliderFloat("falloff", &look.keyFalloff, 0.f, 1.f);
     }
     if (ImGui::CollapsingHeader("rim / ambient")) {
-        ImGui::DragFloat3("rim dir", look.rimDir, 0.02f, -1.f, 1.f);
+        // Rim is OFF by default now. Its direction and colour only matter once
+        // the intensity is non-zero, so they went to ctl rather than sit here
+        // doing nothing.
         ImGui::SliderFloat("rim intensity", &look.rimIntensity, 0.f, 2.f);
-        ImGui::ColorEdit3("rim color", look.rimColor);
         ImGui::ColorEdit3("ambient", look.ambient);
         ImGui::SliderFloat("ao strength", &look.aoStrength, 0.f, 2.f);
     }
@@ -143,12 +137,9 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
         ImGui::SliderFloat("bloom", &look.bloomAmount, 0.f, 1.f);
         ImGui::SliderFloat("bloom threshold", &look.bloomThreshold, 0.f, 2.f);
     }
-    if (ImGui::CollapsingHeader("camera")) {
-        ImGui::SliderFloat("azimuth", &cam.azimuth, -3.14f, 3.14f);
-        ImGui::SliderFloat("elevation", &cam.elevation, -0.4f, 1.2f);
-        ImGui::SliderFloat("distance", &cam.distance, 0.8f, 8.f);
-        ImGui::SliderFloat("fov", &cam.fovY, 0.3f, 1.4f);
-    }
+    // The camera sliders (azimuth/elevation/distance/fov) are gone: drag-orbit
+    // and the wheel do the first three better, and `--cam AZ,EL,DIST` plus ctl
+    // `cam.*` cover the scripted case.
     ImGui::End();
 }
 

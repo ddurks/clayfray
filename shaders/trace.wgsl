@@ -12,15 +12,15 @@
 //   aabbLo.w  the transform's smallest SINGULAR value (a shear can have
 //             unit-length columns and a much smaller sigma_min; trusting a
 //             column norm makes the march step through the skin)
-//   capB.w    BITMASK of the bones whose clay this piece carries — dead with
-//             the skeleton, kept only by the legacy path
+//
+// Three fields used to live here and none was ever read: `skin` (the forward
+// matrix, for a round-trip consistency check that died with the inverse-LBS
+// warp) and `capA`/`capB` (the rest capsule, which box clipping replaced).
+// They were packed every frame and cost HALF of this struct.
 struct Piece {
   invSkin: mat4x4f, // world -> rest, rigid (posed inverse skin matrix)
-  skin: mat4x4f,    // rest -> world, for the round-trip consistency check
   aabbLo: vec4f,    // rest-space tight bound of the piece's zero set
   aabbHi: vec4f,
-  capA: vec4f,      // rest capsule end a, w = swollen radius
-  capB: vec4f,      // rest capsule end b
 }
 
 // One fighter: everything the tracer needs to sample its body. Its CLAY is not
@@ -88,8 +88,7 @@ const MAT_WALL: f32 = 2.0;
 // hardcoded opponent. MAT_FIGHTER_STEP * MAX_FIGHTERS must stay under 0.5.
 const MAT_BODY: f32 = 3.0;
 const MAT_FIGHTER_STEP: f32 = 0.1;
-const MAT_EYE: f32 = 4.0;   // + marble index (4..19)
-const MAT_PUPIL: f32 = 5.0;
+const MAT_EYE: f32 = 4.0;   // + marble index; pupils are just more marbles
 const MAT_GCLAY: f32 = 20.0;
 const MAT_GOB: f32 = 21.0;  // + gob index (21..32)
 const MAT_SWORD: f32 = 50.0; // M4.7: rigid emissive blade, never clay

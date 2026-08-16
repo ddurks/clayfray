@@ -946,7 +946,7 @@ void frameOnce(AppState& s) {
                 lastPresented = pr;
             }
         }
-        uiNewFrame(look, cam, brush, fps, renderer.traceMs(), renderer.postMs(),
+        uiNewFrame(look, brush, fps, renderer.traceMs(), renderer.postMs(),
                    renderer.sploot(), reuseSkipPct, wantScreenshot);
 
         wgpu::SurfaceTexture surfaceTex;

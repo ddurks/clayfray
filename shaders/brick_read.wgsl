@@ -16,7 +16,6 @@
 const IND_ALLOC: u32 = 0x80000000u;
 const IND_INSIDE: u32 = 0x40000000u;
 const IND_IDX_MASK: u32 = 0x000FFFFFu;
-const IND_CHEB_MASK: u32 = 0x000000FFu;
 
 // ---------- THREE BINDINGS, ANY NUMBER OF FIGHTERS ----------
 // Two levels of packing stack here, and both exist for the same reason: core
@@ -185,19 +184,6 @@ fn coarseTrilinear(v: vec3f) -> f32 {
   let d111 = rdCoarse(cellIndex(min(c0 + vec3i(1, 1, 1), vec3i(GRID - 1))));
   return mix(mix(mix(d000, d100, f.x), mix(d010, d110, f.x), f.y),
              mix(mix(d001, d101, f.x), mix(d011, d111, f.x), f.y), f.z);
-}
-
-// Penumbra flavor: smoothness beats accuracy. The trilinear brick data has
-// per-voxel gradient kinks that paint fingerprint bands into soft shadows;
-// the coarse cell field is smooth everywhere.
-fn charDistSmooth(p: vec3f) -> f32 {
-  let volMax = VOL_ORIGIN + vec3f(f32(GRID) * SPAN);
-  let toBox = max(VOL_ORIGIN - p, p - volMax);
-  let outBox = length(max(toBox, vec3f(0.0)));
-  if (outBox > 0.0) {
-    return outBox + 0.5 * SPAN;
-  }
-  return coarseTrilinear((p - VOL_ORIGIN) / VOXEL);
 }
 
 fn albedoVoxel(brick: u32, v: vec3i) -> vec3f {

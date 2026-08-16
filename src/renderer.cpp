@@ -761,38 +761,23 @@ int Renderer::packAffinePieces(float out[kUniformSlots][4], int idx,
             // brush rig: the transform was written straight into the piece
             std::memcpy(fwd, ap.xform, sizeof(fwd));
         }
+        // Only the INVERSE goes to the GPU. The forward matrix rode along for
+        // the inverse-LBS round-trip check, which died with the armature.
         float inv[16];
         matInvAffine(fwd, inv);
-        std::memcpy(out[base + n * 12], inv, 16 * sizeof(float));
-        std::memcpy(out[base + n * 12 + 4], fwd, 16 * sizeof(float));
-        float* lo = out[base + n * 12 + 8];
-        float* hi = out[base + n * 12 + 9];
-        float* ca = out[base + n * 12 + 10];
-        float* cb = out[base + n * 12 + 11];
+        std::memcpy(out[base + n * kPieceSlots], inv, 16 * sizeof(float));
+        float* lo = out[base + n * kPieceSlots + 4];
+        float* hi = out[base + n * kPieceSlots + 5];
         for (int k = 0; k < 3; k++) {
             lo[k] = ap.lo[k];
             hi[k] = ap.hi[k];
         }
-        // Lipschitz rescale — the SMALLEST SINGULAR VALUE, not the min column
-        // norm the 13-piece path packs here. A shear can have unit-length
-        // columns and a much smaller sigmaMin; trusting the column norm would
-        // overestimate world distances and the march would tunnel. Floored at
-        // 0.25 so a degenerate matrix cannot stall the trace to a crawl.
+        // Lipschitz rescale — the SMALLEST SINGULAR VALUE, not a min column
+        // norm. A shear can have unit-length columns and a much smaller
+        // sigmaMin; trusting the column norm would overestimate world
+        // distances and the march would tunnel. Floored at 0.25 so a
+        // degenerate matrix cannot stall the trace to a crawl.
         lo[3] = std::min(std::max(mat3MinSingular(fwd), 0.25f), 1.f);
-        // Rest bounding sphere of this piece's clay. Unused by the affine
-        // sampling path today; it is where a baked hand-pose volume would
-        // declare its extent when the mitts move out of the shared volume.
-        for (int k = 0; k < 3; k++) ca[k] = (ap.lo[k] + ap.hi[k]) * 0.5f;
-        float hd = 0.f;
-        for (int k = 0; k < 3; k++) {
-            const float h = (ap.hi[k] - ap.lo[k]) * 0.5f;
-            hd += h * h;
-        }
-        ca[3] = std::sqrt(hd);
-        for (int k = 0; k < 3; k++) cb[k] = ca[k];
-        // capB.w is a BONE MASK in this mode, not a bone id — the shader's
-        // ownership test ANDs it with 1 << dominantBone.
-        cb[3] = (float)ap.boneMask;
         n++;
     }
     return n;
@@ -1469,10 +1454,6 @@ void Renderer::setCharacter(CharacterAsset asset) {
             pieces[i].lo[0] = pieces[i].lo[1] = pieces[i].lo[2] = 1e9f;
             pieces[i].hi[0] = pieces[i].hi[1] = pieces[i].hi[2] = -1e9f;
         }
-        // one bit per bone: the shader ANDs this with 1 << dominant bone of
-        // the cell it is sampling. 16 bones is the shader-side cap.
-        for (size_t b = 0; b < nb && b < 16; b++)
-            pieces[owner[b]].boneMask |= 1u << b;
         // Rest bounds of the clay each piece carries: the vertices whose
         // DOMINANT bone it owns — the same rule the per-cell skin field uses,
         // so the AABB cull and the ownership test agree about where a piece
@@ -1496,17 +1477,14 @@ void Renderer::setCharacter(CharacterAsset asset) {
             }
         }
         // A piece with no clay (a rig with no mitts, or a hand nothing is
-        // bound to) would carry an inverted box and poison the cull, so fold
-        // its bones back into the body and drop it.
-        for (size_t i = 1; i < pieces.size(); i++) {
-            if (pieces[i].hi[0] < pieces[i].lo[0]) {
-                pieces[0].boneMask |= pieces[i].boneMask;
-                pieces[i].boneMask = 0;
-            }
-        }
+        // bound to) carries an INVERTED box, which would poison the clip. The
+        // box test alone drops it — a per-piece bone mask used to mark the
+        // same thing, but the only consumer was the shader's dominant-bone
+        // ownership test, and that is deleted (brick_read.wgsl: "CLIPPING,
+        // NOT OWNERSHIP - and do not put ownership back").
         if (pieces[0].hi[0] >= pieces[0].lo[0]) {
             for (const AffinePiece& ap : pieces)
-                if (ap.boneMask != 0 && ap.hi[0] >= ap.lo[0]) fighters_[0].pieces.push_back(ap);
+                if (ap.hi[0] >= ap.lo[0]) fighters_[0].pieces.push_back(ap);
         }
         if (bones_.size() > 16 && !fighters_[0].pieces.empty()) {
             std::fprintf(stderr,
@@ -2325,20 +2303,18 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                 // handle the way two hands on a hilt actually sit
                 std::memcpy(c.aim, blade, sizeof(c.aim));
                 c.roll = look.hands.gripRoll;
-                // Fingers wrap the handle; mirrored so both curl inward.
+                // Fingers never curl, and that is not a TODO.
                 //
-                // ZERO under the affine rig, and it has to be. The mitt is one
-                // piece there, sampled through the WRIST's transform alone, so
-                // a per-digit rotation would move the shadow capsules and the
-                // COM to a grip the clay never adopts — a curled proxy over
-                // straight fingers. Zeroing it keeps the whole rig telling one
-                // story: applyHandIk then moves every mitt bone by the same
-                // matrix, which is exactly what the one-transform piece
-                // assumes. Getting the curl BACK is what the baked hand-pose
-                // volumes are for (rigMeta.y) — a discrete grip shape selected
-                // by index, not a joint rotation.
-                c.curl = affine ? 0.f
-                                : (right ? -look.hands.gripCurl : look.hands.gripCurl);
+                // A `hands.gripCurl` used to feed this, mirrored per hand. It
+                // had to be ZERO under the affine rig: the mitt is one piece
+                // there, sampled through a single transform, so a per-digit
+                // rotation would move the shadow capsules and the COM to a
+                // grip the clay never adopts — a curled proxy over straight
+                // fingers. Since the affine rig is the only rig, the slider
+                // was always multiplied out to nothing, so it is gone.
+                // Getting curl back is what a discrete grip SHAPE is for (the
+                // grab brush already does exactly this), not a joint rotation.
+                c.curl = 0.f;
                 c.palmLen = c.restSpan * look.hands.palmFrac;
             }
             float com[3];

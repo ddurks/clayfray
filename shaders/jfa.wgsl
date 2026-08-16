@@ -5,7 +5,6 @@
 //#constants
 const IND_ALLOC: u32 = 0x80000000u;
 const IND_INSIDE: u32 = 0x40000000u;
-const IND_CHEB_MASK: u32 = 0x000000FFu;
 const NO_SEED: u32 = 0xFFFFFFFFu;
 
 struct JfaParams {

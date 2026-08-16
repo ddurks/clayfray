@@ -127,8 +127,11 @@ class Renderer {
     static constexpr int kSlotGroundMeta = kSlotGobs + 24; // 12 gobs x2
     static constexpr int kSlotSwordA = kSlotGroundMeta + 1;
     static constexpr int kSlotFighters = kSlotSwordA + 3; // hilt, tip, colour
-    // One Piece: invSkin mat4 + forward skin mat4 + aabb lo/hi + capsule a/b.
-    static constexpr int kPieceSlots = 12;
+    // One Piece: invSkin mat4 + aabb lo/hi. It was 12 — a forward skin mat4
+    // and a rest capsule a/b rode along, packed every frame and read by no
+    // shader (the round-trip check and the capsule test that wanted them both
+    // died with the armature).
+    static constexpr int kPieceSlots = 6;
     // One Fighter: meta + center + its pieces. WGSL requires a uniform array's
     // element stride to be a multiple of 16 bytes, i.e. a whole number of
     // slots — which this is by construction.
@@ -194,10 +197,10 @@ class Renderer {
     // lo/hi are the piece's rest-space AABB. Under the brush rig they are the
     // selected BRUSH's box, they change when the pose index changes, and the
     // shader clips to them — so they are load-bearing geometry, not just the
-    // conservative cull they were under the bone rig. `boneMask` is dead
-    // (the ownership test it fed is gone); kept only for the legacy path.
+    // conservative cull they were under the bone rig. (A `boneMask` lived here
+    // for the shader's dominant-bone ownership test; that test is deleted and
+    // must not come back — see brick_read.wgsl.)
     struct AffinePiece {
-        uint32_t boneMask = 0;
         float lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
         int srcBone = -1;
         float xform[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};

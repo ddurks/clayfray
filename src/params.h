@@ -10,9 +10,10 @@ struct FighterPose {
     bool moving = false;            // picks the bounce clip over idle
 };
 
-// M4.7 sword prop + hand IK. Debug: the hilt transform is driven by these
-// panel controls so dragging it demonstrates the hands following via IK.
-// Later the swing/hold pose drives the transform instead.
+// M4.7 sword prop + hand IK. The hilt transform is driven by the harness's
+// guard-and-swing pose (main.cpp GameState::swordOffset), NOT by hand any
+// more — these are the rest values it offsets from. Dragging pos/yaw/pitch
+// live fights the animation, which is why they left the panel for ctl.
 struct SwordParams {
     bool enabled = true;             // hold the sword + run hand IK
     // carried: `pos`/`yaw` are read in CHARACTER space and ride the fighter's
@@ -70,16 +71,12 @@ struct HandParams {
     // THROUGH the gap between the fingers (gripAxis), so both hands belong on
     // the blade's own axis and any offset just slides them off it.
     float gripSpread = 0.f;
-    // Finger curl: rotates the thumb/finger subtrees ABOUT THE HANDLE AXIS so
-    // the digits wrap onto the blade. The wrist is deliberately untouched —
-    // rolling the whole mitt moves the palm off the grip, which is a different
-    // (and wrong) thing. Mirrored per hand so both curl inward.
-    float gripCurl = 0.5f;    // radians, per digit
+    // A `gripCurl` sat here, rotating the thumb/finger subtrees about the
+    // handle so the digits wrapped onto the blade. It needed an armature to
+    // rotate, and the grab MORPH replaced the whole idea — it was a panel
+    // slider and a ctl name driving nothing at all.
 };
 
-// M4.8 gaze. The eye bones are leaves under the head, so this is a pure
-// rotation per eye toward whatever the fighter is looking at (the camera, for
-// now). Quantized to the 12 Hz pose grid like everything else that moves.
 // Whether the ROOT translation steps on the 12 Hz pose grid like the rest of
 // the stop-motion, or slides at 60 Hz.
 //
@@ -116,20 +113,26 @@ struct MotionParams {
     bool stepRoot = false;
 };
 
+// M4.8 gaze. There are no eye bones any more — the eyes are marble beads
+// riding the body affine — so this rotates each PUPIL about its own eyeball's
+// centre to face the target. Latched on the 12 Hz pose grid like everything
+// else that moves, or a standing fighter would re-trace every frame.
 struct GazeParams {
     bool track = true;         // eyes follow the camera as it orbits
-    float maxAngle = 1.5708f;  // clamp cone off the head's forward, radians
+    float maxAngle = 1.5708f;  // clamp cone off the forward direction, radians
 };
 
 // M-PERF: the affine body's procedural motion.
 //
-// This REPLACES the skeletal clips as the driver of the blob's shape. The
-// animation the game wants is a squish-and-spring (idle) and a squish, hop and
-// forward lean (walk) — that is one non-uniform scale plus a shear plus a
-// translation, i.e. one matrix, i.e. nothing worth skinning per sample. The
-// 45-track 'bounce'/'idle' clips still exist in the asset and still drive the
-// 13-piece path (look.affineRig off), which is what keeps the A/B honest; they
-// are simply not sampled while the affine rig is on.
+// This IS the blob's shape animation — there is nothing else. The motion the
+// game wants is a squish-and-spring (idle) and a squish, hop and forward lean
+// (walk), which is one non-uniform scale plus a shear plus a translation:
+// one matrix, nothing worth skinning per sample.
+//
+// It does not REPLACE skeletal clips, whatever the older note here said. The
+// asset ships no clips and no armature (CLAUDE.md trap 7), so there is no A/B
+// against a 13-piece path; `look.affineRig` off now draws the rest volume
+// unposed, which answers a different question ("rig or volume?").
 //
 // DETERMINISM: the spring is integrated ONLY on 12 Hz pose steps, at a dt read
 // off frame.poseTime, with a fixed substep count and no RNG and no wall clock.
@@ -164,8 +167,19 @@ struct LookParams {
     float keyColor[3] = {1.0f, 0.70f, 0.40f};
     float keyFalloff = 1.4f; // attenuation = intensity / (1 + falloff * d^2)
 
+    // Rim light: a cool Fresnel edge from the UNLIT side. `rim` peaks where
+    // the surface turns away from the camera (pow(1 + dot(n, rd), 2.5) in
+    // trace.wgsl's shade()), gated by how much that point faces rimDir and
+    // multiplied by AO, so it paints a blue-ish outline on the character's
+    // silhouette and separates it from the dark background. The set gets a
+    // quarter of it — rim on rough stone reads as wetness.
+    //
+    // OFF (0) by default. It is the classic third light of a studio rig and it
+    // was doing what that always does: making the clay look photographed
+    // rather than lit by the one warm key the scene actually has. rimDir and
+    // rimColor still exist for anyone turning it back on from ctl.
     float rimDir[3] = {-0.5f, 0.35f, -1.0f};
-    float rimIntensity = 0.95f;
+    float rimIntensity = 0.f;
     float rimColor[3] = {0.45f, 0.62f, 0.85f};
 
     float ambient[3] = {0.016f, 0.012f, 0.009f};

@@ -187,11 +187,34 @@ grip.
   NEVER interpolated: blending two brushes would reintroduce exactly the
   per-sample blending this rig deletes, and a snap on a pose step is the
   stop-motion idiom.
-- **Not carried over from the bone rig**: eye gaze (the eye bones are gone —
-  the eyes are fixed beads riding the body affine) and per-digit finger curl
-  (`hands.gripCurl`, `hands.gripRoll` are unused; the grab morph replaces
-  them). A wound carved into a hand belongs to the POSE it was made in, since
-  the two hand poses are separate volume regions.
+- **Not carried over from the bone rig**: eye gaze as a bone rotation (the
+  eye bones are gone — the eyes are beads riding the body affine, and gaze
+  spins each pupil about its own eyeball) and per-digit finger curl
+  (`hands.gripCurl` is DELETED — it had to be zero under the affine rig, so
+  under the only rig there is it was a slider multiplied out to nothing; the
+  grab brush is how a grip shape changes now). `hands.gripRoll` IS live: it
+  spins the whole mitt about the blade. A wound carved into a hand belongs to
+  the POSE it was made in, since the two hand poses are separate volume
+  regions.
+
+## The look-dev panel is deliberately small
+
+ImGui carries knobs whose right value is still a judgement call you make by
+looking. Anything settled has been cut — the mitt alignment (reach, palm,
+orient, grip axis/roll/spread), the sword's placement (hilt pos/yaw/pitch/
+length/radius/glow, all driven by the harness's guard-and-swing pose so
+dragging them fought the animation), the clip play/speed controls for clips
+this asset does not have, and the camera sliders that drag-orbit does better.
+
+**Nothing was lost.** ctl still exposes every `LookParams` field by struct
+path, which is the better home for a value set once and never touched:
+
+```sh
+tools/ctl.sh "set hands.gripRoll 0.4" "set sword.pitch 0.35"
+```
+
+Add a knob back to the panel when you are actively tuning it, not because it
+exists.
 
 ## Windowed test harness (M5)
 

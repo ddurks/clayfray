@@ -51,10 +51,6 @@ fn triVert(t: u32, k: u32) -> vec3f {
   let vi = mIdx[t * 3u + k];
   return vec3f(mPos[vi * 6u], mPos[vi * 6u + 1u], mPos[vi * 6u + 2u]);
 }
-fn triNormal(t: u32, k: u32) -> vec3f {
-  let vi = mIdx[t * 3u + k];
-  return vec3f(mPos[vi * 6u + 3u], mPos[vi * 6u + 4u], mPos[vi * 6u + 5u]);
-}
 
 struct TriHit {
   d2: f32,

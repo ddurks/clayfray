@@ -11,11 +11,8 @@
 // block above, so at least those cannot drift.
 struct Piece {
   invSkin: mat4x4f,
-  skin: mat4x4f,    // forward, for the round-trip consistency check
   aabbLo: vec4f,
   aabbHi: vec4f,
-  capA: vec4f,
-  capB: vec4f,
 }
 
 struct Fighter {

@@ -39,7 +39,6 @@ fn fbm(p: vec3f) -> f32 {
   return v;
 }
 
-fn sdSphere(p: vec3f, r: f32) -> f32 { return length(p) - r; }
 fn sdEllipsoid(p: vec3f, r: vec3f) -> f32 {
   let k0 = length(p / r);
   let k1 = length(p / (r * r));

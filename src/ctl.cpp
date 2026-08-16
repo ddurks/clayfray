@@ -180,7 +180,6 @@ void CtlServer::buildRegistry() {
     addI("hands.gripAxis", &l->hands.gripAxis);
         addF("hands.gripRoll", &l->hands.gripRoll);
     addF("hands.gripSpread", &l->hands.gripSpread);
-    addF("hands.gripCurl", &l->hands.gripCurl);
     addB("gaze.track", &l->gaze.track);
     addF("gaze.maxAngle", &l->gaze.maxAngle);
     OrbitCamera* c = refs_.cam;
