@@ -10,7 +10,9 @@
 #include <span>
 #include <vector>
 
-#ifdef __APPLE__
+#ifdef __EMSCRIPTEN__
+#include <SDL3/SDL_properties.h>
+#elif defined(__APPLE__)
 #include <SDL3/SDL_metal.h>
 #endif
 #ifdef _WIN32
@@ -20,9 +22,37 @@
 #include <windows.h>
 #endif
 
+bool gpuBlockOn(const wgpu::Instance& instance, wgpu::Future future,
+                const char* what) {
+#if CLAYFRAY_HAS_BLOCKING_GPU_WAIT
+    (void)what;
+    return instance.WaitAny(future, UINT64_MAX) == wgpu::WaitStatus::Success;
+#else
+    // Not "we chose not to wait" — we CANNOT. wgpuInstanceWaitAny is an
+    // abort() in a non-Asyncify browser module at every timeout including 0
+    // (platform.h note 1), so calling it would take the tab down with a stack
+    // trace pointing at Dawn instead of at the real problem. Report and fail.
+    (void)instance;
+    (void)future;
+    std::fprintf(stderr,
+                 "[web] blocking GPU wait for '%s' is not available in a "
+                 "browser — this call site still needs the stage-2 callback "
+                 "inversion (or build with -DCLAYFRAY_WEB_JSPI=ON)\n",
+                 what);
+    return false;
+#endif
+}
+
 namespace {
 
-// ---- persistent pipeline cache -------------------------------------------
+#ifndef __EMSCRIPTEN__
+// ---- persistent pipeline cache (native only) -----------------------------
+// Not compiled on web for two independent reasons, either of which is fatal:
+// `DawnCacheDeviceDescriptor` does not exist in emdawnwebgpu (it is a native
+// Dawn extension), and the backing store would be MEMFS, i.e. thrown away
+// when the tab closes. The browser keeps its own compiled-pipeline cache
+// across loads, so nothing is lost.
+//
 // Dawn compiles every WGSL module from scratch on each launch — ~6 s for the
 // trace/pick shaders alone, paid on EVERY run of an edit-rebuild-look cycle.
 // Dawn exposes a blob cache hook; back it with one file per entry so warm
@@ -97,15 +127,22 @@ void cacheStore(size_t keySize, const uint8_t* key, size_t valueSize,
     std::filesystem::rename(tmp, path, ec);
     if (ec) std::filesystem::remove(tmp, ec);
 }
+#endif // !__EMSCRIPTEN__
 
 } // namespace
 
 bool Gpu::init(SDL_Window* window) {
+    wgpu::InstanceDescriptor instDesc{};
+#if CLAYFRAY_HAS_BLOCKING_GPU_WAIT
+    // Asking for TimedWaitAny is not a hint on web: emdawnwebgpu's
+    // CreateInstance returns NULL when the feature is requested without
+    // Asyncify/JSPI, so a stray request here reads as "failed to create
+    // instance" with no further explanation.
     static const wgpu::InstanceFeatureName instFeatures[] = {
         wgpu::InstanceFeatureName::TimedWaitAny};
-    wgpu::InstanceDescriptor instDesc{};
     instDesc.requiredFeatureCount = 1;
     instDesc.requiredFeatures = instFeatures;
+#endif
     instance = wgpu::CreateInstance(&instDesc);
     if (!instance) {
         std::fprintf(stderr, "wgpu: failed to create instance\n");
@@ -135,7 +172,7 @@ bool Gpu::init(SDL_Window* window) {
                                  (int)msg.length, msg.data);
                 }
             });
-        instance.WaitAny(af, UINT64_MAX);
+        gpuBlockOn(instance, af, "adapter request");
     };
     requestAdapter(adapterOpts);
     if (!adapter && adapterOpts.backendType == wgpu::BackendType::Vulkan) {
@@ -179,6 +216,7 @@ bool Gpu::init(SDL_Window* window) {
             }
         });
 
+#ifndef __EMSCRIPTEN__
     // Warm starts skip shader compilation entirely (see cacheLoad above).
     // CLAYFRAY_NO_PIPELINE_CACHE=1 forces cold compiles when a cache entry is
     // suspect; deleting .cache/pipeline/ has the same effect permanently.
@@ -207,6 +245,7 @@ bool Gpu::init(SDL_Window* window) {
             });
         devDesc.nextInChain = &cacheDesc;
     }
+#endif
 
     wgpu::Future df = adapter.RequestDevice(
         &devDesc, wgpu::CallbackMode::WaitAnyOnly,
@@ -218,12 +257,26 @@ bool Gpu::init(SDL_Window* window) {
                              (int)msg.length, msg.data);
             }
         });
-    instance.WaitAny(df, UINT64_MAX);
+    gpuBlockOn(instance, df, "device request");
     if (!device) return false;
     queue = device.GetQueue();
 
     if (window) {
-#ifdef __APPLE__
+#ifdef __EMSCRIPTEN__
+        // The surface is a <canvas> named by CSS selector. It must be the SAME
+        // canvas SDL is drawing/eventing on, or input goes to one element and
+        // pixels to another — so ask SDL which one it took rather than
+        // hardcoding. SDL's Emscripten backend defaults to "#canvas", which is
+        // also what the stock emcc HTML shell emits.
+        const char* selector = SDL_GetStringProperty(
+            SDL_GetWindowProperties(window),
+            SDL_PROP_WINDOW_EMSCRIPTEN_CANVAS_ID_STRING, "#canvas");
+        wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvasSource{};
+        canvasSource.selector = selector;
+        wgpu::SurfaceDescriptor surfDesc{};
+        surfDesc.nextInChain = &canvasSource;
+        surface = instance.CreateSurface(&surfDesc);
+#elif defined(__APPLE__)
         SDL_MetalView view = SDL_Metal_CreateView(window);
         void* layer = SDL_Metal_GetLayer(view);
         wgpu::SurfaceSourceMetalLayer metalSource{};
@@ -273,6 +326,12 @@ void Gpu::processEvents() {
 }
 
 void Gpu::waitForGpu() {
+#if !CLAYFRAY_DEV_TOOLS
+    // Backpressure for the headless loops only, and those are native-only.
+    // The browser paces us by returning to the event loop between frames, so
+    // there is nothing to throttle and nothing that may block here.
+    return;
+#else
     if (!instance || !queue) return;
     wgpu::Future f = queue.OnSubmittedWorkDone(
         wgpu::CallbackMode::WaitAnyOnly,
@@ -282,5 +341,6 @@ void Gpu::waitForGpu() {
                              (int)status, (int)msg.length, msg.data);
             }
         });
-    instance.WaitAny(f, UINT64_MAX);
+    gpuBlockOn(instance, f, "queue drain");
+#endif
 }

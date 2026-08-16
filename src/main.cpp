@@ -219,7 +219,13 @@ long poseTickOf(double t) { return (long)std::floor(t * 12.0 + 1e-9); }
 
 // break-on-condition (ctl `break ledger T`): pause instead of exiting so
 // the state is inspectable via stats/shot/snap. One-shot; re-arm to renew.
+// Only ctl can arm it, so it goes where ctl goes.
 void checkBreak(CtlServer& ctl, const Renderer& renderer, SimClock& clock) {
+#if !CLAYFRAY_DEV_TOOLS
+    (void)ctl;
+    (void)renderer;
+    (void)clock;
+#else
     if (ctl.breakLedgerTol < 0.f) return;
     const SplootStats& s = renderer.sploot();
     float res = (s.carved - (s.deposited + s.inFlight + s.debt)) * 1e6f;
@@ -231,6 +237,7 @@ void checkBreak(CtlServer& ctl, const Renderer& renderer, SimClock& clock) {
                      res, ctl.breakLedgerTol);
         ctl.breakLedgerTol = -1.f;
     }
+#endif
 }
 
 std::string gCharacterPath; // --character; empty = built-in analytic fighter
@@ -277,6 +284,12 @@ struct RunOpts {
     int exitAfter = 0;           // windowed smoke test
 };
 
+#if CLAYFRAY_DEV_TOOLS
+// Every headless mode (--screenshot, --carve-test, --serve, --replay) is a
+// desktop harness: no swapchain, a fixed 1/60 s step regardless of wall clock,
+// and GPU backpressure held by blocking on the queue. A browser has none of
+// those levers — it hands you a canvas and a frame callback — so the web
+// target builds the windowed path only.
 int runHeadless(const RunOpts& o) {
     Gpu gpu;
     if (!gpu.init(nullptr)) return 1;
@@ -509,6 +522,7 @@ int runHeadless(const RunOpts& o) {
     }
     return 0;
 }
+#endif // CLAYFRAY_DEV_TOOLS
 
 int runWindowed(const RunOpts& o) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
@@ -583,7 +597,7 @@ int runWindowed(const RunOpts& o) {
     refs.fps = &fps;
     refs.wantQuit = &ctlQuit;
     refs.charPath = gCharacterPath;
-    ctl.init("ctl", refs);
+    ctl.init(CLAYFRAY_DEV_TOOLS ? "ctl" : "", refs);
 
     if (!o.loadName.empty()) {
         if (!renderer.loadSnapshot(snapFilePath(o.loadName), &simT, gCharacterPath)) {
@@ -600,6 +614,13 @@ int runWindowed(const RunOpts& o) {
     int screenshotCounter = 0;
     bool running = true;
 
+    // STAGE 2 SEAM. Everything from here to the bottom of the loop is one
+    // frame and is already browser-safe: no blocking waits, no filesystem, all
+    // GPU readbacks async (AllowSpontaneous, pumped by processEvents). What is
+    // NOT browser-safe is the `while` itself — a browser needs the body handed
+    // to emscripten_set_main_loop so control returns to the event loop between
+    // frames, and Gpu::init/Renderer::init hoisted behind the adapter/device
+    // callbacks that currently sit behind gpuBlockOn (gpu.h).
     while (running && !ctlQuit) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -700,7 +721,12 @@ int runWindowed(const RunOpts& o) {
         }
         fps = fpsMeter.tick(frameDt);
 
-        if (++frameCounter % 30 == 0) renderer.reloadShadersIfChanged();
+        frameCounter++;
+#if CLAYFRAY_DEV_TOOLS
+        // shader hot reload: a stat() sweep of the source tree's shaders/,
+        // which on web would be a sweep of read-only preloaded MEMFS
+        if (frameCounter % 30 == 0) renderer.reloadShadersIfChanged();
+#endif
         if (o.exitAfter > 0 && frameCounter >= o.exitAfter) running = false;
 
         // internal resolution scale (throttled so slider drags don't thrash
@@ -780,12 +806,17 @@ int runWindowed(const RunOpts& o) {
             ImGui::Render();
         }
 
+#if CLAYFRAY_DEV_TOOLS
         if (wantScreenshot) {
             char path[64];
             std::snprintf(path, sizeof(path), "lookdev/capture_%03d.png",
                           screenshotCounter++);
             renderer.screenshot(path);
         }
+#else
+        (void)wantScreenshot;
+        (void)screenshotCounter;
+#endif
         gpu.processEvents();
         ctl.finishFrame();
         checkBreak(ctl, renderer, clock);
@@ -875,8 +906,19 @@ int main(int argc, char** argv) {
         if (!aaSet) o.aa = 1;
     }
 
+#if CLAYFRAY_DEV_TOOLS
     if (!o.screenshotPath.empty() || o.serve || !o.replayPath.empty()) {
         return runHeadless(o);
     }
+#else
+    // Flag PARSING stays identical on web so the two builds cannot drift over
+    // what a flag means; only the modes that need a real OS are unreachable.
+    if (!o.screenshotPath.empty() || o.serve || !o.replayPath.empty() ||
+        !o.loadName.empty()) {
+        std::fprintf(stderr,
+                     "[web] headless modes and snapshots are desktop-only; "
+                     "running windowed\n");
+    }
+#endif
     return runWindowed(o);
 }

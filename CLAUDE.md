@@ -13,6 +13,37 @@ cmake --build build                 # configures via FetchContent on first run
 ./build/clayfray --screenshot out.png --frames 8 --size 960x540 --aa 2
 ```
 
+### Web target (Emscripten) — STAGE 1: it BUILDS, it does not yet RUN
+
+```sh
+emcmake cmake -S . -B build-web -DCMAKE_BUILD_TYPE=Release
+cmake --build build-web        # -> build-web/clayfray.{html,js,wasm,data}
+```
+
+Dependencies come from Emscripten's own ports (`--use-port=sdl3
+--use-port=emdawnwebgpu`), not the FetchContent'd native Dawn — a wasm module
+has no native Dawn to link, and emdawnwebgpu is Dawn's browser-facing
+implementation. The ports pin their own SDL3/Dawn revisions; the desktop pins
+are untouched by that branch and only `__EMSCRIPTEN__` code ever sees the port
+headers.
+
+`src/platform.h` is the whole platform boundary, and `CLAYFRAY_DEV_TOOLS` is
+the switch. Web drops: the ctl server, snapshots, shader hot reload, journal
+record/replay, screenshots, `debugStats`/`debugScanField`, and every headless
+mode. Web keeps: the renderer, the sim, the ImGui panel (imgui's WebGPU
+backend speaks emdawnwebgpu — keep `IMGUI_IMPL_WEBGPU_BACKEND_DAWN`, the
+`_WGPU` spelling is wgpu-native), and the runtime reads of `shaders/*.wgsl`
+and `assets/fighter.glb`. Those reads are UNCHANGED: the linker preloads both
+into MEMFS at the same paths, cwd is `/`, and only `CLAYFRAY_SHADER_DIR`
+differs (`/shaders`, since the source tree's absolute path means nothing
+inside the module). A NEW asset needs a `--preload-file` line in CMakeLists or
+it is silently missing on web.
+
+Stage 1 deliberately stops short of running: `runWindowed` still owns a
+`while` loop and `Gpu::init` still blocks on the adapter/device futures. Stage
+2 is `emscripten_set_main_loop` plus turning those two waits into callbacks —
+and per trap 9 they are the only two left.
+
 Headless flags: `--screenshot PATH --size WxH --frames N --time T --aa N`,
 `--cam AZ,EL,DIST` (inspect from another angle without serve mode),
 `--character file.glb`, `--carve-test` (scripted carve/add exercise),
@@ -300,6 +331,35 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    every pass that writes another. (`jfa.wgsl`'s `bDistRO` is declared
    `read_write` purely for this reason.) The tracer's read-only bindings are
    safe only because tracing is a different pass from every write.
+
+9. **A browser main thread cannot block, and emdawnwebgpu makes that an
+   ABORT, not a hang.** `wgpuInstanceWaitAny` is a bare `abort()` in a
+   non-Asyncify wasm module at EVERY timeout **including 0** — the port's
+   `library_webgpu.js` has literally one `abort()` line there — so there is no
+   poll-once fallback to write, and a blocking wait takes the tab down with a
+   stack trace pointing at Dawn. Requesting
+   `InstanceFeatureName::TimedWaitAny` is the same trap wearing a disguise:
+   `CreateInstance` returns NULL and it surfaces as "failed to create
+   instance" with no hint why.
+
+   So every blocking wait goes through `gpuBlockOn()` (src/gpu.h) and there is
+   exactly ONE `.WaitAny(` left in the tree, inside it:
+
+   ```sh
+   grep -rn '\.WaitAny(' src/            # must print exactly one line
+   grep -c emwgpuWaitAny build-web/clayfray.js   # must print 0
+   ```
+
+   The second check is the real one — Emscripten only links the WaitAny JS
+   glue if something references it, so 0 proves the web build cannot reach the
+   abort. (It prints 1 under `-DCLAYFRAY_WEB_JSPI=ON`, which is the escape
+   hatch that makes blocking legal again.) Adding a bare `WaitAny` back
+   compiles clean on both targets and fails only in a browser.
+
+   Blocking also hides in non-GPU clothing: `Renderer::syncMeasurements`
+   sleep-spins for map callbacks that only the JS event loop can deliver, so
+   it is compiled out too. Any new "wait until X arrives" loop belongs behind
+   `CLAYFRAY_DEV_TOOLS`, not in the frame path.
 
 ## Verifying a conservation (M4.6) change
 

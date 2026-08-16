@@ -227,6 +227,16 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
     return true;
 }
 
+#if !CLAYFRAY_DEV_TOOLS
+// Both of these exist to answer "is the pool full / is the field corrupt" at a
+// desktop terminal, and both do it by stalling the process on a whole-volume
+// readback (tens of MB). Neither is reachable on web — CLAYFRAY_DEBUG_STATS is
+// read only by the headless run — so they compile away rather than being
+// ported to a callback.
+void BrickSystem::debugStats(const char*) {}
+void BrickSystem::debugScanField() {}
+#else
+
 void BrickSystem::debugStats(const char* label) {
     const uint32_t cells = kGrid * kGrid * kGrid;
     wgpu::BufferDescriptor desc{};
@@ -244,7 +254,7 @@ void BrickSystem::debugStats(const char* label) {
                                  [&ok](wgpu::MapAsyncStatus s, wgpu::StringView) {
                                      ok = s == wgpu::MapAsyncStatus::Success;
                                  });
-    gpu_->instance.WaitAny(f, UINT64_MAX);
+    if (!gpuBlockOn(gpu_->instance, f, "debugStats readback")) return;
     if (!ok) return;
     const uint32_t* d = (const uint32_t*)rb.GetConstMappedRange(0, desc.size);
     uint32_t alloc = 0, fresh = 0, inside = 0, maxIdx = 0;
@@ -289,7 +299,7 @@ void BrickSystem::debugScanField() {
                                  [&ok](wgpu::MapAsyncStatus s, wgpu::StringView) {
                                      ok = s == wgpu::MapAsyncStatus::Success;
                                  });
-    gpu_->instance.WaitAny(f, UINT64_MAX);
+    if (!gpuBlockOn(gpu_->instance, f, "debugScanField readback")) return;
     if (!ok) return;
     const uint32_t* ind = (const uint32_t*)rb.GetConstMappedRange(0, desc.size);
     const uint16_t* dist = (const uint16_t*)(ind + cells);
@@ -341,7 +351,7 @@ void BrickSystem::debugScanField() {
                                    [&cok](wgpu::MapAsyncStatus s, wgpu::StringView) {
                                        cok = s == wgpu::MapAsyncStatus::Success;
                                    });
-    gpu_->instance.WaitAny(cf, UINT64_MAX);
+    gpuBlockOn(gpu_->instance, cf, "coarse-field readback");
     if (cok) {
         const float* cd = (const float*)crb.GetConstMappedRange(0, cdesc.size);
         int neg = 0, tiny = 0, nan = 0;
@@ -359,6 +369,7 @@ void BrickSystem::debugScanField() {
         crb.Unmap();
     }
 }
+#endif // CLAYFRAY_DEV_TOOLS
 
 // Legacy single-fighter entry point: prepare and use in one step.
 void BrickSystem::requestImport(CharacterAsset asset) {
@@ -669,6 +680,13 @@ bool BrickSystem::measurementsIdle() const {
     return true;
 }
 
+#if !CLAYFRAY_DEV_TOOLS
+// Snapshots are desktop-only (see the header of snapshot.cpp). Stubbed rather
+// than removed, so Renderer's save/load path needs no #if of its own.
+bool BrickSystem::save(SnapWriter&) { return false; }
+bool BrickSystem::load(SnapReader&) { return false; }
+#else
+
 bool BrickSystem::save(SnapWriter& w) {
     const uint32_t cells = kGrid * kGrid * kGrid;
     std::vector<uint8_t> ind = readbackBuffer(*gpu_, volume, cells * 4ull, kIndOff);
@@ -779,6 +797,7 @@ bool BrickSystem::load(SnapReader& r) {
     capSpillSeen_ = 0;
     return true;
 }
+#endif // CLAYFRAY_DEV_TOOLS
 
 // Copy the counter block out for the async watermark/spill check. Called for
 // edits (every 60), and also after import and bake: a right-sized pool is most

@@ -2,6 +2,15 @@
 
 #include <cstring>
 
+// Snapshots are a desktop dev-loop feature end to end: ~80 MB of raw
+// same-build memory written to disk so a rebuild can drop you back into the
+// exact scene. On web the "disk" is the wasm heap (gone when the tab closes)
+// and the readback below is a blocking wait, so the whole file compiles out
+// rather than being ported. Nothing calls into it — Renderer::saveSnapshot /
+// loadSnapshot, BrickSystem::save/load and GroundClay::save/load are guarded
+// by the same switch.
+#if CLAYFRAY_DEV_TOOLS
+
 namespace {
 constexpr char kMagic[4] = {'C', 'F', 'S', 'N'};
 // 2: BrickEdit gained worldPos (rest-space pos + world wound, M5 locomotion)
@@ -132,10 +141,12 @@ std::vector<uint8_t> readbackBuffer(Gpu& gpu, wgpu::Buffer src, uint64_t size,
                                  [&ok](wgpu::MapAsyncStatus s, wgpu::StringView) {
                                      ok = s == wgpu::MapAsyncStatus::Success;
                                  });
-    gpu.instance.WaitAny(f, UINT64_MAX);
+    if (!gpuBlockOn(gpu.instance, f, "snapshot readback")) return out;
     if (!ok) return out;
     out.resize(size);
     std::memcpy(out.data(), rb.GetConstMappedRange(0, size), size);
     rb.Unmap();
     return out;
 }
+
+#endif // CLAYFRAY_DEV_TOOLS

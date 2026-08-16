@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.25)
-if(APPLE)
+# `APPLE` here is the HOST, not the target: this line runs before project(),
+# and MEASURED at that point (emcmake, macOS host) APPLE=1 while
+# CMAKE_SYSTEM_NAME and EMSCRIPTEN are both still EMPTY — the toolchain file
+# has not been read yet. CMAKE_TOOLCHAIN_FILE is the only signal available,
+# because emcmake passes it on the command line as a cache entry. Without this
+# test the web configure enables an Objective-C++ language it never uses and
+# points it at the HOST clang from inside a cross toolchain.
+if(APPLE AND NOT CMAKE_TOOLCHAIN_FILE MATCHES "Emscripten")
   # OBJCXX must be declared here: enable_language() later in the file fails
   # to initialize the toolchain (missing CMAKE_OBJCXX_COMPILE_OBJECT)
   project(clayfray LANGUAGES C CXX OBJCXX)
@@ -22,8 +29,33 @@ if(CCACHE_PROGRAM)
 endif()
 
 option(CLAYFRAY_TRACY "Enable Tracy profiler client" OFF)
+# Web escape hatch: link the module with JSPI so gpuBlockOn() can really block
+# (see src/platform.h). OFF is the intended shape — stage 2 removes the last
+# blocking callers instead — but a flag beats a rewrite if that stalls.
+option(CLAYFRAY_WEB_JSPI "Web: allow blocking GPU waits via JSPI" OFF)
 
 include(FetchContent)
+
+# ---- window + WebGPU: ONE interface target, two very different sources ----
+# Desktop builds SDL3 and Dawn from source. The browser CANNOT: a wasm module
+# has no native Dawn to link, and the browser's WebGPU is reached through
+# Dawn's Emscripten port, emdawnwebgpu, which Emscripten ships as a `--use-port`
+# (it downloads a prebuilt package + JS glue). SDL3 likewise has an Emscripten
+# port. Everything downstream links `clayfray_deps` and stays platform-blind.
+add_library(clayfray_deps INTERFACE)
+
+if(EMSCRIPTEN)
+  # Ports must appear on the COMPILE line as well as the link line: they
+  # contribute the include directories (webgpu/webgpu_cpp.h, SDL3/SDL.h), and
+  # a compile-only or link-only spelling fails with "file not found" or
+  # undefined symbols respectively.
+  set(CLAYFRAY_EM_PORTS --use-port=sdl3 --use-port=emdawnwebgpu)
+  target_compile_options(clayfray_deps INTERFACE ${CLAYFRAY_EM_PORTS})
+  target_link_options(clayfray_deps INTERFACE ${CLAYFRAY_EM_PORTS})
+  # Version skew is deliberate and web-only: the ports pin their own SDL3 and
+  # Dawn revisions, and the desktop pins below are untouched by this branch.
+  # Only code under __EMSCRIPTEN__ ever compiles against the port headers.
+else()
 
 # ---- SDL3 (static) ----
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
@@ -56,6 +88,11 @@ FetchContent_Declare(dawn
   GIT_SUBMODULES ""
   GIT_SUBMODULES_RECURSE FALSE)
 
+FetchContent_MakeAvailable(sdl3 dawn)
+target_link_libraries(clayfray_deps INTERFACE SDL3::SDL3 dawn::webgpu_dawn)
+
+endif() # EMSCRIPTEN
+
 # ---- Dear ImGui (no CMake upstream; we build our own target) ----
 FetchContent_Declare(imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui
@@ -74,7 +111,7 @@ FetchContent_Declare(cgltf
   GIT_TAG v1.15
   GIT_SHALLOW TRUE)
 
-FetchContent_MakeAvailable(sdl3 dawn imgui stb cgltf)
+FetchContent_MakeAvailable(imgui stb cgltf)
 
 if(APPLE)
   # the wgpu backend pulls in Cocoa/Metal headers on macOS, so compile it as
@@ -93,8 +130,11 @@ add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
   ${IMGUI_WGPU_BACKEND})
 target_include_directories(imgui_lib PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+# emdawnwebgpu IS Dawn's API surface, so the Dawn spelling of imgui's WebGPU
+# backend is correct on web too — it is `IMGUI_IMPL_WEBGPU_BACKEND_WGPU` (the
+# wgpu-native flavour) that would be wrong.
 target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-target_link_libraries(imgui_lib PUBLIC SDL3::SDL3 dawn::webgpu_dawn)
+target_link_libraries(imgui_lib PUBLIC clayfray_deps)
 
 add_executable(clayfray
   src/main.cpp
@@ -108,8 +148,47 @@ add_executable(clayfray
   src/ctl.cpp
   src/ui.cpp)
 target_include_directories(clayfray PRIVATE ${stb_SOURCE_DIR} ${cgltf_SOURCE_DIR})
-target_link_libraries(clayfray PRIVATE SDL3::SDL3 dawn::webgpu_dawn imgui_lib)
-target_compile_definitions(clayfray PRIVATE CLAYFRAY_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders")
+target_link_libraries(clayfray PRIVATE clayfray_deps imgui_lib)
+
+if(EMSCRIPTEN)
+  # Runtime file reads are UNCHANGED on web — that is the point of preloading.
+  # `shaders/` and `assets/` are baked into a .data file the loader mounts into
+  # MEMFS before main() runs, at the paths given after '@'. loadShader() and
+  # the fighter.glb ifstream then open exactly the paths they always did; only
+  # the shader ROOT differs, because the source tree's absolute path is
+  # meaningless inside the module.
+  #
+  # Emscripten's initial working directory is "/", so main.cpp's relative
+  # "assets/fighter.glb" resolves to the mount below without a chdir.
+  target_compile_definitions(clayfray PRIVATE CLAYFRAY_SHADER_DIR="/shaders")
+  target_link_options(clayfray PRIVATE
+    "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/shaders@/shaders"
+    # the .glb by name, not the whole assets/ directory: the sibling
+    # fighter.blend and the Blender export scripts are 375 KB of payload every
+    # visitor would download and nothing would read. Cost of naming it: a NEW
+    # asset needs a line here or it is silently absent on web.
+    "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/assets/fighter.glb@/assets/fighter.glb"
+    # The clay volumes are GPU buffers, so the wasm heap only carries mesh
+    # import staging and the edit/gob queues. 64 MB is a starting reservation,
+    # NOT a measured figure — nothing has run yet (stage 1 builds, stage 2
+    # runs) — and growth covers being wrong. Re-check it once the tab boots.
+    -sALLOW_MEMORY_GROWTH=1
+    -sINITIAL_MEMORY=67108864)
+  if(CLAYFRAY_WEB_JSPI)
+    # -sJSPI is a LINK setting (em++ warns and ignores it on a compile line);
+    # the define is what flips CLAYFRAY_HAS_BLOCKING_GPU_WAIT in platform.h,
+    # and it must reach every TU that contains a wait.
+    target_compile_definitions(clayfray PRIVATE CLAYFRAY_WEB_JSPI)
+    target_link_options(clayfray PRIVATE -sJSPI)
+  endif()
+  # emit the stock emcc shell, whose <canvas id="canvas"> is what both SDL and
+  # the WebGPU surface bind to (see the selector lookup in gpu.cpp)
+  set_target_properties(clayfray PROPERTIES SUFFIX ".html")
+else()
+  # the SOURCE tree, not an install dir: editing a .wgsl and having the running
+  # binary pick it up is the whole shader hot-reload loop (CLAUDE.md trap 1)
+  target_compile_definitions(clayfray PRIVATE CLAYFRAY_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders")
+endif()
 
 if(CLAYFRAY_TRACY)
   FetchContent_Declare(tracy
