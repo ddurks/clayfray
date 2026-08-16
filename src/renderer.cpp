@@ -15,8 +15,29 @@
 
 #include "snapshot.h"
 
+// stb_image_write's Radiance (.hdr) writer calls sprintf, which macOS marks
+// deprecated, so this warned on EVERY build. We never write .hdr — screenshots
+// are PNG — but STB_IMAGE_WRITE_IMPLEMENTATION compiles the whole library, so
+// the dead path warns anyway.
+//
+// Suppressed AT THE INCLUDE, deliberately, rather than with a project-wide
+// -Wno-deprecated-declarations: this is vendored third-party code we do not
+// get to fix, and our own code should keep the diagnostic. A build whose
+// output is one permanent warning is a build nobody reads.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace {
 
