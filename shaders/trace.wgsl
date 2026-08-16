@@ -51,7 +51,12 @@ struct Uniforms {
   post: vec4f,
   post2: vec4f,
   mouse: vec4f,          // slot 13 (used by pick)
-  marbles: array<vec4f, 32>, // 16 x {pos,radius},{color,-} — 4 beads/fighter
+  // 4 beads per fighter (2 eyeballs + 2 pupils), 2 slots each. DERIVED from
+  // MAX_FIGHTERS, never a literal: as `array<vec4f, 32>` this silently agreed
+  // with the C++ only while kMaxFighters happened to be 4, and at any other
+  // value the uniform buffer came out smaller than the shader's computed
+  // minBindingSize — which fails EVERY bind group, not just this binding.
+  marbles: array<vec4f, MAX_FIGHTERS * 8>,
   marbleMeta: vec4f,     // x = count
   sceneMeta: vec4f,      // x = live fighter count, y = joint smin k,
                          // z = piece box margin
@@ -315,7 +320,7 @@ fn albedoFor(p: vec3f, m: f32) -> vec3f {
     return groundAlbedo(p);
   }
   // marble: per-prop color from the uniform (already linear)
-  let idx = clamp(i32(m - MAT_EYE + 0.5), 0, 15);
+  let idx = clamp(i32(m - MAT_EYE + 0.5), 0, i32(MAX_FIGHTERS * 4u) - 1);
   return u.marbles[idx * 2 + 1].rgb;
 }
 

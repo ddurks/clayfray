@@ -375,7 +375,9 @@ N=3 instead of N=2.
 
 **DONE (M-SLICE).** Shipped as one `BrickStore` of three buffers, sliced
 `kMaxFighters` ways, with a `BrickSystem` per fighter owning slice `f`. Trace
-is **4 of 8 storage buffers at any N** and `kMaxPlayers` is 4. What actually
+is **4 of 8 storage buffers at any N**. `kMaxFighters` is held at 2 for the
+memory (slices are allocated up front: 4 costs 157 MB of pools against 104),
+but the design is N-clean and was exercised at 4. What actually
 landed, against what was planned below:
 
 - Per-cell stride: yes, but the WRITE side never sees it — each fighter binds

@@ -87,10 +87,17 @@ struct MeasuredEdit {
 class BrickSystem {
   public:
     // ---- how many fighters share one store ----
-    // The cap is now a MEMORY choice, not a binding one: the tracer costs the
-    // same 3 bindings at any N (see BrickStore). Raising it multiplies the
-    // pool budget below and the uniform block's fighter array, nothing else.
-    static constexpr int kMaxFighters = 4;
+    // A MEMORY choice, not a binding one: the tracer costs the same 3 bindings
+    // at any N (see BrickStore), so this only multiplies the pool budget below
+    // and the uniform block's fighter array.
+    //
+    // Held at 2 deliberately. The slices are allocated up front whether or not
+    // a fighter is live, so 4 costs 157 MB of GPU buffers against 104 MB for
+    // 2 — fine on desktop, not obviously fine in a phone browser, and the web
+    // target ships. Going back to 4 is this line PLUS dropping kMaxBricks to
+    // 12288 (see its table); the static_assert below is the backstop if you
+    // forget, and it is deliberately strict rather than exact-at-the-limit.
+    static constexpr int kMaxFighters = 2;
     // Articulated regions per fighter: the brush rig is body + two mitts
     // (trap 7). This sizes the `pieces` array inside each Fighter in the
     // uniform block, so it is emitted into the shaders rather than
@@ -182,35 +189,42 @@ class BrickSystem {
     // promised. Overflow is graceful (finishCapacityPoll and the spill counter
     // in brick.cpp), never corrupting.
     //
-    // 12288 was 16384 while each fighter owned its own pools. Slicing trades
-    // 25% of one fighter's headroom for TWICE the fighters at 1.75x the total:
+    // THIS NUMBER IS PAIRED WITH kMaxFighters. The tracer binds each pool
+    // WHOLE, so the albedo binding is kMaxBricks * 2 KiB * kMaxFighters, and
+    // core WebGPU only guarantees maxStorageBufferBindingSize = 128 MiB:
     //
     //           per fighter   x2 fighters   x4 fighters
-    //   16384    48 MiB        96 MiB        192 MiB   <- albedo alone hits
-    //                                                     the 128 MiB core
-    //                                                     binding-size limit
+    //   16384    48 MiB        96 MiB        192 MiB   <- albedo lands on
+    //                                                     EXACTLY 128 MiB:
+    //                                                     legal, but zero
+    //                                                     margin on a
+    //                                                     guaranteed minimum
     //   12288    36 MiB        72 MiB        144 MiB   <- albedo 96 MiB
     //
-    // What 12288 still covers: 1.82x the import floor, 1.47x the hard carve
-    // ceiling (which carving CANNOT exceed, see above), and it clears the
-    // worst case on record — CLAYFRAY_TEST_ADDSTRESS at ~11.5k — by 7%. That
-    // last margin is the thin one; if add-stress ever spills, raise this and
-    // re-check the 128 MiB albedo limit at kMaxFighters.
+    // At kMaxFighters = 2 shrinking this buys nothing, so it is back at the
+    // value derived for the one-volume-per-fighter design: 2.4x the import
+    // floor, 2.0x the hard carve ceiling (which carving CANNOT exceed, see
+    // above), and 1.4x the worst case on record (CLAYFRAY_TEST_ADDSTRESS,
+    // ~11.5k). At 12288 that last margin was 7% — measured 10273/12288, i.e.
+    // 83.6% of pool, which is a lot closer to spilling than it sounds.
     //
     // RE-MEASURE THIS if kGrid changes, if the artist re-exports a
     // significantly larger fighter, or before trusting it on a long play
     // session: bricks scale with kGrid^2, so kGrid=74 would want ~4x this.
     //   CLAYFRAY_DEBUG_STATS=1 ./build/clayfray --carve-test ...   -> allocTop
     //   CLAYFRAY_TEST_ADDSTRESS=1 with the same flags               -> the peak
-    static constexpr uint32_t kMaxBricks = 12288;
+    static constexpr uint32_t kMaxBricks = 16384;
     static constexpr uint64_t kDistBytes = (uint64_t)kMaxBricks * 256 * 4;
     static constexpr uint64_t kAlbedoBytes = (uint64_t)kMaxBricks * 512 * 4;
-    // Core WebGPU guarantees maxStorageBufferBindingSize = 128 MiB, and the
-    // tracer binds each pool WHOLE. Blowing this fails to create the trace
-    // bind group on a conformant mobile device while working on desktop —
-    // the same silent-black-screen shape as trap 8's binding count.
-    static_assert(kAlbedoBytes * kMaxFighters <= 134217728ull,
-                  "albedo pool exceeds the 128 MiB core storage-binding limit");
+    // Blowing this fails to create the trace bind group on a conformant mobile
+    // device while working perfectly on desktop — the same silent-black-screen
+    // shape as trap 8's binding count. STRICTLY less than the limit, not equal:
+    // 16384 x 4 fighters lands on 128 MiB to the byte, so an exact-fit assert
+    // would wave through the one combination most likely to bite.
+    static_assert(kAlbedoBytes * kMaxFighters < 134217728ull,
+                  "albedo pool needs the whole 128 MiB core storage-binding "
+                  "limit or more - drop kMaxBricks (see its table) or "
+                  "kMaxFighters");
     // The brick index is stored in the low 20 bits of an indirection word
     // (IND_IDX_MASK = 0x000FFFFF), so the encoding caps out at 1,048,575 —
     // shrinking the pool only uses less of that range. There is also a

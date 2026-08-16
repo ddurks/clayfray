@@ -81,8 +81,13 @@ Headless flags: `--screenshot PATH --size WxH --frames N --time T --aa N`,
 ## Players — fighters are SLICES (M5, sliced M-SLICE)
 
 `Renderer::addPlayer(pose)` adds a fighter and returns its index; player 0 is
-the hero. **The cap is 4** (`BrickSystem::kMaxFighters`), and it is now a
-MEMORY choice rather than a shader one.
+the hero. **The cap is `BrickSystem::kMaxFighters`, currently 2** — and it is
+now a MEMORY choice rather than a shader one. The slice machinery is sized by
+that constant and has been exercised at 4; it sits at 2 because every slice is
+allocated up front whether or not a fighter is live, so 4 costs 157 MB of GPU
+buffers against 104 MB, and the web target ships. Going to 4 is that one line
+PLUS dropping `kMaxBricks` to 12288 (its comment has the table; a
+`static_assert` catches you if you forget).
 
 Every fighter is a SLICE of one `BrickStore`: one `volume`, one `distPool`,
 one `albedoPool`, each cut into `kMaxFighters` partitions. So **the tracer
@@ -122,9 +127,10 @@ explicit (default 0 = the hero, which is what every journal and `--carve-test`
 assumes). Routing an edit off the live pick instead would silently redirect
 every SCRIPTED edit to whatever is under the cursor.
 
-ctl exposes `p1.*`…`p3.*` (`enabled`/`pos`/`yaw`/`lean`/`moving`), plus
-`foe.*` kept as an alias for player 1 so recorded journals still replay. The
-`edit` verb takes an optional trailing player index.
+ctl exposes `p1.*` … `p<kMaxPlayers-1>.*` (`enabled`/`pos`/`yaw`/`lean`/
+`moving`) — the registry is built by a loop, so raising the cap adds the names
+automatically. `foe.*` is kept as an alias for player 1 so recorded journals
+still replay. The `edit` verb takes an optional trailing player index.
 
 EVERY fighter bills to ONE conservation ledger: clay off any body becomes the
 same gobs on the same arena.
@@ -221,21 +227,23 @@ tools/ctl.sh quit
 ```
 
 Commands: `get NAME|*`, `set NAME V..` (any LookParams/sword/cam/brush field,
-names = struct paths like `sword.pitch`; plus `p1.*`…`p3.*` per opponent),
+names = struct paths like `sword.pitch`; plus `p1.*`… per opponent),
 `edit carve|add x y z r [rgb [dir srcRGB [player]]]`, `bake`, `shot PATH`,
 `stats`, `probe`/`pickuv u v`, `pause`, `resume`, `step [N]`, `timescale F`,
 `snap save|load NAME`, `record PATH|stop`, `break ledger TOL_ML|off`, `quit`.
 
-Four fighters, each carved in its own slice, from a cold `--serve`:
+Placing and carving an opponent in ITS OWN slice (the trailing `1` is the
+player index; drop it and the edit means the hero, which is what every
+existing journal assumes):
 
 ```sh
-tools/ctl.sh "set p2.enabled 1" "set p2.pos -0.95 0 0.35" "set p2.yaw 1.4"
-tools/ctl.sh "edit carve 0.02 0.45 0.14 0.085 0.72 0.45 0.4 0 0 1 .15 .4 .45 2"
+tools/ctl.sh "set p1.pos -0.95 0 0.35" "set p1.yaw 1.4"
+tools/ctl.sh "edit carve 0.02 0.45 0.14 0.085 0.72 0.45 0.4 0 0 1 .15 .4 .45 1"
 ```
 
 Every slice is imported at startup, so enabling a player is instant — but
 `playerCount()` only counts the ones `addPlayer()` made, and only `main.cpp`
-calls that (once, for player 1). Two fighters is still the default scene.
+calls that (once, for player 1).
 
 Iteration rules of thumb:
 - **Don't render screenshots to check your own work — build it and hand it
@@ -331,12 +339,33 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    `cmake --build build` before diagnosing wgpu errors after a shader change.
 
 2. **The `Uniforms` struct is hand-mirrored in THREE files**: `src/renderer.h`
-   (`kUniformSlots`, and the hardcoded slot writes in `packUniforms`),
-   `shaders/trace.wgsl`, and `shaders/pick.wgsl`. Change one → change all three.
-   A `static_assert` in `packUniforms` catches only C++-side buffer overrun;
-   the WGSL side has no compile-time link, so a mismatch shows up as the same
-   validation spew as trap 1. When you add a uniform field, append it (don't
-   reorder) and bump `kUniformSlots`.
+   (`kUniformSlots` and the `kSlot*` layout constants `packUniforms` writes
+   through), `shaders/trace.wgsl`, and `shaders/pick.wgsl`. Change one → change
+   all three. A `static_assert` in `packUniforms` catches only C++-side buffer
+   overrun; the WGSL side has no compile-time link, so a mismatch shows up as
+   the same validation spew as trap 1. When you add a uniform field, append it
+   (don't reorder).
+
+   **Any array sized by a C++ constant must be DERIVED in the WGSL, never
+   retyped as a literal.** This has already bitten once, and it is nastier
+   than it looks. `marbles` was `array<vec4f, 32>` in both shaders while the
+   C++ computed `4 * kMaxPlayers` beads — which agreed *by coincidence* at
+   `kMaxPlayers = 4`. Dropping the cap to 2 made the CPU buffer 2736 B against
+   a shader `minBindingSize` of 2992, and the failure is not local: **every**
+   bind group against that layout fails to create, so the app boots, imports,
+   prints a healthy asset banner, renders a black screen, and carves 0.0 ml
+   while `--carve-test` still exits 0 (0 == 0 balances). The fix is to size it
+   off the generated block — `array<vec4f, MAX_FIGHTERS * 8>` — which is why
+   `wgslConstants()` emits `MAX_FIGHTERS` and `PIECES_PER_FIGHTER` and why
+   `//#constants` sits ABOVE the struct in both roots.
+
+   So after ANY change to the uniform block or to `kMaxFighters`, grep the run
+   for validation spew rather than trusting an exit code:
+
+   ```sh
+   ./build/clayfray --screenshot /tmp/x.png --frames 4 --size 320x180 --aa 1 \
+     2>&1 | grep -c 'wgpu error'      # must print 0
+   ```
 
 3. **March fields must be CONSERVATIVE; AO/penumbra fields must be SMOOTH.**
    Feeding a conservative (Lipschitz-scaled / clamped) distance into AO or soft

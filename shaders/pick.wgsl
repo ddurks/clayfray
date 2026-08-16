@@ -39,7 +39,7 @@ struct Uniforms {
   post: vec4f,
   post2: vec4f,
   mouse: vec4f, // xy = uv of cursor
-  marbles: array<vec4f, 32>,
+  marbles: array<vec4f, MAX_FIGHTERS * 8>,
   marbleMeta: vec4f,
   sceneMeta: vec4f,
   capsMeta: vec4f,

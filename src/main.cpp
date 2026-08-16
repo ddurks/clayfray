@@ -538,6 +538,25 @@ int runHeadless(const RunOpts& o) {
     // measurement or a gob was dropped — a real regression. Agents/CI can
     // gate on this exit code instead of eyeballing the ledger line.
     if ((o.carveTest || !journal.empty()) && look.conserveClay) {
+        // A balance of 0 == 0 is NOT a pass for --carve-test: it always carves,
+        // so carving nothing means the run never got that far. That is exactly
+        // what a bind-group validation failure looks like from out here — the
+        // app boots, imports, prints a healthy banner, renders black, and
+        // balances perfectly at zero. This gate reported success through it
+        // (see trap 2), so make the silence itself the failure.
+        // ...but only for the DEFAULT carve-test. The two env-var variants
+        // carve nothing on purpose: ADDSTRESS only deposits, and NULLEDITS
+        // fires ops that deliberately touch no clay.
+        const bool plainCarveTest = o.carveTest &&
+                                    !std::getenv("CLAYFRAY_TEST_ADDSTRESS") &&
+                                    !std::getenv("CLAYFRAY_TEST_NULLEDITS");
+        if (plainCarveTest && s.carved <= 0.f) {
+            std::fprintf(stderr,
+                         "[sploot] CARVE TEST CARVED NOTHING (0.0 ml). The "
+                         "ledger 'balances' but no edit landed — check the run "
+                         "for wgpu validation errors.\n");
+            return 3;
+        }
         float residual = s.carved - (s.deposited + s.inFlight + s.debt);
         float tol = std::max(1e-6f, s.carved * 0.01f); // 1 ml or 1% of carved
         if (std::fabs(residual) > tol) {
