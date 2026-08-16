@@ -1,5 +1,6 @@
 #include "asset.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -73,14 +74,22 @@ bool CharacterAsset::load(const std::string& path) {
         return false;
     }
 
-    // Every mesh bound to the armature is one body: the blob rig authors the
-    // torso and the two floating mitts as SEPARATE Blender objects sharing
-    // one skin, and they all have to land in the same voxel volume. Picking a
-    // single node (as this did) silently imported whichever came last —
-    // a fighter made of nothing but hands.
+    // CLAUDE.md trap 7 used to read "the character is EVERY mesh bound to the
+    // armature, not one node", because the rig authored the blob and its two
+    // mitts as separate objects sharing one skin and merging them was the only
+    // way to get a whole fighter.
+    //
+    // M-RIG inverts that. There is no armature, and the meshes must stay
+    // SEPARATE — each becomes its own brush at its own place in the volume, and
+    // the hand is imported TWICE (rest and grab). So selection is by node name,
+    // and the merge is gone. The trap survives in spirit: get the selection
+    // wrong and you still get a fighter made of nothing but hands, which is why
+    // the summary at the end prints a per-part vertex count.
     const cgltf_skin* skin = nullptr;
     std::vector<const cgltf_node*> bodyNodes;
     const cgltf_node* unskinned = nullptr; // fallback for rigless assets
+    const cgltf_node* namedBody = nullptr; // node "body"
+    const cgltf_node* namedHand = nullptr; // node "hand"
     for (cgltf_size n = 0; n < data->nodes_count; n++) {
         const cgltf_node* node = &data->nodes[n];
         if (!node->mesh) continue;
@@ -121,6 +130,10 @@ bool CharacterAsset::load(const std::string& path) {
         }
         if (wholeNodeIsProp) {
             // fully consumed as beads
+        } else if (std::strcmp(name, "body") == 0) {
+            namedBody = node;
+        } else if (std::strcmp(name, "hand") == 0) {
+            namedHand = node;
         } else if (node->skin) {
             if (!skin) skin = node->skin;
             if (node->skin == skin) {
@@ -133,24 +146,38 @@ bool CharacterAsset::load(const std::string& path) {
             unskinned = node;
         }
     }
-    // no armature at all: fall back to the single mesh (pre-rig assets)
-    if (bodyNodes.empty() && unskinned) bodyNodes.push_back(unskinned);
-    if (bodyNodes.empty()) {
-        std::fprintf(stderr, "asset: no body mesh found in %s\n", path.c_str());
-        cgltf_free(data);
-        return false;
-    }
-
-    for (const cgltf_node* bodyNode : bodyNodes) {
-        // skinned verts are in armature space per glTF; non-skinned get node world
+    // ---- brush assembly ----
+    // Append one node's clay primitives as a MeshPart. `morph` selects a morph
+    // target to apply at full weight (-1 = base shape); `offset` translates the
+    // whole part in rest space, which is how the grab hand is moved into the
+    // empty negative-x half of the volume.
+    //
+    // Every part lands in the SAME positions/indices arrays: the voxelizer
+    // consumes one triangle soup and does not care that it is three disconnected
+    // shells. Its watertight +x parity raycast counts crossings, so disjoint
+    // CLOSED shells each resolve correctly on their own (verified: both meshes
+    // are closed 2-manifolds once split vertices are welded).
+    auto addPart = [&](const cgltf_node* node, const char* partName, int morph,
+                       const float offset[3]) -> int {
+        if (!node || !node->mesh) return -1;
+        MeshPart part;
+        part.name = partName;
+        part.idxBegin = (uint32_t)indices.size();
+        for (int a = 0; a < 3; a++) {
+            part.lo[a] = 1e9f;
+            part.hi[a] = -1e9f;
+        }
+        // Unskinned verts are authored in the node's own space; on this asset
+        // every node is identity, but honouring the transform keeps a
+        // re-export that parents something to an Empty from silently shifting.
         float world[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-        if (!bodyNode->skin) cgltf_node_transform_world(bodyNode, world);
+        if (!node->skin) cgltf_node_transform_world(node, world);
 
-        for (cgltf_size p = 0; p < bodyNode->mesh->primitives_count; p++) {
-            const cgltf_primitive& prim = bodyNode->mesh->primitives[p];
+        for (cgltf_size p = 0; p < node->mesh->primitives_count; p++) {
+            const cgltf_primitive& prim = node->mesh->primitives[p];
             if (prim.type != cgltf_primitive_type_triangles) continue;
             if (isMarblePrim(prim)) continue; // already a bead, not clay
-            uint32_t base = vertexCount();
+            const uint32_t base = vertexCount();
 
             const cgltf_accessor* pos = nullptr;
             const cgltf_accessor* col = nullptr;
@@ -173,18 +200,48 @@ bool CharacterAsset::load(const std::string& path) {
             }
             if (!pos) continue;
 
+            // Morph target POSITION deltas, applied at weight 1.0. glTF morph
+            // deltas are per-vertex offsets in the SAME space as the base
+            // positions, so this is a plain add before the node transform.
+            const cgltf_accessor* dlt = nullptr;
+            if (morph >= 0 && (cgltf_size)morph < prim.targets_count) {
+                for (cgltf_size a = 0; a < prim.targets[morph].attributes_count; a++) {
+                    if (prim.targets[morph].attributes[a].type ==
+                        cgltf_attribute_type_position)
+                        dlt = prim.targets[morph].attributes[a].data;
+                }
+            }
+            if (morph >= 0 && !dlt) {
+                std::fprintf(stderr,
+                             "asset: '%s' wanted morph target %d but the primitive "
+                             "has none — importing the base shape\n",
+                             partName, morph);
+            }
+
             for (cgltf_size i = 0; i < pos->count; i++) {
                 float v[3];
                 cgltf_accessor_read_float(pos, i, v, 3);
+                if (dlt && i < dlt->count) {
+                    float dv[3];
+                    cgltf_accessor_read_float(dlt, i, dv, 3);
+                    v[0] += dv[0]; v[1] += dv[1]; v[2] += dv[2];
+                }
                 float x = world[0] * v[0] + world[4] * v[1] + world[8] * v[2] + world[12];
                 float y = world[1] * v[0] + world[5] * v[1] + world[9] * v[2] + world[13];
                 float z = world[2] * v[0] + world[6] * v[1] + world[10] * v[2] + world[14];
+                x += offset[0]; y += offset[1]; z += offset[2];
                 positions.insert(positions.end(), {x, y, z});
+                part.lo[0] = std::min(part.lo[0], x); part.hi[0] = std::max(part.hi[0], x);
+                part.lo[1] = std::min(part.lo[1], y); part.hi[1] = std::max(part.hi[1], y);
+                part.lo[2] = std::min(part.lo[2], z); part.hi[2] = std::max(part.hi[2], z);
 
                 float c[4] = {0.5f, 0.5f, 0.5f, 1.f};
                 if (col) cgltf_accessor_read_float(col, i, c, 4);
                 colors.insert(colors.end(), {c[0], c[1], c[2]});
 
+                // No skin on this asset: joints stay 0 and weights stay the
+                // identity (1,0,0,0). Nothing in the pipeline reads either any
+                // more — they exist so a rigged asset still imports.
                 cgltf_uint j[4] = {0, 0, 0, 0};
                 if (jnt) cgltf_accessor_read_uint(jnt, i, j, 4);
                 joints.insert(joints.end(), {(uint16_t)j[0], (uint16_t)j[1],
@@ -201,6 +258,34 @@ bool CharacterAsset::load(const std::string& path) {
                 }
             }
         }
+        part.idxCount = (uint32_t)indices.size() - part.idxBegin;
+        if (part.idxCount == 0) return -1;
+        parts.push_back(std::move(part));
+        return (int)parts.size() - 1;
+    };
+
+    static const float kNoOffset[3] = {0.f, 0.f, 0.f};
+    if (namedBody || namedHand) {
+        // The three brushes, in voxelization order. The hand is imported TWICE
+        // from the SAME primitive: once as authored (rest) and once with the
+        // "grab" morph target at full weight, translated into the empty half of
+        // the volume. Discrete poses, never blended — see brick_read.wgsl.
+        partBody = addPart(namedBody, "body", -1, kNoOffset);
+        partHandRest = addPart(namedHand, "hand.rest", -1, kNoOffset);
+        partHandGrab = addPart(namedHand, "hand.grab", 0, kGrabBrushOffset);
+    } else {
+        // Legacy/rigged assets: keep the old behaviour — every mesh bound to
+        // the armature (or the lone unskinned mesh) merged into one body brush.
+        if (bodyNodes.empty() && unskinned) bodyNodes.push_back(unskinned);
+        for (const cgltf_node* bodyNode : bodyNodes) {
+            const int pi = addPart(bodyNode, "body", -1, kNoOffset);
+            if (partBody < 0) partBody = pi;
+        }
+    }
+    if (parts.empty()) {
+        std::fprintf(stderr, "asset: no body mesh found in %s\n", path.c_str());
+        cgltf_free(data);
+        return false;
     }
 
     std::unordered_map<const cgltf_node*, int> jointIndex;
@@ -281,6 +366,30 @@ bool CharacterAsset::load(const std::string& path) {
         if (!clip.tracks.empty()) clips.push_back(std::move(clip));
     }
 
+    // The artist authors ONE side and mirrors across x. That is true of the
+    // hand (handled as a brush above) and of the eye, whose two primitives
+    // (marble_pupil_L / marble_eye_L) arrive here as beads — so synthesise the
+    // right eye by reflecting each bead's centre. Radius is unchanged: a mirror
+    // is an isometry, and these are spheres.
+    //
+    // Guarded on there being no already-mirrored partner, so a future asset
+    // that ships both eyes does not get four.
+    if (!marbles.empty() && hasBrushRig()) {
+        bool anyLeft = false, anyRight = false;
+        for (const MarbleProp& m : marbles) {
+            if (m.pos[0] > 1e-4f) anyLeft = true;
+            if (m.pos[0] < -1e-4f) anyRight = true;
+        }
+        if (anyLeft && !anyRight) {
+            const size_t n = marbles.size();
+            for (size_t i = 0; i < n; i++) {
+                MarbleProp m = marbles[i];
+                m.pos[0] = -m.pos[0];
+                marbles.push_back(m);
+            }
+        }
+    }
+
     // marbles ride the nearest joint (rest-space origin distance)
     if (!bones.empty()) {
         for (MarbleProp& m : marbles) {
@@ -308,6 +417,15 @@ bool CharacterAsset::load(const std::string& path) {
     }
     std::printf("asset: %s -> %u verts, %u tris, %zu bones, %zu marbles\n", path.c_str(),
                 vertexCount(), triangleCount(), bones.size(), marbles.size());
+    // Per-brush bounds. This is the line to read when the fighter looks wrong
+    // after a re-export (the spirit of CLAUDE.md trap 7): a missing part, a
+    // part with no triangles, or two parts whose boxes touch all show up here
+    // before anything is rendered.
+    for (const MeshPart& mp : parts) {
+        std::printf("asset: brush '%s' %u tris, aabb (%.4f %.4f %.4f)..(%.4f %.4f %.4f)\n",
+                    mp.name.c_str(), mp.idxCount / 3, mp.lo[0], mp.lo[1], mp.lo[2],
+                    mp.hi[0], mp.hi[1], mp.hi[2]);
+    }
     for (const AnimClip& c : clips) {
         std::printf("asset: clip '%s' %.2fs, %zu tracks\n", c.name.c_str(), c.duration,
                     c.tracks.size());

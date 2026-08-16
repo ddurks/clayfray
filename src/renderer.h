@@ -145,22 +145,51 @@ class Renderer {
     FighterPose fighterDisp_, foeDisp_;
     float dispPoseTime_ = -1.f;
 
-    // ---- M-PERF: the three-piece affine rig ----
-    // Articulation collapsed to an affine body plus two rigid mitts. See the
-    // block comment in shaders/brick_read.wgsl for what the sampling path
-    // gains; this is just the CPU-side table that describes the three pieces.
+    // ---- M-RIG: the three-piece brush rig ----
+    // Articulation is an affine body plus two rigid mitts, each sampling a
+    // DISJOINT region of the one rest volume. See the block comment in
+    // shaders/brick_read.wgsl for the design; this is the CPU-side table.
     //
-    // Built once per character. `srcBone` is the bone whose posed skin matrix
-    // IS the piece's transform — for the body that is any spine bone (they all
-    // carry the same affine once posed), for a mitt it is the wrist the hand
-    // IK placed. `boneMask` is what the shader's ownership test compares the
-    // per-cell dominant bone against; lo/hi bound the clay the piece carries.
+    // Two ways a piece gets its rest->world transform:
+    //   srcBone >= 0  the posed skin matrix of that bone (legacy rigged asset)
+    //   srcBone <  0  `xform`, written directly each frame by updateBrushRig
+    // The fighter asset has no armature, so it always takes the second.
+    //
+    // lo/hi are the piece's rest-space AABB. Under the brush rig they are the
+    // selected BRUSH's box, they change when the pose index changes, and the
+    // shader clips to them — so they are load-bearing geometry, not just the
+    // conservative cull they were under the bone rig. `boneMask` is dead
+    // (the ownership test it fed is gone); kept only for the legacy path.
     struct AffinePiece {
         uint32_t boneMask = 0;
         float lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
         int srcBone = -1;
+        float xform[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     };
     std::vector<AffinePiece> affinePieces_;
+    // The opponent needs its OWN piece matrices (its own pose drives them), so
+    // it cannot share the hero's table the way the bone rig did via skinMats_.
+    std::vector<AffinePiece> foeAffinePieces_;
+
+    // Static description of the three brushes, measured off the asset at import
+    // and then constant. `canonLo/canonHi` are each hand brush's bounds mapped
+    // back onto the authored (rest-hand) frame, so both poses are placed by the
+    // same grip maths; `ofs` is the rest-space translation that brush carries
+    // in the volume (zero for the rest hand, kGrabBrushOffset for the grab).
+    struct BrushRig {
+        bool valid = false;
+        float bodyLo[3], bodyHi[3];
+        float handLo[2][3], handHi[2][3];   // [0] = rest, [1] = grab, in-volume
+        float canonLo[2][3], canonHi[2][3]; // the same, mapped to the rest frame
+        float ofs[2][3];
+        float palm[2][3]; // grip point per pose, canonical frame
+    };
+    BrushRig brush_{};
+    // Pose index per hand, LATCHED on the 12 Hz grid: 0 = rest brush, 1 = grab
+    // brush. Discrete and never interpolated — see brick_read.wgsl.
+    int handPose_[2] = {0, 0};
+    int foeHandPose_[2] = {0, 0};
+    float handPoseTime_ = -1.f;
 
     // Procedural squish: one scalar per fighter. q < 0 is compressed, q > 0
     // stretched; the overshoot back through zero IS the bounce. Stepped on the
@@ -175,12 +204,26 @@ class Renderer {
     BodySpring foeSpring_{0.f, 0.f, 0.37f};
     float springPoseTime_ = -1.f;
     bool affineOn(const LookParams& look) const;
+    // True when the asset arrived without an armature and the brush rig is the
+    // only rig there is.
+    bool skeletonFree() const { return bones_.empty() && !affinePieces_.empty(); }
     static void stepSpring(BodySpring& s, const RigParams& r, bool moving, float dt);
+    // Shadow-proxy capsule fitted to a brush's rest AABB (there are no bones
+    // left for deriveCapsules to fit to).
+    static void capsuleFromBox(const float lo[3], const float hi[3], float a[3],
+                               float b[3], float& r);
     void bodyAffine(const FighterPose& disp, const BodySpring& s,
                     const RigParams& r, float out[16]) const;
+    // Recomputes one fighter's three piece transforms and brush boxes for the
+    // current pose. `grip` is the world-space sword geometry to hold, or null
+    // to leave the mitts riding the body.
+    void updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
+                        const FighterPose& disp, const BodySpring& s,
+                        const LookParams& look, const SwordParams* grip) const;
     // Writes the three pieces at `base` (66 for the hero, 293 for the foe) and
     // returns how many it wrote.
     int packAffinePieces(float out[kUniformSlots][4], int base,
+                         const std::vector<AffinePiece>& pieces,
                          const std::vector<float>& mats) const;
     // Tight posed bound over those pieces: each piece's rest AABB corners run
     // through its own transform. The 13-piece path derives this from posed
@@ -188,7 +231,8 @@ class Renderer {
     // bounds, so the corners give a tighter sphere for free — and it has to be
     // recomputed rather than inherited, because a squish can push the body
     // past a bound measured on the rest mesh.
-    float affineBoundR(const std::vector<float>& mats, const float center[3]) const;
+    float affineBoundR(const std::vector<AffinePiece>& pieces,
+                       const std::vector<float>& mats, const float center[3]) const;
 
   public:
     // M5: where the fighter stands. Set from the gameplay tick; the renderer

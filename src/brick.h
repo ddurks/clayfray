@@ -98,44 +98,47 @@ class BrickSystem {
     // (Vulkan's limit is effectively unbounded, which is why M5's second
     // fighter looked fine on the Windows box.)
     //
-    // So indirection, JFA seeds, the coarse field and the cell weights live
-    // at fixed offsets inside `volume`. A pass that WRITES one binds just its
-    // own region as a sub-range, so the write shaders are untouched; the
-    // tracer binds the whole buffer once and adds a base index on the read
-    // (the CELL_* constants in wgslConstants(), used by brick_read.wgsl).
+    // So indirection, JFA seeds and the coarse field live at fixed offsets
+    // inside `volume`. A pass that WRITES one binds just its own region as a
+    // sub-range, so the write shaders are untouched; the tracer binds the whole
+    // buffer once and adds a base index on the read (the CELL_* constants in
+    // wgslConstants(), used by brick_read.wgsl).
     //
     // Every write-side binding of these regions is read_write ON PURPOSE:
     // Dawn rejects a buffer that is writable and read-only within one pass,
     // and it tracks that per BUFFER, not per bound range — so a `read`
     // binding on any region would break every pass that writes another.
+    //
+    // M-RIG: there used to be a FOURTH region here, `cellW` — a per-cell
+    // 4-slot bone-weight field (kCellCount * 8 bytes) that existed solely to
+    // steer the inverse-LBS chunk warp and, later, the affine rig's
+    // dominant-bone ownership test. The asset has no armature and the brush
+    // rig separates pieces by disjoint rest-space AABBs, so nothing reads a
+    // bone weight anywhere in the pipeline any more. Dropping the region is
+    // 1 MB of the volume buffer per fighter and, more usefully, deletes the
+    // volume-wide flood fill from import.
     static constexpr uint64_t kCellCount = (uint64_t)kGrid * kGrid * kGrid;
     static constexpr uint64_t kCellBytes = kCellCount * 4;
-    static constexpr uint64_t kCellWBytes = kCellCount * 8; // 4 joints + 4 weights
     // Region starts must satisfy minStorageBufferOffsetAlignment (256).
     static constexpr uint64_t kAlign = 256;
     static constexpr uint64_t kRegionStride = (kCellBytes + kAlign - 1) & ~(kAlign - 1);
     static constexpr uint64_t kIndOff = 0;                     // indirection
     static constexpr uint64_t kSeedOff = kRegionStride;        // JFA seeds (jfaA)
     static constexpr uint64_t kCoarseOff = kRegionStride * 2;  // coarse distance
-    static constexpr uint64_t kCellWOff = kRegionStride * 3;   // per-cell skin
     static constexpr uint64_t kVolumeBytes =
-        kCellWOff + ((kCellWBytes + kAlign - 1) & ~(kAlign - 1));
+        kCoarseOff + ((kCellBytes + kAlign - 1) & ~(kAlign - 1));
 
-    // ---- chunk-warp thresholds: RESOLUTION-RELATIVE, never metres ----
-    // These three were authored as fixed distances (0.05 / 0.008 / 0.06 m)
-    // tuned at kGrid=50. A fixed distance silently TIGHTENS as kGrid falls,
-    // because the errors they gate on are all set by cell/voxel size — which
-    // is how dropping to kGrid=37 opened holes in the character's sides. The
-    // multipliers below reproduce the tuned values exactly at kGrid=50 and
-    // track the grid from there.
+    // ---- piece thresholds: RESOLUTION-RELATIVE, never metres ----
+    // These were authored as fixed distances tuned at kGrid=50. A fixed
+    // distance silently TIGHTENS as kGrid falls, because the errors they gate
+    // on are all set by cell/voxel size — which is how dropping to kGrid=37
+    // opened holes in the character's sides. The multipliers below reproduce
+    // the tuned values exactly at kGrid=50 and track the grid from there.
     //
-    // Round-trip rejection tolerance, in CELL SPANS. forwardResid() compares
-    // a sample's forward-LBS round-trip against where it came from. Genuine
-    // samples miss by the inverse-LBS approximation error, whose scale is set
-    // by the resolution of the per-cell skin field (cellWeights) — so this is
-    // span-relative. Too tight and real armpit/shoulder samples get rejected
-    // as "vacated space" and nothing renders there: holes in the sides.
-    static constexpr float kWarpResidSpans = 1.765f;      // 0.05 m at kGrid=50
+    // M-RIG removed a third, kWarpResidSpans: the inverse-LBS round-trip
+    // rejection tolerance that forwardResid() compared against. Both it and
+    // forwardResid went with the skeleton.
+    //
     // Joint blend width, in VOXELS: bridges hairline cracks where two pieces
     // hand off, without re-introducing ring bulges at the joint.
     static constexpr float kJointSminVoxels = 1.977f;     // 0.008 m at kGrid=50
@@ -162,21 +165,21 @@ class BrickSystem {
 
     // ---- shared mesh preprocessing ----
     // Everything requestImport() derives from the asset — triangle bins,
-    // watertight parity, smooth normals, the per-cell skin field — is a pure
-    // function of the CharacterAsset, and so are the read-only GPU buffers it
-    // uploads. Two fighters of the same character were computing byte-identical
-    // results twice: ~2.5 s of a 7.8 s startup, plus a duplicate ~32 MB upload.
-    // Only the OUTPUT volume (indirection, pools, cellWeights) is per-fighter.
+    // watertight parity, smooth normals — is a pure function of the
+    // CharacterAsset, and so are the read-only GPU buffers it uploads. Two
+    // fighters of the same character were computing byte-identical results
+    // twice: ~2.5 s of a 7.8 s startup, plus a duplicate ~32 MB upload.
+    // Only the OUTPUT volume (indirection, seeds, coarse, pools) is
+    // per-fighter.
     //
     // Call prepareImport() once per character and hand the result to every
     // fighter. Refcounted so the buffers outlive whichever BrickSystem dies
     // first.
     struct MeshImport {
         wgpu::Buffer pos;    // interleaved position + smooth normal
-        wgpu::Buffer idx, col, skin;
+        wgpu::Buffer idx, col;
         wgpu::Buffer tris;   // merged [cell offsets][triangle ids]
         wgpu::Buffer inside; // per-cell watertight parity bits
-        std::vector<uint32_t> cellW; // per-cell 4-slot skin, flood-filled
         uint32_t triCount = 0;
     };
     static std::shared_ptr<MeshImport> prepareImport(Gpu& gpu,
@@ -204,18 +207,17 @@ class BrickSystem {
     // refresh. Call once per frame before the trace pass.
     void encode(wgpu::CommandEncoder& enc);
 
-    // The per-cell arrays, packed at the kIndOff/kSeedOff/kCoarseOff/kCellWOff
-    // offsets above:
+    // The per-cell arrays, packed at the kIndOff/kSeedOff/kCoarseOff offsets
+    // above:
     //   ind    — indirection grid
     //   seed   — canonical JFA output (jfaA), read by tracer/pick
     //   coarse — per-cell signed coarse distance, read by tracer
-    //   cellW  — per-cell nearest-surface bone weights, flood-filled
-    //            volume-wide: the chunk warp needs weight guidance OUTSIDE the
-    //            narrow band too (a rigid warp guess at a big joint angle
-    //            lands far from the surface)
     wgpu::Buffer volume;
+    // NOTE (mobile memory): these two are sized by kMaxBricks (49152) but
+    // measured usage is ~12.4k bricks, so both are roughly 4x oversized. Left
+    // alone here on purpose — shrinking kMaxBricks has capacity-overflow
+    // consequences and is its own change.
     wgpu::Buffer distPool, albedoPool;
-    wgpu::Buffer weightPool; // per-voxel packed top-2 bone weights (M4 reads)
 
     // Blocking readbacks; debug only.
     void debugStats(const char* label);

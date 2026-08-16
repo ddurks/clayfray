@@ -46,33 +46,38 @@ grip.
   spring in `RigParams`, integrated **on the 12 Hz pose grid** — not the frame
   clock, because the squish is a traced uniform and a 60 Hz one would make a
   standing fighter re-trace every frame.
-- **The `bounce`/`idle` clips are not sampled** while it is on. They still
-  drive the 13-piece path, which is what keeps the A/B honest.
-- **Ownership, not box clipping**, decides which piece draws a region: the
-  per-cell dominant bone (`cellW`, already built by brick.cpp) is ANDed against
-  a per-piece bone mask carried in `Piece.capB.w`. Clipping to the AABB instead
-  slices flat bands across a round body. The AABB stays, as the cull it was.
-- The hard handoff is safe on THIS rig because the bone partition is also the
-  mesh partition — the blob is weighted only to `base*`, the mitts only to
-  `hand/thumb/finger*` — so the ownership boundary runs through the ~12 cm of
-  air between them. Attach the mitts to a body and the `min` in
-  `charDistAffine` becomes an `smin` at `u.boneMeta.y`.
-- `Piece.aabbLo.w` is the transform's **smallest singular value** in this mode,
-  not the min column norm the 13-piece path packs: a shear can have unit-length
-  columns and a much smaller sigma_min, and trusting the column norm makes the
-  march step through the skin.
-- **Known visual gap**: the mitts render in their rest (uncurled) shape,
-  because a one-transform piece cannot hold a per-digit curl. The intended fix
-  is baked hand-pose volumes — discrete grip shapes selected by index
-  (`rigMeta.y`, 0 today), never interpolated: blending two would reintroduce
-  exactly the blending this deletes, and a snap on a pose step reads as
-  stop-motion.
+- **There are no clips to sample.** The asset ships none; the walk/idle shape
+  is entirely procedural (the spring above). `animPlay`/`evalPose`/`animSpeed`
+  survive only for a hypothetical rigged asset and no-op on this one.
+- **BOX CLIPPING, NOT OWNERSHIP**, decides which piece draws a region:
+  `max(field, boxDist)` against the piece's own rest AABB. The dominant-bone
+  ownership test (and the `cellW` field it read) is DELETED — there are no
+  bones. An earlier AABB experiment sliced flat bands across the body; that
+  was when pieces clipped a shared, OVERLAPPING body region, so the box cut
+  through solid clay. The three brushes are now disjoint and ~0.12 m apart, so
+  each box contains its own brush entirely and cuts nothing. **Do not
+  reinstate ownership.**
+- `Piece.aabbLo.w` is the transform's **smallest singular value**, not a min
+  column norm: a shear can have unit-length columns and a much smaller
+  sigma_min, and trusting the column norm makes the march step through the
+  skin. For the two hands it is exactly 1 — a mirror has det -1 but
+  `M^T M = I`, so it is distance-preserving and needs no special case.
+- **The grip is a discrete brush swap.** Holding the sword selects the grab
+  brush, releasing selects the rest brush, latched on the 12 Hz pose grid and
+  NEVER interpolated: blending two brushes would reintroduce exactly the
+  per-sample blending this rig deletes, and a snap on a pose step is the
+  stop-motion idiom.
+- **Not carried over from the bone rig**: eye gaze (the eye bones are gone —
+  the eyes are fixed beads riding the body affine) and per-digit finger curl
+  (`hands.gripCurl`, `hands.gripRoll` are unused; the grab morph replaces
+  them). A wound carved into a hand belongs to the POSE it was made in, since
+  the two hand poses are separate volume regions.
 
 ## Windowed test harness (M5)
 
 `WASD` walks the fighter (camera-relative — forward is always away from the
-camera), it turns to face travel and leans into it, plays the `bounce` clip
-while moving and `idle` at rest, and the orbit target follows it. `SPACE`
+camera), it turns to face travel and leans into it, squishes and hops on its
+procedural spring (there are no clips), and the orbit target follows it. `SPACE`
 swings. The sword rests in a VERTICAL guard with a slight bob (quantized to
 the 12 Hz pose grid, trap 4); the swing is a three-beat flourish over 0.80 s —
 wind up high, flatten to horizontal and sweep across the front at chest
@@ -236,15 +241,24 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    the cursor — if they differ while the fighter is unposed at the origin,
    something is wrong.
 
-7. **The character is EVERY mesh bound to the armature, not one node.** The
-   fighter is authored as separate Blender objects (blob body + the two
-   floating mitts) sharing one skin; `CharacterAsset::load` merges all of
-   them. It used to pick a single node, which silently imported whichever
-   came last — a fighter made of nothing but hands, with no error. If the
-   body vanishes after a re-export, check the vertex count on the `asset:`
-   line against the sum of the mesh objects before suspecting the renderer.
-   A mesh bound to a SECOND skin is skipped with a warning (joint indices
-   would not line up).
+7. **The character is THREE BRUSHES selected by node name — and there is no
+   armature.** The asset has no skins, no animations and no bones: three
+   meshes authored in place (`body`, `hand`, `eye`). `CharacterAsset::load`
+   keeps them SEPARATE (it used to merge every mesh bound to the armature)
+   and imports the hand TWICE — once as authored, once with its `grab` morph
+   target at full weight, translated by `kGrabBrushOffset` into the empty
+   negative-x half of the rest volume. Three disjoint regions, one volume, no
+   new GPU resources. `eye` is consumed as marble beads via its `marble_*`
+   materials and the right eye/hand are MIRRORED in x at runtime, because the
+   artist authors one side only.
+
+   The old failure mode (a fighter made of nothing but hands, with no error)
+   is still the one to watch for after a re-export. The `asset: brush '...'`
+   lines print each brush's triangle count and AABB, and
+   `tools/verify_brush_layout.py` re-derives the whole layout from the .glb
+   and `src/brick.h` — run it if the artist moves anything. A brush that
+   leaves the volume box, or two brushes closer than the narrow band, breaks
+   the AABB clip that separates the pieces and both are reported.
 
 8. **A shader stage gets 10 storage buffers on Metal, and `trace` uses 9.**
    Metal gives a function 31 buffer slots; Dawn spends one on buffer lengths
@@ -253,8 +267,9 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    does) buys nothing. M5's second fighter took `trace` to 14 bindings and the
    pipeline failed to CREATE on macOS: `CreateComputePipeline` errored and
    every frame after it was invalid, while Vulkan (effectively unbounded)
-   showed nothing wrong. So each fighter's four per-cell arrays (indirection,
-   JFA seeds, coarse, cell weights) are REGIONS of one `volume` buffer: write
+   showed nothing wrong. So each fighter's per-cell arrays (indirection,
+   JFA seeds, coarse — there was a fourth, cell weights, until the skeleton
+   went) are REGIONS of one `volume` buffer: write
    passes bind their own region as a sub-range, which is why the write shaders
    still declare them separately, and the tracer binds the buffer once and
    adds a base index (`CELL_*` from `wgslConstants`, accessors at the top of
@@ -289,7 +304,7 @@ reference renders — diff against them by eye after a lighting/shading change.
 | `CLAYFRAY_NO_REDIST` / `_NO_ANIM` / `_NO_PIECES` | disable redistance / animation / chunk articulation |
 | `CLAYFRAY_AO` / `_DETAIL` / `_SHADOWK` | override look params (float) |
 | `CLAYFRAY_DEBUG_PICK=1` | print world vs REST position under the cursor (trap 6) |
-| `CLAYFRAY_NO_AFFINE=1` | force the 13-piece inverse-LBS warp instead of the 3-piece affine rig — the A/B for the M-PERF articulation collapse, on ONE binary (see below) |
+| `CLAYFRAY_NO_AFFINE=1` | draw the rest volume UNPOSED (pieces = 0), i.e. all three brushes side by side where they are authored. Answers "is the rig wrong or is the volume wrong?" in one keystroke. It used to select the 13-piece inverse-LBS warp; that path died with the armature, so this is no longer an A/B between two rigs |
 | `CLAYFRAY_DEBUG_REUSE=1` | name the input behind every re-trace that happens BETWEEN pose steps (a re-trace ON a pose step is the 12 Hz floor, so it stays quiet — silence means optimal) — a uniform (by slot NAME, e.g. "gobs (flying clay)") or the volume whose generation moved. Frame reuse is what makes motion affordable, so when the `[reuse] traced N of M` line collapses toward 0% skipped, this says which input refuses to settle |
 | `CLAYFRAY_TEST_ADDSTRESS` / `_TEST_NULLEDITS` | `--carve-test` variants (pool stress / null-edit JFA) |
 

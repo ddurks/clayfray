@@ -7,7 +7,10 @@ constexpr char kMagic[4] = {'C', 'F', 'S', 'N'};
 // 2: BrickEdit gained worldPos (rest-space pos + world wound, M5 locomotion)
 // 3: BrickEdit gained the capsule brush (segment/posB) for blade cuts
 // 4: kGrid 74 -> 50 (kVoxel 2.73 -> 4.05 mm); every pool/cell size changed
-constexpr uint32_t kVersion = 4;
+// 5: M-RIG dropped the skeleton. Sections "BCLW" (per-cell skin field) and
+//    "BWGT" (per-voxel bone weights) are gone with their buffers, and the
+//    volume buffer lost its fourth region, so kVolumeBytes shrank too.
+constexpr uint32_t kVersion = 5;
 
 uint32_t tagWord(const char tag[4]) {
     uint32_t w;

@@ -477,16 +477,148 @@ uint64_t Renderer::traceInputDigest(const float u[kUniformSlots][4]) const {
 // ---------- M-PERF: the three-piece affine rig ----------
 
 bool Renderer::affineOn(const LookParams& look) const {
-    // Env override so the parent can benchmark both rigs on ONE binary. A
-    // shader edit would force a cold pipeline compile on the next launch and
-    // that has faked two "wins" in this codebase already (CLAUDE.md).
+    if (affinePieces_.empty()) return false;
+    // THE A/B THAT USED TO LIVE HERE IS GONE, and it is worth saying why so
+    // nobody tries to restore it. `look.affineRig` / CLAYFRAY_NO_AFFINE=1
+    // switched between this rig and the 13-piece inverse-LBS warp, on one
+    // binary, so the pair could be benchmarked without a shader edit. The warp
+    // inverted a linear blend over a skeleton; the asset has no skeleton, no
+    // skin and no weights, so there is no second rig left to switch to and the
+    // comparison has no meaning.
+    //
+    // The flag is kept, repurposed to something that IS still useful on a
+    // skeleton-free asset: off = draw the rest volume unposed (pieces = 0, the
+    // shader's un-rigged path). That answers "is the rig wrong or is the
+    // VOLUME wrong?" in one keystroke, which is the question that actually
+    // comes up now. packUniforms implements the pn = 0 side.
     static const bool disabled = std::getenv("CLAYFRAY_NO_AFFINE") != nullptr;
-    if (disabled || !look.affineRig) return false;
-    // The ownership test packs one bit per bone into a piece's capB.w, and 16
-    // bones is the cap everywhere in the shader (array<Piece,16>). A bigger
-    // rig falls back to the 13-piece warp rather than silently mis-owning
-    // cells. This rig has 15.
-    return !affinePieces_.empty() && bones_.size() <= 16;
+    if (skeletonFree()) return !disabled && look.affineRig;
+    return !disabled && look.affineRig && bones_.size() <= 16;
+}
+
+// Rest -> world for the three brush pieces, for ONE fighter.
+//
+// piece 0 BODY: the existing affine, unchanged — spring squish, then the lean
+//   shear, then yaw, then translate/hop about the feet.
+// piece 1/2 HANDS: rigid. Each maps its selected brush back to the authored
+//   (canonical) hand frame, centres the palm, mirrors x for the right hand,
+//   orients onto the blade, and lands on its grip.
+// A brush's AABB as a capsule: axis along the box's longest dimension, radius
+// the smaller of the other two half-extents. Crude, but it is only the SHADOW
+// PROXY (charProxy), which is smin-ed and then max-ed against the real field —
+// so it may not be tight, it just must not be wildly too small.
+void Renderer::capsuleFromBox(const float lo[3], const float hi[3], float a[3],
+                              float b[3], float& r) {
+    float c[3], h[3];
+    for (int k = 0; k < 3; k++) {
+        c[k] = (lo[k] + hi[k]) * 0.5f;
+        h[k] = (hi[k] - lo[k]) * 0.5f;
+    }
+    int axis = 0;
+    for (int k = 1; k < 3; k++)
+        if (h[k] > h[axis]) axis = k;
+    const int o1 = (axis + 1) % 3, o2 = (axis + 2) % 3;
+    r = std::min(h[o1], h[o2]);
+    const float half = std::max(h[axis] - r, 0.f);
+    for (int k = 0; k < 3; k++) {
+        a[k] = c[k];
+        b[k] = c[k];
+    }
+    a[axis] = c[axis] - half;
+    b[axis] = c[axis] + half;
+}
+
+void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
+                              const FighterPose& disp, const BodySpring& s,
+                              const LookParams& look, const SwordParams* grip) const {
+    if (!brush_.valid || pieces.size() < 3) return;
+    float A[16];
+    bodyAffine(disp, s, look.rig, A);
+    std::memcpy(pieces[0].xform, A, sizeof(A));
+    for (int k = 0; k < 3; k++) {
+        pieces[0].lo[k] = brush_.bodyLo[k];
+        pieces[0].hi[k] = brush_.bodyHi[k];
+    }
+
+    // Blade frame. `offsetDir` is the fighter's own +X pushed perpendicular to
+    // the blade — NOT cross(blade, up), which degenerates exactly in the
+    // vertical guard the sword rests in most of the time.
+    float hilt[3] = {0, 0, 0}, tip[3] = {0, 0, 0};
+    float gA[3] = {0, 0, 0}, gB[3] = {0, 0, 0};
+    float blade[3] = {0.f, 1.f, 0.f};
+    if (grip) {
+        swordGeometry(*grip, hilt, tip, gA, gB);
+        for (int k = 0; k < 3; k++) blade[k] = tip[k] - hilt[k];
+        const float bl = std::sqrt(blade[0] * blade[0] + blade[1] * blade[1] +
+                                   blade[2] * blade[2]);
+        if (bl > 1e-6f) for (int k = 0; k < 3; k++) blade[k] /= bl;
+    }
+    const float cy = std::cos(disp.yaw), sy = std::sin(disp.yaw);
+    float offs[3] = {cy, 0.f, -sy};
+    const float dotOB = offs[0] * blade[0] + offs[1] * blade[1] + offs[2] * blade[2];
+    for (int k = 0; k < 3; k++) offs[k] -= dotOB * blade[k];
+    float ol = std::sqrt(offs[0] * offs[0] + offs[1] * offs[1] + offs[2] * offs[2]);
+    if (ol < 1e-5f) { offs[0] = 1.f; offs[1] = 0.f; offs[2] = 0.f; ol = 1.f; }
+    for (int k = 0; k < 3; k++) offs[k] /= ol;
+
+    for (int side = 0; side < 2; side++) { // 0 = left, 1 = right
+        AffinePiece& ap = pieces[1 + side];
+        const int b = (handPose[side] != 0) ? 1 : 0;
+        for (int k = 0; k < 3; k++) {
+            ap.lo[k] = brush_.handLo[b][k];
+            ap.hi[k] = brush_.handHi[b][k];
+        }
+        // Mirror in x for the right hand. det = -1, but M^T M = I so every
+        // singular value is 1: distance-preserving, and mat3MinSingular (which
+        // forms M^T M) returns exactly 1 for it. Confirmed, not assumed.
+        const float mir = (side == 1) ? -1.f : 1.f;
+
+        // Pre-translation applied in BRUSH space, before the mirror.
+        //   holding: brush -> canonical -> palm at the origin, so the grip
+        //            transform below lands the palm exactly on the hilt.
+        //   riding:  brush -> canonical ONLY. The hand keeps its authored
+        //            offset from the body, and mirroring about x=0 (the body's
+        //            own axis) puts the other one on the other side.
+        float pre[3];
+        for (int k = 0; k < 3; k++) {
+            pre[k] = -brush_.ofs[b][k] - (grip ? brush_.palm[b][k] : 0.f);
+        }
+
+        float M[16];
+        if (grip) {
+            // Fingers point ACROSS the blade, toward the other hand. The
+            // mirror supplies the flip, so `offs` is the target finger axis for
+            // BOTH hands: final finger dir = mir * offs, and each hand sits at
+            // sideSign * offs, so the fingers always face inward.
+            const float sideSign = (side == 1) ? 1.f : -1.f;
+            const float* g = (side == 1) ? gA : gB; // right takes the near grip
+            const float lateral = look.hands.gripSpread * grip->radius * sideSign;
+            float col0[3] = {offs[0], offs[1], offs[2]};
+            float col1[3] = {blade[0], blade[1], blade[2]};
+            float col2[3] = {col0[1] * col1[2] - col0[2] * col1[1],
+                             col0[2] * col1[0] - col0[0] * col1[2],
+                             col0[0] * col1[1] - col0[1] * col1[0]};
+            // columns (fingerDir, bladeDir, fingerDir x bladeDir) — orthonormal
+            // and det +1, so the ONLY reflection in the piece is the explicit
+            // mirror below.
+            M[0] = col0[0] * mir; M[1] = col0[1] * mir; M[2] = col0[2] * mir; M[3] = 0.f;
+            M[4] = col1[0];       M[5] = col1[1];       M[6] = col1[2];       M[7] = 0.f;
+            M[8] = col2[0];       M[9] = col2[1];       M[10] = col2[2];      M[11] = 0.f;
+            for (int k = 0; k < 3; k++) M[12 + k] = g[k] + offs[k] * lateral;
+            M[15] = 1.f;
+        } else {
+            // No sword: the mitt just rides the body, mirrored, where authored.
+            float Mir[16];
+            matIdentity(Mir);
+            Mir[0] = mir;
+            matMul(A, Mir, M);
+        }
+        // fold the pre-translation in: xform = M * T(pre)
+        float T[16];
+        matIdentity(T);
+        T[12] = pre[0]; T[13] = pre[1]; T[14] = pre[2];
+        matMul(M, T, ap.xform);
+    }
 }
 
 void Renderer::stepSpring(BodySpring& s, const RigParams& r, bool moving, float dt) {
@@ -544,15 +676,17 @@ void Renderer::bodyAffine(const FighterPose& disp, const BodySpring& s,
 }
 
 int Renderer::packAffinePieces(float out[kUniformSlots][4], int base,
+                               const std::vector<AffinePiece>& pieces,
                                const std::vector<float>& mats) const {
     int n = 0;
-    for (const AffinePiece& ap : affinePieces_) {
+    for (const AffinePiece& ap : pieces) {
         if (n >= 16) break;
         float fwd[16];
         if (ap.srcBone >= 0 && (size_t)(ap.srcBone * 16 + 16) <= mats.size()) {
             std::memcpy(fwd, &mats[ap.srcBone * 16], sizeof(fwd));
         } else {
-            matIdentity(fwd);
+            // brush rig: the transform was written straight into the piece
+            std::memcpy(fwd, ap.xform, sizeof(fwd));
         }
         float inv[16];
         matInvAffine(fwd, inv);
@@ -591,15 +725,16 @@ int Renderer::packAffinePieces(float out[kUniformSlots][4], int base,
     return n;
 }
 
-float Renderer::affineBoundR(const std::vector<float>& mats,
+float Renderer::affineBoundR(const std::vector<AffinePiece>& pieces,
+                             const std::vector<float>& mats,
                              const float center[3]) const {
     float r = 0.f;
-    for (const AffinePiece& ap : affinePieces_) {
+    for (const AffinePiece& ap : pieces) {
         float m[16];
         if (ap.srcBone >= 0 && (size_t)(ap.srcBone * 16 + 16) <= mats.size()) {
             std::memcpy(m, &mats[ap.srcBone * 16], sizeof(m));
         } else {
-            matIdentity(m);
+            std::memcpy(m, ap.xform, sizeof(m));
         }
         for (int c = 0; c < 8; c++) {
             const float q[3] = {(c & 1) ? ap.hi[0] : ap.lo[0],
@@ -643,17 +778,26 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // Beads for EVERY player, packed into the one 8-slot array: 4 eyes each
     // for two fighters fills it exactly. Each set rides its own skeleton, so
     // the opponent's eyes track its own pose.
+    // The eyes are the four beads: two per fighter under the bone rig, and
+    // under the brush rig two per fighter as well (the artist authors the LEFT
+    // eye's pupil + eyeball and the importer mirrors both across x).
+    //
+    // Skeleton-free, a bead has no bone to ride, so it rides the BODY piece's
+    // affine — which is what carries the squish, lean, yaw and hop. Radius is
+    // deliberately NOT scaled by it: glass beads don't breathe with the torso.
+    const bool brushRig = skeletonFree();
     int n = 0;
-    auto packMarbles = [&](const std::vector<float>& mats) {
+    auto packMarbles = [&](const std::vector<float>& mats,
+                           const std::vector<AffinePiece>& pieces) {
         for (const MarbleProp& m : marbles_) {
             if (n >= 8) break;
             float* slotA = out[14 + n * 2];
             float* slotB = out[15 + n * 2];
             float pos[3] = {m.pos[0], m.pos[1], m.pos[2]};
-            // props ride their bone rigidly; radius stays fixed (glass beads
-            // don't breathe with torso scale)
             if (m.bone >= 0 && (size_t)(m.bone * 16 + 16) <= mats.size()) {
                 matTransformPoint(&mats[m.bone * 16], m.pos, pos);
+            } else if (brushRig && !pieces.empty()) {
+                matTransformPoint(pieces[0].xform, m.pos, pos);
             }
             slotA[0] = pos[0]; slotA[1] = pos[1]; slotA[2] = pos[2];
             slotA[3] = m.radius;
@@ -661,18 +805,41 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
             n++;
         }
     };
-    packMarbles(skinMats_);
-    if (foeEnabled_ && !foeSkinMats_.empty()) packMarbles(foeSkinMats_);
+    packMarbles(skinMats_, affinePieces_);
+    if (foeEnabled_ && (!foeSkinMats_.empty() || brushRig))
+        packMarbles(foeSkinMats_, foeAffinePieces_);
     out[30][0] = (float)n;
 
-    // posed capsule shadow proxy (empty for the analytic fallback character)
+    // Posed capsule shadow proxy. Under the brush rig `bone` carries the PIECE
+    // index instead of a bone index (see setCharacter), so the capsule rides
+    // the same transform as the clay it stands in for.
     int cn = std::min((int)capsules_.size(), 16);
     float center[3] = {0.f, 0.f, 0.f};
     for (int i = 0; i < cn; i++) {
         const BoneCapsule& c = capsules_[i];
         float a[3] = {c.a[0], c.a[1], c.a[2]};
         float b[3] = {c.b[0], c.b[1], c.b[2]};
-        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
+        if (brushRig) {
+            // The capsule must be expressed in the SAME brush space its piece
+            // is currently sampling, or the piece's transform (which undoes
+            // that brush's rest-space offset) throws it ~1 m across the arena
+            // the moment a hand switches to the grab brush. The piece's own
+            // lo/hi already IS the selected brush's box, so refit from that
+            // every frame rather than caching a box from one pose.
+            if (c.bone >= 0 && (size_t)c.bone < affinePieces_.size()) {
+                const AffinePiece& ap = affinePieces_[c.bone];
+                float ca[3], cb[3], cr;
+                capsuleFromBox(ap.lo, ap.hi, ca, cb, cr);
+                matTransformPoint(ap.xform, ca, a);
+                matTransformPoint(ap.xform, cb, b);
+                float* sA = out[33 + i * 2];
+                float* sB = out[34 + i * 2];
+                sA[0] = a[0]; sA[1] = a[1]; sA[2] = a[2]; sA[3] = cr;
+                sB[0] = b[0]; sB[1] = b[1]; sB[2] = b[2];
+                for (int k = 0; k < 3; k++) center[k] += (a[k] + b[k]) * 0.5f;
+                continue;
+            }
+        } else if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
             matTransformPoint(&skinMats_[c.bone * 16], c.a, a);
             matTransformPoint(&skinMats_[c.bone * 16], c.b, b);
         }
@@ -703,17 +870,21 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // preserve the distance metric; max/min/smin keep Lipschitz <= 1.
     static const bool noPieces = std::getenv("CLAYFRAY_NO_PIECES") != nullptr;
     const bool affine = affineOn(look);
-    int pn = noPieces ? 0 : cn;
+    // Skeleton-free with the rig switched off: pn = 0 puts the shader on its
+    // un-rigged path (the rest volume drawn where it was authored, all three
+    // brushes visible side by side). That is the debug A/B described in
+    // affineOn — NOT a fallback anything ships with.
+    int pn = (brushRig || noPieces) ? 0 : cn;
     float bodyBoundR = 0.f;
     if (affine && !noPieces) {
         // Three pieces replace the per-capsule ones. The posed bound comes off
         // the pieces' own rest boxes rather than the capsule endpoints below,
         // because a squish can push clay past any bound measured at rest.
-        pn = packAffinePieces(out, 66, skinMats_);
-        bodyBoundR = affineBoundR(skinMats_, center);
+        pn = packAffinePieces(out, 66, affinePieces_, skinMats_);
+        bodyBoundR = affineBoundR(affinePieces_, skinMats_, center);
     }
     // ...otherwise the M4-P1 per-capsule pieces, one per bone.
-    const int legacyPn = affine ? 0 : pn;
+    const int legacyPn = (affine || brushRig) ? 0 : pn;
     for (int i = 0; i < legacyPn; i++) {
         const BoneCapsule& c = capsules_[i];
         float inv[16];
@@ -788,10 +959,12 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // the hero's above but driven by ITS skeleton, which is what lets it play
     // its own clip instead of standing rigid.
     int fpn = 0;
-    if (affine && foeEnabled_ && !noPieces &&
-        foeSkinMats_.size() >= bones_.size() * 16) {
-        fpn = packAffinePieces(out, 293, foeSkinMats_);
-    } else if (foeEnabled_ && !noPieces &&
+    if (affine && foeEnabled_ && !noPieces && brushRig) {
+        fpn = packAffinePieces(out, 293, foeAffinePieces_, foeSkinMats_);
+    } else if (affine && foeEnabled_ && !noPieces &&
+               foeSkinMats_.size() >= bones_.size() * 16) {
+        fpn = packAffinePieces(out, 293, affinePieces_, foeSkinMats_);
+    } else if (foeEnabled_ && !noPieces && !brushRig &&
                foeSkinMats_.size() >= bones_.size() * 16) {
         fpn = std::min((int)capsules_.size(), 16);
         for (int i = 0; i < fpn; i++) {
@@ -870,7 +1043,7 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
 
     // M4.7 sword: emissive blade endpoints (radius 0 = inactive). memset above
     // already zeroed the slots, so the disabled case needs no write.
-    if (swordWorld_.enabled && !bones_.empty()) {
+    if (swordWorld_.enabled && (!bones_.empty() || brushRig)) {
         float hilt[3], tip[3], gA[3], gB[3];
         swordGeometry(swordWorld_, hilt, tip, gA, gB);
         out[284][0] = hilt[0]; out[284][1] = hilt[1]; out[284][2] = hilt[2];
@@ -908,18 +1081,26 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
         // reject sphere from its actual posed pieces. Too SMALL a sphere
         // clips the opponent out of the frame, so this has to track the
         // squish rather than reuse the rest-mesh radius.
-        if (affine && fpn > 0 && foeSkinMats_.size() >= bones_.size() * 16) {
+        if (affine && fpn > 0 &&
+            (brushRig || foeSkinMats_.size() >= bones_.size() * 16)) {
+            const std::vector<AffinePiece>& fp =
+                brushRig ? foeAffinePieces_ : affinePieces_;
             float m[16];
-            const int sb = affinePieces_.empty() ? -1 : affinePieces_[0].srcBone;
-            if (sb >= 0 && (size_t)(sb * 16 + 16) <= foeSkinMats_.size()) {
-                std::memcpy(m, &foeSkinMats_[sb * 16], sizeof(m));
+            if (brushRig) {
+                if (fp.empty()) matIdentity(m);
+                else std::memcpy(m, fp[0].xform, sizeof(m));
             } else {
-                matIdentity(m);
+                const int sb = fp.empty() ? -1 : fp[0].srcBone;
+                if (sb >= 0 && (size_t)(sb * 16 + 16) <= foeSkinMats_.size()) {
+                    std::memcpy(m, &foeSkinMats_[sb * 16], sizeof(m));
+                } else {
+                    matIdentity(m);
+                }
             }
             float c[3];
             matTransformPoint(m, foeCenterRest_, c);
             out[292][0] = c[0]; out[292][1] = c[1]; out[292][2] = c[2];
-            out[291][1] = affineBoundR(foeSkinMats_, c) + 0.05f;
+            out[291][1] = affineBoundR(fp, foeSkinMats_, c) + 0.05f;
         }
     }
 }
@@ -976,6 +1157,128 @@ void Renderer::setCharacter(CharacterAsset asset) {
     clips_ = asset.clips;
     capsules_ = deriveCapsules(asset);
     evalPose(bones_, nullptr, 0.f, skinMats_); // identity: rest pose
+
+    // ---- M-RIG: the skeleton-free brush rig ----
+    // Built entirely from the imported MeshParts, so it needs no armature. Done
+    // FIRST because it decides whether any of the bone machinery below runs at
+    // all (on this asset none of it does: every loop is over an empty bones_).
+    brush_ = BrushRig{};
+    affinePieces_.clear();
+    foeAffinePieces_.clear();
+    if (asset.hasBrushRig()) {
+        const MeshPart& body = asset.parts[asset.partBody];
+        const MeshPart& hr = asset.parts[asset.partHandRest];
+        const MeshPart& hg = asset.parts[asset.partHandGrab];
+        // Pad each brush box outward. The pad only has to CONTAIN the brush's
+        // clay (a box that contains it makes max(field, boxDist) exact); it
+        // must not reach a neighbour, and with ~0.12 m of clearance a pad this
+        // size is nowhere near doing that.
+        const float pad = 0.012f;
+        auto setBox = [&](const MeshPart& p, float lo[3], float hi[3]) {
+            for (int k = 0; k < 3; k++) {
+                lo[k] = p.lo[k] - pad;
+                hi[k] = p.hi[k] + pad;
+            }
+        };
+        setBox(body, brush_.bodyLo, brush_.bodyHi);
+        setBox(hr, brush_.handLo[0], brush_.handHi[0]);
+        setBox(hg, brush_.handLo[1], brush_.handHi[1]);
+        for (int k = 0; k < 3; k++) {
+            brush_.ofs[0][k] = 0.f;
+            brush_.ofs[1][k] = kGrabBrushOffset[k];
+        }
+        for (int b = 0; b < 2; b++) {
+            for (int k = 0; k < 3; k++) {
+                brush_.canonLo[b][k] = brush_.handLo[b][k] - brush_.ofs[b][k];
+                brush_.canonHi[b][k] = brush_.handHi[b][k] - brush_.ofs[b][k];
+            }
+            // The grip sits INSIDE the mitt: palmFrac of the way along the
+            // finger axis from the wrist end. The hand is authored pointing
+            // +x away from the body, so +x is the finger axis and the wrist
+            // end is the box's min x. (The old rig measured this off the
+            // wrist->fingertip bones; the box is the same measurement without
+            // an armature to take it from.)
+            brush_.palm[b][0] =
+                brush_.canonLo[b][0] +
+                (brush_.canonHi[b][0] - brush_.canonLo[b][0]) * 0.6f;
+            brush_.palm[b][1] = (brush_.canonLo[b][1] + brush_.canonHi[b][1]) * 0.5f;
+            brush_.palm[b][2] = (brush_.canonLo[b][2] + brush_.canonHi[b][2]) * 0.5f;
+        }
+        brush_.valid = true;
+
+        // Three pieces: body, left hand, right hand. srcBone stays -1 — these
+        // are driven by updateBrushRig writing `xform` directly.
+        affinePieces_.resize(3);
+        for (int i = 0; i < 3; i++) affinePieces_[i].srcBone = -1;
+        foeAffinePieces_ = affinePieces_;
+
+        // Shadow proxy. deriveCapsules() fits capsules to BONES and there are
+        // none, so synthesise one per brush from its own AABB: the capsule runs
+        // along the box's longest axis with a radius set by the smaller of the
+        // other two half-extents, which is a decent stand-in for a rounded
+        // blob or mitt. `bone` carries the PIECE index here (packUniforms
+        // knows), so each capsule rides the clay it stands in for.
+        capsules_.clear();
+        auto addCapsule = [&](const float lo[3], const float hi[3], int piece) {
+            BoneCapsule bc{};
+            capsuleFromBox(lo, hi, bc.a, bc.b, bc.r);
+            bc.bone = piece; // PIECE index, not a bone id
+            bc.rPiece = bc.r;
+            for (int k = 0; k < 3; k++) { bc.lo[k] = lo[k]; bc.hi[k] = hi[k]; }
+            capsules_.push_back(bc);
+        };
+        // Rest-pose defaults. packUniforms REFITS the a/b/r of each of these
+        // every frame from its piece's current brush box, so these values only
+        // serve foeCaps_ (the rest capsules used for blade hit tests).
+        addCapsule(brush_.bodyLo, brush_.bodyHi, 0);
+        addCapsule(brush_.handLo[0], brush_.handHi[0], 1);
+        addCapsule(brush_.handLo[0], brush_.handHi[0], 2);
+
+        std::printf("rig: brush rig — body (%.3f %.3f %.3f)..(%.3f %.3f %.3f), "
+                    "hand rest x[%.3f %.3f], hand grab x[%.3f %.3f], "
+                    "%zu marbles\n",
+                    brush_.bodyLo[0], brush_.bodyLo[1], brush_.bodyLo[2],
+                    brush_.bodyHi[0], brush_.bodyHi[1], brush_.bodyHi[2],
+                    brush_.handLo[0][0], brush_.handHi[0][0], brush_.handLo[1][0],
+                    brush_.handHi[1][0], marbles_.size());
+        // Fail LOUDLY rather than rendering a silently clipped fighter: a brush
+        // that pokes outside the volume box, or two brushes whose padded boxes
+        // touch, both break the clip's exactness (CLAUDE.md trap 5 drops edits
+        // near the boundary for the same reason).
+        const float vlo[3] = {BrickSystem::kOrigin[0], BrickSystem::kOrigin[1],
+                              BrickSystem::kOrigin[2]};
+        const float vhi[3] = {vlo[0] + BrickSystem::kExtent,
+                              vlo[1] + BrickSystem::kExtent,
+                              vlo[2] + BrickSystem::kExtent};
+        const float* boxes[3][2] = {{brush_.bodyLo, brush_.bodyHi},
+                                    {brush_.handLo[0], brush_.handHi[0]},
+                                    {brush_.handLo[1], brush_.handHi[1]}};
+        static const char* bnames[3] = {"body", "hand.rest", "hand.grab"};
+        for (int i = 0; i < 3; i++) {
+            for (int k = 0; k < 3; k++) {
+                if (boxes[i][0][k] < vlo[k] || boxes[i][1][k] > vhi[k]) {
+                    std::fprintf(stderr,
+                                 "[rig] WARNING brush '%s' axis %d leaves the volume "
+                                 "box (%.4f..%.4f vs %.4f..%.4f) — it will render "
+                                 "clipped\n",
+                                 bnames[i], k, boxes[i][0][k], boxes[i][1][k], vlo[k],
+                                 vhi[k]);
+                }
+            }
+            for (int j = i + 1; j < 3; j++) {
+                bool overlap = true;
+                for (int k = 0; k < 3; k++)
+                    if (boxes[i][1][k] < boxes[j][0][k] || boxes[j][1][k] < boxes[i][0][k])
+                        overlap = false;
+                if (overlap) {
+                    std::fprintf(stderr,
+                                 "[rig] WARNING brushes '%s' and '%s' overlap — the "
+                                 "AABB clip is no longer an exact separation\n",
+                                 bnames[i], bnames[j]);
+                }
+            }
+        }
+    }
 
     // M4.7: build the floating-hand IK chains from bone names. Rig convention
     // (see the .glb): a base.* blob spine plus two DETACHED mitts,
@@ -1110,16 +1413,14 @@ void Renderer::setCharacter(CharacterAsset asset) {
                                   std::sqrt(dx * dx + dy * dy + dz * dz));
         }
     }
-    // ---- M-PERF: the three-piece affine rig ----
-    // Partition the rig into an affine body plus one rigid piece per mitt.
-    // This is a BONE partition, and on this asset it is exactly the mesh-object
-    // partition too: the blob is weighted only to base/base.001/base.002 and
-    // the mitts only to hand/thumb/finger/*tip — zero shared weights (verified
-    // on assets/fighter.glb). That is what makes the hard handoff safe: no
-    // cell can be near both pieces' clay, so the ownership boundary the shader
-    // tests against runs through the ~12 cm of air between them.
-    affinePieces_.clear();
+    // ---- M-PERF: the BONE-partitioned affine rig (legacy assets only) ----
+    // Partition a rigged asset into an affine body plus one rigid piece per
+    // mitt, by BONE. Skipped entirely when the brush rig already built the
+    // pieces above — which is the case for the current fighter, and the guard
+    // matters: this used to start with an unconditional clear() that would
+    // silently throw the brush pieces away.
     if (!bones_.empty()) {
+        affinePieces_.clear();
         std::vector<int> owner(nb, 0); // default: the body
         std::vector<int> srcBone{-1};  // piece 0 is the body; filled below
         for (const HandIkChain& c : handIk_) {
@@ -1198,10 +1499,23 @@ void Renderer::setCharacter(CharacterAsset asset) {
     foeCaps_ = capsules_;
     {
         float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
-        for (uint32_t v = 0; v < asset.vertexCount(); v++) {
+        if (brush_.valid) {
+            // The BODY brush only. Taking this over every vertex would now
+            // include the grab hand parked in the negative-x half of the
+            // volume, inflating the rest bound to cover ground the fighter
+            // never occupies. The posed bound that actually gates the trace is
+            // recomputed from the piece boxes each frame (affineBoundR); this
+            // is only the fallback used before the pieces exist.
             for (int a = 0; a < 3; a++) {
-                lo[a] = std::min(lo[a], asset.positions[v * 3 + a]);
-                hi[a] = std::max(hi[a], asset.positions[v * 3 + a]);
+                lo[a] = brush_.bodyLo[a];
+                hi[a] = brush_.bodyHi[a];
+            }
+        } else {
+            for (uint32_t v = 0; v < asset.vertexCount(); v++) {
+                for (int a = 0; a < 3; a++) {
+                    lo[a] = std::min(lo[a], asset.positions[v * 3 + a]);
+                    hi[a] = std::max(hi[a], asset.positions[v * 3 + a]);
+                }
             }
         }
         float r2 = 0.f;
@@ -1372,12 +1686,23 @@ void Renderer::updateBladeCut(const LookParams& look) {
     // capsules posed by the opponent's OWN skeleton (root already folded in),
     // so the hit test tracks it while it animates
     if (foeSkinMats_.empty()) return;
+    // Blade tests happen in WORLD space, so the opponent's rest capsules have
+    // to be posed first. Under the brush rig `bone` is a PIECE index into the
+    // foe's own piece table — falling through to identity here would leave the
+    // foe's hitboxes sitting at the origin while the foe itself stands
+    // elsewhere, and the sword would cut empty air.
+    const bool brushRig = skeletonFree();
     auto foeToWorld = [&](const BoneCapsule& c, const float* r, float* w) {
-        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= foeSkinMats_.size()) {
+        if (brushRig) {
+            if (c.bone >= 0 && (size_t)c.bone < foeAffinePieces_.size()) {
+                matTransformPoint(foeAffinePieces_[c.bone].xform, r, w);
+                return;
+            }
+        } else if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= foeSkinMats_.size()) {
             matTransformPoint(&foeSkinMats_[c.bone * 16], r, w);
-        } else {
-            w[0] = r[0]; w[1] = r[1]; w[2] = r[2];
+            return;
         }
+        w[0] = r[0]; w[1] = r[1]; w[2] = r[2];
     };
     // Sweep in TIME as well as along the blade, and emit ONE CAPSULE PER
     // SUBSTEP rather than collapsing the whole sweep into a single capsule.
@@ -1456,7 +1781,11 @@ void Renderer::updateBladeCut(const LookParams& look) {
         // through the bone the blade actually met
         float invBone[16];
         matIdentity(invBone);
-        if (hitBone >= 0 && (size_t)(hitBone * 16 + 16) <= foeSkinMats_.size()) {
+        if (brushRig) {
+            if (hitBone >= 0 && (size_t)hitBone < foeAffinePieces_.size()) {
+                matInvAffine(foeAffinePieces_[hitBone].xform, invBone);
+            }
+        } else if (hitBone >= 0 && (size_t)(hitBone * 16 + 16) <= foeSkinMats_.size()) {
             matInvAffine(&foeSkinMats_[hitBone * 16], invBone);
         }
         matTransformPoint(invBone, wA, e.pos);
@@ -1516,6 +1845,7 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
         float a[3], b[3], r;
         int bone; // inverts back to rest space when a gob sticks here
     };
+    const bool brushRig = skeletonFree();
     std::vector<PosedCap> caps;
     caps.reserve(capsules_.size());
     for (const BoneCapsule& c : capsules_) {
@@ -1524,15 +1854,32 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
         std::memcpy(pc.b, c.b, sizeof(pc.b));
         pc.r = c.r;
         pc.bone = c.bone;
-        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
+        // Gobs fly in WORLD space, so the colliders have to be posed. Under
+        // the brush rig `bone` is a PIECE index and the pose comes from that
+        // piece's transform; refit from its current brush box for the same
+        // reason packUniforms does (a grab hand's box lives 0.98 m away).
+        if (brushRig) {
+            if (c.bone >= 0 && (size_t)c.bone < affinePieces_.size()) {
+                const AffinePiece& ap = affinePieces_[c.bone];
+                float ca[3], cb[3];
+                capsuleFromBox(ap.lo, ap.hi, ca, cb, pc.r);
+                matTransformPoint(ap.xform, ca, pc.a);
+                matTransformPoint(ap.xform, cb, pc.b);
+            }
+        } else if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
             matTransformPoint(&skinMats_[c.bone * 16], c.a, pc.a);
             matTransformPoint(&skinMats_[c.bone * 16], c.b, pc.b);
         }
         caps.push_back(pc);
     }
-    // sticking writes rest-space voxels, so only an un-posed body may catch
-    // gobs (same "pause to sculpt" rule the carve tool lives with)
-    bool resting = !look.animPlay || bones_.empty();
+    // Sticking writes rest-space voxels. The bone rig could only do that on an
+    // un-posed body; the brush rig CAN invert its piece transforms exactly
+    // (they are affine and non-degenerate), so a posed fighter still catches
+    // gobs — which is why `bones_.empty()` must not be read as "un-posed" here.
+    // That reading is precisely CLAUDE.md trap 6: it would deposit clay at a
+    // world position used as a rest address, and a walked-away fighter would
+    // grow wounds in the wrong place (or silently drop them, trap 5).
+    bool resting = brushRig ? true : (!look.animPlay || bones_.empty());
 
     for (auto it = gobs_.begin(); it != gobs_.end();) {
         Gob& g = *it;
@@ -1575,7 +1922,16 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
                     // invert the skin matrix of the bone it landed on
                     std::memcpy(e.worldPos, g.pos, sizeof(e.worldPos));
                     float rest[3] = {g.pos[0], g.pos[1], g.pos[2]};
-                    if (pc.bone >= 0 && (size_t)(pc.bone * 16 + 16) <= skinMats_.size()) {
+                    if (brushRig) {
+                        // world -> the BRUSH region this piece samples, which
+                        // is the volume address the edit must carry (trap 6).
+                        if (pc.bone >= 0 && (size_t)pc.bone < affinePieces_.size()) {
+                            float inv[16];
+                            matInvAffine(affinePieces_[pc.bone].xform, inv);
+                            matTransformPoint(inv, g.pos, rest);
+                        }
+                    } else if (pc.bone >= 0 &&
+                               (size_t)(pc.bone * 16 + 16) <= skinMats_.size()) {
                         float inv[16];
                         matInvAffine(&skinMats_[pc.bone * 16], inv);
                         matTransformPoint(inv, g.pos, rest);
@@ -1665,6 +2021,31 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
 
     // pose the skeleton at the quantized clock; paused = rest pose
     resolveSword(look);
+
+    // ---- M-RIG: drive the brush rig ----
+    // The pose index is DISCRETE and latched on the 12 Hz pose grid, exactly
+    // like everything else that moves (trap 4). Holding the sword selects the
+    // grab brush; letting go selects the rest brush. There is deliberately no
+    // transition: interpolating between the two would mean blending two SDF
+    // regions per sample, which is the per-sample blending this whole rig
+    // exists to delete, and a hand that eases into a grip does not read as
+    // stop-motion — it should pop.
+    if (skeletonFree()) {
+        const bool holding = swordWorld_.enabled && look.hands.ik;
+        if (frame.poseTime != handPoseTime_) {
+            handPoseTime_ = frame.poseTime;
+            handPose_[0] = handPose_[1] = holding ? 1 : 0;
+            // the opponent is not holding anything yet, so it keeps rest hands
+            foeHandPose_[0] = foeHandPose_[1] = 0;
+        }
+        updateBrushRig(affinePieces_, handPose_, fighterDisp_, spring_, look,
+                       (swordWorld_.enabled && look.hands.ik) ? &swordWorld_ : nullptr);
+        if (foeEnabled_) {
+            updateBrushRig(foeAffinePieces_, foeHandPose_, foeDisp_, foeSpring_, look,
+                           nullptr);
+        }
+    }
+
     if (!bones_.empty()) {
         if (affine) {
             // ONE matrix for the whole body. evalPose with a null clip yields
@@ -2167,6 +2548,11 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
     lastSimTime_ = -1.f;
     lastPoseTime_ = -1.f;
     springPoseTime_ = -1.f;
+    // Force the hand pose index to re-latch on the next pose step. It is a
+    // pure function of the sword-grip state, so it needs no snapshot section —
+    // but the LATCH CLOCK does have to be invalidated or a restored scene can
+    // hold a stale grip until the pose time happens to move.
+    handPoseTime_ = -1.f;
     if (simT) *simT = rc.simT;
     std::printf("[snap] loaded %s (t=%.2fs, %zu gob(s))\n", path.c_str(), rc.simT,
                 gobs_.size());

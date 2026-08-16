@@ -16,7 +16,11 @@ const IND_IDX_MASK: u32 = 0x000FFFFFu;
 @group(0) @binding(0) var<storage, read> mPos: array<f32>;      // xyz + smooth normal, 6/vertex
 @group(0) @binding(1) var<storage, read> mIdx: array<u32>;      // 3 per tri
 @group(0) @binding(2) var<storage, read> mCol: array<f32>;      // rgb per vertex
-@group(0) @binding(3) var<storage, read> mSkin: array<vec2u>;   // per vertex: 4x joint u8, 4x weight unorm8
+// M-RIG: group(0) binding(3) used to be `mSkin` (per-vertex joint ids +
+// weights). It fed nothing but the packed per-voxel bone weights below, which
+// no shader ever read back. Binding numbers of the survivors are deliberately
+// LEFT AS THEY WERE — WebGPU allows a sparse set, and renumbering would mean
+// touching every bind-group entry in brick.cpp for no gain.
 @group(0) @binding(4) var<storage, read> cellTris: array<u32>;  // [offsets: cells+1][ids...]
 @group(0) @binding(5) var<storage, read_write> voxParity: array<u32>; // per-voxel inside bits, ROW_WORDS u32/row
 @group(0) @binding(6) var<storage, read> insideBits: array<u32>;      // per-cell parity (classify)
@@ -26,7 +30,10 @@ const IND_IDX_MASK: u32 = 0x000FFFFFu;
 @group(1) @binding(0) var<storage, read_write> bIndirection: array<u32>;
 @group(1) @binding(1) var<storage, read_write> bDist: array<u32>;
 @group(1) @binding(2) var<storage, read_write> bAlbedo: array<u32>;
-@group(1) @binding(3) var<storage, read_write> bWeights: array<u32>; // 512 per brick
+// M-RIG: binding(3) was `bWeights`, 512 packed top-2 bone weights per brick —
+// kMaxBricks * 512 * 4 = 100.7 MB PER FIGHTER of GPU memory that was written
+// once at import and never read by any shader or by the renderer. It was
+// skeleton residue; with the armature gone it could never be read again.
 
 @group(2) @binding(0) var<storage, read_write> counters: array<atomic<u32>>;
 @group(2) @binding(1) var<storage, read_write> freelist: array<u32>;
@@ -268,9 +275,11 @@ fn meshFill(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid
       bDist[brick * 256u + vi / 2u] = pack2x16float(vec2f(d0, d1));
     }
 
-    // albedo + weights from the nearest triangle's vertices
+    // albedo from the nearest triangle's vertices. The 12-slot bone-influence
+    // accumulation that used to run here (three verts x four slots, merged and
+    // sorted to a top-2) went with bWeights — it was per-VOXEL work feeding a
+    // buffer nobody read.
     var albedo = vec3f(0.15, 0.47, 0.53);
-    var packedW = 0u;
     if (hit.tri != 0xFFFFFFFFu) {
       let i0 = mIdx[hit.tri * 3u];
       let i1 = mIdx[hit.tri * 3u + 1u];
@@ -279,52 +288,9 @@ fn meshFill(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid
       let c1 = vec3f(mCol[i1 * 3u], mCol[i1 * 3u + 1u], mCol[i1 * 3u + 2u]);
       let c2 = vec3f(mCol[i2 * 3u], mCol[i2 * 3u + 1u], mCol[i2 * 3u + 2u]);
       albedo = c0 * hit.bary.x + c1 * hit.bary.y + c2 * hit.bary.z;
-
-      // accumulate bone influence across the tri's 3 verts (4 slots each)
-      var ids: array<u32, 12>;
-      var ws: array<f32, 12>;
-      var n = 0u;
-      for (var vk = 0u; vk < 3u; vk++) {
-        let vidx = mIdx[hit.tri * 3u + vk];
-        let s = mSkin[vidx]; // x = 4x joint u8s, y = 4x weight unorm8s
-        let bw = hit.bary[vk];
-        for (var slot = 0u; slot < 4u; slot++) {
-          let joint = (s.x >> (slot * 8u)) & 0xFFu;
-          let wgt = f32((s.y >> (slot * 8u)) & 0xFFu) / 255.0 * bw;
-          if (wgt <= 0.001) {
-            continue;
-          }
-          var found = false;
-          for (var m = 0u; m < n; m++) {
-            if (ids[m] == joint) {
-              ws[m] += wgt;
-              found = true;
-            }
-          }
-          if (!found && n < 12u) {
-            ids[n] = joint;
-            ws[n] = wgt;
-            n++;
-          }
-        }
-      }
-      var b0 = 0u; var w0 = 0.0;
-      var b1 = 0u; var w1 = 0.0;
-      for (var m = 0u; m < n; m++) {
-        if (ws[m] > w0) {
-          b1 = b0; w1 = w0;
-          b0 = ids[m]; w0 = ws[m];
-        } else if (ws[m] > w1) {
-          b1 = ids[m]; w1 = ws[m];
-        }
-      }
-      let total = max(w0 + w1, 1e-5);
-      packedW = (b0 & 0xFFu) | (u32(round(w0 / total * 255.0)) << 8u) |
-                ((b1 & 0xFFu) << 16u) | (u32(round(w1 / total * 255.0)) << 24u);
     }
     // clay mottle so imported flat colors still read handled
     albedo *= (0.82 + 0.32 * fbm(w * 9.0));
     bAlbedo[brick * 512u + vi] = pack4x8unorm(vec4f(clamp(albedo, vec3f(0.0), vec3f(1.0)), 1.0));
-    bWeights[brick * 512u + vi] = packedW;
   }
 }

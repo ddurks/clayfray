@@ -108,19 +108,18 @@ std::string BrickSystem::wgslConstants() {
         "const CELLS: u32 = %uu;\n"
         "const AXIS_VOX: i32 = %d;\n"
         "const ROW_WORDS: u32 = %uu;\n"
-        "const WARP_RESID_TOL: f32 = %.9g;\n"
         "// Base index (in u32 elements) of each per-cell array inside the one\n"
-        "// `volume` storage buffer the tracer binds — see brick.h.\n"
+        "// `volume` storage buffer the tracer binds — see brick.h. CELL_W (the\n"
+        "// per-cell skin field) and WARP_RESID_TOL (the inverse-LBS round-trip\n"
+        "// tolerance) were emitted here until M-RIG deleted the skinned path.\n"
         "const CELL_IND: u32 = %uu;\n"
         "const CELL_SEED: u32 = %uu;\n"
-        "const CELL_COARSE: u32 = %uu;\n"
-        "const CELL_W: u32 = %uu;\n",
+        "const CELL_COARSE: u32 = %uu;\n",
         kGrid, kBrickUsable, (double)kVoxel, (double)kSpan, (double)kOrigin[0],
         (double)kOrigin[1], (double)kOrigin[2], (double)kBand, kMaxBricks,
         kDirtyCap, (uint32_t)kGrid * kGrid * kGrid, (int)kAxisVox, kRowWords,
-        (double)(kWarpResidSpans * kSpan), (uint32_t)(kIndOff / 4),
-        (uint32_t)(kSeedOff / 4), (uint32_t)(kCoarseOff / 4),
-        (uint32_t)(kCellWOff / 4));
+        (uint32_t)(kIndOff / 4), (uint32_t)(kSeedOff / 4),
+        (uint32_t)(kCoarseOff / 4));
     return buf;
 }
 
@@ -137,7 +136,6 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
     volume = makeStorage(dev, kVolumeBytes, "brick volume");
     distPool = makeStorage(dev, kMaxBricks * 256ull * 4ull, "brick dist pool");
     albedoPool = makeStorage(dev, kMaxBricks * 512ull * 4ull, "brick albedo pool");
-    weightPool = makeStorage(dev, kMaxBricks * 512ull * 4ull, "brick weight pool");
     counters_ = makeStorage(dev, 16, "brick counters");
     freelist_ = makeStorage(dev, kMaxBricks * 4ull, "brick freelist");
     jfaB_ = makeStorage(dev, cells * 4ull, "jfa B");
@@ -381,19 +379,9 @@ std::shared_ptr<BrickSystem::MeshImport> BrickSystem::prepareImport(
         tick = now;
     };
 
-    // per-vertex packed skin: x = 4x joint u8, y = 4x weight unorm8
-    std::vector<uint32_t> skin(vertCount * 2);
-    for (uint32_t v = 0; v < vertCount; v++) {
-        uint32_t j = 0, w = 0;
-        for (int s = 0; s < 4; s++) {
-            j |= (std::min<uint32_t>(asset.joints[v * 4 + s], 255u)) << (s * 8);
-            w |= (uint32_t)std::lround(
-                     std::min(std::max(asset.weights[v * 4 + s], 0.f), 1.f) * 255.f)
-                 << (s * 8);
-        }
-        skin[v * 2] = j;
-        skin[v * 2 + 1] = w;
-    }
+    // M-RIG: the per-vertex packed skin (4x joint u8 + 4x weight unorm8) was
+    // built and uploaded here. Its only consumer was voxelize.wgsl's per-voxel
+    // bone-weight accumulation, which wrote a buffer nothing read.
 
     // bin triangles into cells (AABB + band margin): fill needs every tri
     // that could be a voxel's nearest within the stored band
@@ -513,87 +501,14 @@ std::shared_ptr<BrickSystem::MeshImport> BrickSystem::prepareImport(
 
     lap("normals");
 
-    // per-cell 4-slot bone weights (joints word + weights word per cell):
-    // the trace-side warp blends up to four bones per region, which is what
-    // hand-scale junctions need. Source: distance-weighted gather over the
-    // cell's binned vertices (denoised vs nearest-vertex), flood-filled so
-    // the warp is defined volume-wide.
-    std::vector<uint32_t> cellW(cells * 2, 0);
-    {
-        std::vector<int> queue;
-        queue.reserve(cells);
-        std::vector<float> acc(256);
-        for (uint32_t ci = 0; ci < cells; ci++) {
-            uint32_t lo = offsets[ci], hi = offsets[ci + 1];
-            if (lo == hi) continue;
-            float cx = kOrigin[0] + ((ci % kGrid) + 0.5f) * kSpan;
-            float cy = kOrigin[1] + (((ci / kGrid) % kGrid) + 0.5f) * kSpan;
-            float cz = kOrigin[2] + ((ci / (kGrid * kGrid)) + 0.5f) * kSpan;
-            std::fill(acc.begin(), acc.end(), 0.f);
-            for (uint32_t k = lo; k < hi; k++) {
-                uint32_t t = ids[k];
-                for (int e = 0; e < 3; e++) {
-                    uint32_t v = asset.indices[t * 3 + e];
-                    const float* pv = &asset.positions[v * 3];
-                    float dx = pv[0] - cx, dy = pv[1] - cy, dz = pv[2] - cz;
-                    float kern = 1.f / (dx * dx + dy * dy + dz * dz +
-                                        kSpan * kSpan * 0.25f);
-                    for (int sl = 0; sl < 4; sl++) {
-                        uint32_t j = std::min<uint32_t>(asset.joints[v * 4 + sl], 255u);
-                        acc[j] += asset.weights[v * 4 + sl] * kern;
-                    }
-                }
-            }
-            // top-4, renormalized to sum 255
-            int top[4] = {-1, -1, -1, -1};
-            for (int j = 0; j < 256; j++) {
-                if (acc[j] <= 0.f) continue;
-                for (int r = 0; r < 4; r++) {
-                    if (top[r] < 0 || acc[j] > acc[top[r]]) {
-                        for (int m = 3; m > r; m--) top[m] = top[m - 1];
-                        top[r] = j;
-                        break;
-                    }
-                }
-            }
-            if (top[0] < 0) continue;
-            float total = 0.f;
-            for (int r = 0; r < 4; r++) {
-                if (top[r] >= 0) total += acc[top[r]];
-            }
-            uint32_t jw = 0, ww = 0;
-            for (int r = 0; r < 4; r++) {
-                if (top[r] < 0) break;
-                uint32_t w8 = (uint32_t)std::lround(acc[top[r]] / total * 255.f);
-                if (r == 0) w8 = std::max(w8, 1u); // dominant never rounds to 0
-                jw |= (uint32_t)top[r] << (r * 8);
-                ww |= w8 << (r * 8);
-            }
-            cellW[ci * 2] = jw;
-            cellW[ci * 2 + 1] = ww;
-            queue.push_back((int)ci);
-        }
-        for (size_t head = 0; head < queue.size(); head++) {
-            int ci = queue[head];
-            int x = ci % kGrid, y = (ci / kGrid) % kGrid, z = ci / (kGrid * kGrid);
-            const int nb[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
-                                  {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-            for (auto& o : nb) {
-                int nx = x + o[0], ny = y + o[1], nz = z + o[2];
-                if (nx < 0 || ny < 0 || nz < 0 || nx >= kGrid || ny >= kGrid ||
-                    nz >= kGrid)
-                    continue;
-                int ni = nx + ny * kGrid + nz * kGrid * kGrid;
-                if (cellW[ni * 2 + 1] == 0) {
-                    cellW[ni * 2] = cellW[ci * 2];
-                    cellW[ni * 2 + 1] = cellW[ci * 2 + 1];
-                    queue.push_back(ni);
-                }
-            }
-        }
-    }
+    // M-RIG: a per-cell 4-slot bone-weight field was built here — a
+    // distance-weighted gather over each cell's binned vertices, then a
+    // breadth-first flood fill that propagated weights to EVERY cell in the
+    // volume so the inverse-LBS warp had guidance outside the narrow band.
+    // It cost kGrid^3 = 125k cells of fill at import and 1 MB of the volume
+    // buffer per fighter. Nothing reads a bone weight now: the brush rig
+    // separates pieces by disjoint rest-space AABBs, not by dominant bone.
 
-    lap("cellW");
 
     auto upload = [&](const void* data, uint64_t bytes, const char* label) {
         wgpu::Buffer buf = makeStorage(dev, std::max<uint64_t>(bytes, 4), label);
@@ -602,11 +517,9 @@ std::shared_ptr<BrickSystem::MeshImport> BrickSystem::prepareImport(
     };
     auto mesh = std::make_shared<MeshImport>();
     mesh->triCount = triCount;
-    mesh->cellW = std::move(cellW);
     mesh->pos = upload(posNrm.data(), posNrm.size() * 4, "mesh pos+normal");
     mesh->idx = upload(asset.indices.data(), asset.indices.size() * 4, "mesh idx");
     mesh->col = upload(asset.colors.data(), asset.colors.size() * 4, "mesh col");
-    mesh->skin = upload(skin.data(), skin.size() * 4, "mesh skin");
     // merged [offsets][ids] — stays inside the 10-storage-buffer limit
     std::vector<uint32_t> merged;
     merged.reserve(offsets.size() + ids.size());
@@ -624,9 +537,8 @@ void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
     wgpu::Device& dev = gpu_->device;
     mesh_ = std::move(mesh);
 
-    // per-fighter: this volume's own cell-weight copy and parity scratch
-    gpu_->queue.WriteBuffer(volume, kCellWOff, mesh_->cellW.data(),
-                            mesh_->cellW.size() * 4);
+    // per-fighter parity scratch (the per-cell weight copy that used to be
+    // written here died with the skeleton)
     const uint32_t axisVox = kAxisVox, rowWords = kRowWords;
     vxParityBuf_ = makeStorage(dev, (uint64_t)axisVox * axisVox * rowWords * 4,
                                "voxel parity");
@@ -638,10 +550,10 @@ void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
     // classify's auto layout skips bindings it doesn't touch; fill uses all.
     vxG0_ = bindv(vxFill_, 0,
                   {{0, mesh_->pos}, {1, mesh_->idx}, {2, mesh_->col},
-                   {3, mesh_->skin}, {4, mesh_->tris}, {5, vxParityBuf_}});
+                   {4, mesh_->tris}, {5, vxParityBuf_}});
     vxG1_ = bindv(vxFill_, 1,
                   {{0, volume, kIndOff, kCellBytes}, {1, distPool},
-                   {2, albedoPool}, {3, weightPool}});
+                   {2, albedoPool}});
     vxG2_ = bindv(vxClassify_, 2, {{0, counters_}, {1, freelist_}});
 
     importPending_ = true;
@@ -780,15 +692,17 @@ bool BrickSystem::save(SnapWriter& w) {
         uint64_t size;
         uint64_t offset = 0;
     };
+    // M-RIG dropped two sections: "BCLW" (the per-cell skin field) and "BWGT"
+    // (the per-voxel bone weights). Both backing buffers are gone, so this is
+    // a FORMAT change — snapshot.cpp's kVersion is bumped to match and stale
+    // .snap files refuse cleanly instead of loading garbage.
     const Sect sects[] = {
-        {"BCLW", volume, cells * 8ull, kCellWOff},
         {"BCNT", counters_, 16},
         {"BFRE", freelist_, kMaxBricks * 4ull},
         {"BJFA", volume, cells * 4ull, kSeedOff},   // jfaB_ is per-pass scratch
         {"BCRS", volume, cells * 4ull, kCoarseOff}, // coarseB_ likewise
         {"BDST", distPool, bricks * 256ull * 4ull},
         {"BALB", albedoPool, bricks * 512ull * 4ull},
-        {"BWGT", weightPool, bricks * 512ull * 4ull},
     };
     for (const Sect& s : sects) {
         if (s.size == 0) {
@@ -824,14 +738,12 @@ bool BrickSystem::load(SnapReader& r) {
     };
     const Sect sects[] = {
         {"BIND", volume, cells * 4ull, kIndOff},
-        {"BCLW", volume, cells * 8ull, kCellWOff},
         {"BCNT", counters_, 16},
         {"BFRE", freelist_, kMaxBricks * 4ull},
         {"BJFA", volume, cells * 4ull, kSeedOff},
         {"BCRS", volume, cells * 4ull, kCoarseOff},
         {"BDST", distPool, bricks * 256ull * 4ull},
         {"BALB", albedoPool, bricks * 512ull * 4ull},
-        {"BWGT", weightPool, bricks * 512ull * 4ull},
     };
     for (const Sect& s : sects) {
         if (s.size == 0) continue;
