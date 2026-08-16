@@ -160,15 +160,19 @@ bool Renderer::init(Gpu& gpu, int width, int height) {
         queryRead_ = gpu_->device.CreateBuffer(&mDesc);
     }
 
-    if (!brick_.init(gpu, loadShader("edit.wgsl"), loadShader("jfa.wgsl"),
-                     loadShader("redistance.wgsl"), loadShader("voxelize.wgsl")))
-        return false;
-    // fighter 1's volume. A whole second BrickSystem, so every pass it owns
-    // (voxelize, edit, JFA, redistance) works on it unchanged and its clay is
-    // physically separate from the hero's.
-    if (!foe_.init(gpu, loadShader("edit.wgsl"), loadShader("jfa.wgsl"),
-                   loadShader("redistance.wgsl"), loadShader("voxelize.wgsl")))
-        return false;
+    // One store, one slice per fighter. Every BrickSystem still owns its whole
+    // pass chain (voxelize, edit, JFA, redistance) and works on its own slice
+    // unchanged, so one fighter's carving can never touch another's clay — but
+    // they cost three storage bindings between them instead of three each.
+    if (!store_.init(gpu)) return false;
+    for (int i = 0; i < kMaxPlayers; i++) {
+        if (!fighters_[i].vol.init(gpu, store_, i, loadShader("edit.wgsl"),
+                                   loadShader("jfa.wgsl"),
+                                   loadShader("redistance.wgsl"),
+                                   loadShader("voxelize.wgsl")))
+            return false;
+    }
+    fighters_[0].enabled = true; // the hero always exists
     if (!ground_.init(gpu, loadShader("ground.wgsl"))) return false;
 
     // default marbles = the classic hand-coded eyes (linearized colors)
@@ -321,19 +325,23 @@ void Renderer::buildBindGroups() {
         traceBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        // Two packed buffers, not five: indirection + seeds + coarse are
-        // regions of brick_.volume (brick.h), and the ground's base + height +
-        // color are regions of ground_.field (ground.h). Four here plus
-        // fighter 1's three puts `trace` at SEVEN storage buffers — inside the
-        // EIGHT that core WebGPU guarantees a stage, which is the limit that
-        // governs mobile. See CLAUDE.md trap 8.
+        // FOUR storage buffers for the whole scene, at ANY number of fighters.
+        // Three levels of packing get it there (CLAUDE.md trap 8: core WebGPU
+        // guarantees a stage only EIGHT, which is the limit that governs
+        // mobile):
+        //   - indirection + seeds + coarse are regions of one `volume` buffer
+        //   - the ground's base + height + colour are regions of `field`
+        //   - and every FIGHTER is a slice of the same three store buffers,
+        //     which is what this bind group being fighter-independent means.
+        // M5 bound fighter 0 here and fighter 1 in a second group, for 7 of 8
+        // and no room for a third body. This is 4 of 8 with four to spare.
         wgpu::BindGroupEntry entries[4] = {};
         entries[0].binding = 0;
-        entries[0].buffer = brick_.volume;
+        entries[0].buffer = store_.volume;
         entries[1].binding = 1;
-        entries[1].buffer = brick_.distPool;
+        entries[1].buffer = store_.distPool;
         entries[2].binding = 2;
-        entries[2].buffer = brick_.albedoPool;
+        entries[2].buffer = store_.albedoPool;
         entries[3].binding = 7;
         entries[3].buffer = ground_.field;
         wgpu::BindGroupDescriptor desc{};
@@ -355,43 +363,24 @@ void Renderer::buildBindGroups() {
         pickBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        // Same three as trace, minus the ground: pick marches the body only.
+        // Same three as trace, minus the ground: pick marches the bodies only.
         // (Before the volume regions merged, trace and pick needed different
         // entry counts here — pick's auto layout dropped the coarse field it
         // never reads. One binding now carries every per-cell array, so both
-        // layouts agree.)
+        // layouts agree.) group(2) is GONE: it held fighter 1's volume, and
+        // there is no per-fighter group left to hold.
         wgpu::BindGroupEntry entries[3] = {};
         entries[0].binding = 0;
-        entries[0].buffer = brick_.volume;
+        entries[0].buffer = store_.volume;
         entries[1].binding = 1;
-        entries[1].buffer = brick_.distPool;
+        entries[1].buffer = store_.distPool;
         entries[2].binding = 2;
-        entries[2].buffer = brick_.albedoPool;
+        entries[2].buffer = store_.albedoPool;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = pickPipeline_.GetBindGroupLayout(1);
         desc.entryCount = 3;
         desc.entries = entries;
         pickBrickBind_ = dev.CreateBindGroup(&desc);
-    }
-    {
-        // group(2): fighter 1's volume, laid out exactly like fighter 0's.
-        // Bound for BOTH pipelines because brick_read.wgsl references these
-        // statically, so Tint keeps the bindings alive even on paths pick
-        // never takes.
-        wgpu::BindGroupEntry entries[3] = {};
-        entries[0].binding = 0;
-        entries[0].buffer = foe_.volume;
-        entries[1].binding = 1;
-        entries[1].buffer = foe_.distPool;
-        entries[2].binding = 2;
-        entries[2].buffer = foe_.albedoPool;
-        wgpu::BindGroupDescriptor desc{};
-        desc.entries = entries;
-        desc.entryCount = 3;
-        desc.layout = tracePipeline_.GetBindGroupLayout(2);
-        traceFoeBind_ = dev.CreateBindGroup(&desc);
-        desc.layout = pickPipeline_.GetBindGroupLayout(2);
-        pickFoeBind_ = dev.CreateBindGroup(&desc);
     }
     {
         wgpu::BindGroupEntry entries[3] = {};
@@ -433,7 +422,7 @@ bool Renderer::reloadShadersIfChanged() {
     if (buildPipelines()) buildBindGroups();
     traceValid_ = false; // recompiled shaders may trace differently
     // character source may have changed; rebuild the volume from it
-    brick_.requestBake();
+    fighters_[0].vol.requestBake();
     return true;
 #endif
 }
@@ -455,25 +444,26 @@ const char* Renderer::uniformSlotName(int s) {
                                    "rimColor", "ambient",  "material", "post",
                                    "post2",    "mouse"};
     if (s < 14) return head[s];
-    if (s < 30) return "marbles (eyes)";
-    if (s == 30) return "marbleMeta";
-    if (s == 31) return "capsMeta";
-    if (s == 32) return "capsCenter";
-    if (s < 65) return "capsules (hero shadow proxy)";
-    if (s == 65) return "boneMeta";
-    if (s < 258) return "pieces (hero articulation)";
-    if (s == 258) return "gobMeta (in-flight count)";
-    if (s < 283) return "gobs (flying clay)";
-    if (s == 283) return "groundMeta (clay top bound)";
-    if (s == 284) return "swordA (hilt)";
-    if (s == 285) return "swordB (tip)";
-    if (s == 286) return "swordCol";
-    if (s < 291) return "foeInv";
-    if (s == 291) return "foeMeta";
-    if (s == 292) return "foeCenter";
-    if (s < 485) return "pieces (foe articulation)";
-    if (s == 485) return "foeBoneMeta";
-    return "rigMeta (affine rig select)";
+    if (s < kSlotMarbleMeta) return "marbles (eyes)";
+    if (s == kSlotMarbleMeta) return "marbleMeta";
+    if (s == kSlotSceneMeta) return "sceneMeta (live fighter count)";
+    if (s == kSlotCapsMeta) return "capsMeta";
+    if (s == kSlotCapsCenter) return "capsCenter";
+    if (s < kSlotGobMeta) return "capsules (player 0 shadow proxy)";
+    if (s == kSlotGobMeta) return "gobMeta (in-flight count)";
+    if (s < kSlotGroundMeta) return "gobs (flying clay)";
+    if (s == kSlotGroundMeta) return "groundMeta (clay top bound)";
+    if (s == kSlotSwordA) return "swordA (hilt)";
+    if (s == kSlotSwordA + 1) return "swordB (tip)";
+    if (s == kSlotSwordA + 2) return "swordCol";
+    // One name per fighter block, so CLAYFRAY_DEBUG_REUSE blames the body that
+    // actually moved rather than a bare slot number.
+    static char buf[48];
+    const int i = (s - kSlotFighters) / kFighterSlots;
+    const int off = (s - kSlotFighters) % kFighterSlots;
+    const char* what = off == 0 ? "meta" : (off == 1 ? "center" : "pieces");
+    std::snprintf(buf, sizeof(buf), "fighter %d %s", i, what);
+    return buf;
 }
 
 // Which uniform components the reuse digest is allowed to see. Kept beside
@@ -508,7 +498,7 @@ uint64_t Renderer::traceInputDigest(const float u[kUniformSlots][4]) const {
 // ---------- M-PERF: the three-piece affine rig ----------
 
 bool Renderer::affineOn(const LookParams& look) const {
-    if (affinePieces_.empty()) return false;
+    if (fighters_[0].pieces.empty()) return false;
     // THE A/B THAT USED TO LIVE HERE IS GONE, and it is worth saying why so
     // nobody tries to restore it. `look.affineRig` / CLAYFRAY_NO_AFFINE=1
     // switched between this rig and the 13-piece inverse-LBS warp, on one
@@ -743,12 +733,27 @@ void Renderer::bodyAffine(const FighterPose& disp, const BodySpring& s,
     out[15] = 1.f;
 }
 
-int Renderer::packAffinePieces(float out[kUniformSlots][4], int base,
+int Renderer::packAffinePieces(float out[kUniformSlots][4], int idx,
                                const std::vector<AffinePiece>& pieces,
                                const std::vector<float>& mats) const {
+    // +2 skips the block's meta and center slots; pieces follow them.
+    const int base = fighterSlot(idx) + 2;
+    if (pieces.size() > (size_t)BrickSystem::kPiecesPerFighter) {
+        // A piece that does not fit would simply not be drawn — a limb quietly
+        // missing from the body, with nothing in the log. Say so once.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                         "[rig] asset wants %zu pieces, kPiecesPerFighter is %d — "
+                         "the extras will NOT be drawn. Raise it in src/brick.h "
+                         "(costs %d uniform slots per fighter each).\n",
+                         pieces.size(), BrickSystem::kPiecesPerFighter, kPieceSlots);
+        }
+    }
     int n = 0;
     for (const AffinePiece& ap : pieces) {
-        if (n >= 16) break;
+        if (n >= BrickSystem::kPiecesPerFighter) break;
         float fwd[16];
         if (ap.srcBone >= 0 && (size_t)(ap.srcBone * 16 + 16) <= mats.size()) {
             std::memcpy(fwd, &mats[ap.srcBone * 16], sizeof(fwd));
@@ -843,12 +848,11 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     };
     std::memset(out, 0, kUniformSlots * 16);
     std::memcpy(out, packed, sizeof(packed));
-    // Beads for EVERY player, packed into the one 8-slot array: 4 eyes each
-    // for two fighters fills it exactly. Each set rides its own skeleton, so
-    // the opponent's eyes track its own pose.
-    // The eyes are the four beads: two per fighter under the bone rig, and
-    // under the brush rig two per fighter as well (the artist authors the LEFT
-    // eye's pupil + eyeball and the importer mirrors both across x).
+    // Beads for EVERY player, packed into the one array: 4 each (two eyeballs,
+    // two pupils — the artist authors the LEFT eye's pair and the importer
+    // mirrors both across x), so kMaxMarbles is 4 * kMaxPlayers by definition.
+    // It was a flat 8, which fitted exactly two fighters and would have
+    // silently dropped the third's eyes.
     //
     // Skeleton-free, a bead has no bone to ride, so it rides the BODY piece's
     // affine — which is what carries the squish, lean, yaw and hop. Radius is
@@ -857,18 +861,17 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     int n = 0;
     // world centre + radius per packed bead, so the gaze pass below can pair
     // each pupil with its ball without re-deriving the transforms
-    std::array<std::array<float, 4>, 8> eyeWorld{};
-    auto packMarbles = [&](const std::vector<float>& mats,
-                           const std::vector<AffinePiece>& pieces) {
+    std::array<std::array<float, 4>, kMaxMarbles> eyeWorld{};
+    auto packMarbles = [&](const Fighter& f) {
         for (const MarbleProp& m : marbles_) {
-            if (n >= 8) break;
-            float* slotA = out[14 + n * 2];
-            float* slotB = out[15 + n * 2];
+            if (n >= kMaxMarbles) break;
+            float* slotA = out[kSlotMarbles + n * 2];
+            float* slotB = out[kSlotMarbles + n * 2 + 1];
             float pos[3] = {m.pos[0], m.pos[1], m.pos[2]};
-            if (m.bone >= 0 && (size_t)(m.bone * 16 + 16) <= mats.size()) {
-                matTransformPoint(&mats[m.bone * 16], m.pos, pos);
-            } else if (brushRig && !pieces.empty()) {
-                matTransformPoint(pieces[0].xform, m.pos, pos);
+            if (m.bone >= 0 && (size_t)(m.bone * 16 + 16) <= f.skinMats.size()) {
+                matTransformPoint(&f.skinMats[m.bone * 16], m.pos, pos);
+            } else if (brushRig && !f.pieces.empty()) {
+                matTransformPoint(f.pieces[0].xform, m.pos, pos);
             }
             slotA[0] = pos[0]; slotA[1] = pos[1]; slotA[2] = pos[2];
             slotA[3] = m.radius;
@@ -877,9 +880,11 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
             n++;
         }
     };
-    packMarbles(skinMats_, affinePieces_);
-    if (foeEnabled_ && (!foeSkinMats_.empty() || brushRig))
-        packMarbles(foeSkinMats_, foeAffinePieces_);
+    for (int i = 0; i < kMaxPlayers; i++) {
+        const Fighter& f = fighters_[i];
+        if (i > 0 && !(f.enabled && (!f.skinMats.empty() || brushRig))) continue;
+        packMarbles(f);
+    }
     // ---- gaze, without bones ----
     // The eye bones died with the armature, but a bead does not need one: an
     // eye is a big sphere (the ball) with a small one sitting on it (the
@@ -922,18 +927,50 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
             dl = std::sqrt(dl);
             if (dl < 1e-5f) continue;
             // clamp off the ball's forward so an eye never rolls fully round
-            float* slotA = out[14 + i * 2];
+            float* slotA = out[kSlotMarbles + i * 2];
             for (int k = 0; k < 3; k++) slotA[k] = ball[k] + dir[k] / dl * len;
         }
     }
-    out[30][0] = (float)n;
+    out[kSlotMarbleMeta][0] = (float)n;
 
-    // Posed capsule shadow proxy. Under the brush rig `bone` carries the PIECE
-    // index instead of a bone index (see setCharacter), so the capsule rides
-    // the same transform as the clay it stands in for.
+    // Posed capsule shadow proxy, and the CENTRE of each fighter's trace reject
+    // sphere — the same loop, because they are the same posed capsules.
+    //
+    // The proxy ITSELF is written for PLAYER 0 only, deliberately: capsules are
+    // fitted per CHARACTER at import and `u.capsules` is not per-fighter, and
+    // the opponent has always taken the plain loose field in mapPenumbra
+    // instead. Generalising it would change the hero's penumbra, which is a
+    // look change, not this refactor's business.
+    //
+    // The CENTRE is computed for every fighter, and THE DERIVATION IS
+    // LOAD-BEARING, not an implementation detail. charLooseAffine RETURNS
+    // `length(p - gFarCenter) - gFarR` for points outside the sphere, and that
+    // value feeds AO and the penumbra term — so the reject sphere is not
+    // merely an early-out, and moving it moves the shading on every surface it
+    // is far from, including surfaces the fighter is nowhere near in frame.
+    //
+    // Measured, at 640x360 aa2 against origin/main:
+    //   hero on this capsule-average centre     4 px differ, max delta 1
+    //   hero on the transformed REST centre  38295 px differ, max delta 59
+    // The second is how the OPPONENT's centre used to be derived, and it is
+    // arguably the tighter sphere (the capsule average is dragged sideways by
+    // the two mitts). Unifying on it anyway would have repainted the hero's
+    // AO, so this keeps the hero's derivation and moves the opponent onto it.
+    // The opponent's own shift is the entire residual against origin/main
+    // (~4% of pixels, max 17, almost all +-1 LSB on ground near it) and shows
+    // up as AO, not silhouette. Reproducing BOTH exactly would mean keeping a
+    // per-player special case, which is the hero/foe asymmetry this refactor
+    // exists to delete.
+    //
+    // Under the brush rig `bone` carries the PIECE index instead of a bone
+    // index (see setCharacter), so each capsule rides the clay it stands in for.
     int cn = std::min((int)capsules_.size(), 16);
-    float center[3] = {0.f, 0.f, 0.f};
-    for (int i = 0; i < cn; i++) {
+    std::array<std::array<float, 3>, kMaxPlayers> centers{};
+    for (int pi = 0; pi < kMaxPlayers; pi++) {
+      const Fighter& pf = fighters_[pi];
+      float* center = centers[pi].data();
+      const bool writeProxy = (pi == 0);
+      for (int i = 0; i < cn; i++) {
         const BoneCapsule& c = capsules_[i];
         float a[3] = {c.a[0], c.a[1], c.a[2]};
         float b[3] = {c.b[0], c.b[1], c.b[2]};
@@ -944,282 +981,151 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
             // the moment a hand switches to the grab brush. The piece's own
             // lo/hi already IS the selected brush's box, so refit from that
             // every frame rather than caching a box from one pose.
-            if (c.bone >= 0 && (size_t)c.bone < affinePieces_.size()) {
-                const AffinePiece& ap = affinePieces_[c.bone];
+            if (c.bone >= 0 && (size_t)c.bone < pf.pieces.size()) {
+                const AffinePiece& ap = pf.pieces[c.bone];
                 float ca[3], cb[3], cr;
                 capsuleFromBox(ap.lo, ap.hi, ca, cb, cr);
                 matTransformPoint(ap.xform, ca, a);
                 matTransformPoint(ap.xform, cb, b);
-                float* sA = out[33 + i * 2];
-                float* sB = out[34 + i * 2];
-                sA[0] = a[0]; sA[1] = a[1]; sA[2] = a[2]; sA[3] = cr;
-                sB[0] = b[0]; sB[1] = b[1]; sB[2] = b[2];
+                if (writeProxy) {
+                    float* sA = out[kSlotCapsules + i * 2];
+                    float* sB = out[kSlotCapsules + i * 2 + 1];
+                    sA[0] = a[0]; sA[1] = a[1]; sA[2] = a[2]; sA[3] = cr;
+                    sB[0] = b[0]; sB[1] = b[1]; sB[2] = b[2];
+                }
                 for (int k = 0; k < 3; k++) center[k] += (a[k] + b[k]) * 0.5f;
                 continue;
             }
-        } else if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
-            matTransformPoint(&skinMats_[c.bone * 16], c.a, a);
-            matTransformPoint(&skinMats_[c.bone * 16], c.b, b);
+        } else if (c.bone >= 0 &&
+                   (size_t)(c.bone * 16 + 16) <= pf.skinMats.size()) {
+            matTransformPoint(&pf.skinMats[c.bone * 16], c.a, a);
+            matTransformPoint(&pf.skinMats[c.bone * 16], c.b, b);
         }
-        float* slotA = out[33 + i * 2];
-        float* slotB = out[34 + i * 2];
-        slotA[0] = a[0]; slotA[1] = a[1]; slotA[2] = a[2]; slotA[3] = c.r;
-        slotB[0] = b[0]; slotB[1] = b[1]; slotB[2] = b[2];
+        if (writeProxy) {
+            float* slotA = out[kSlotCapsules + i * 2];
+            float* slotB = out[kSlotCapsules + i * 2 + 1];
+            slotA[0] = a[0]; slotA[1] = a[1]; slotA[2] = a[2]; slotA[3] = c.r;
+            slotB[0] = b[0]; slotB[1] = b[1]; slotB[2] = b[2];
+        }
         for (int k = 0; k < 3; k++) center[k] += (a[k] + b[k]) * 0.5f;
+      }
+      if (cn > 0) {
+          for (int k = 0; k < 3; k++) center[k] /= (float)cn;
+      } else {
+          // No capsules fitted (analytic blob): fall back to the character's
+          // rest centre, which is what the bound was measured about.
+          for (int k = 0; k < 3; k++) center[k] = bodyCenterRest_[k];
+      }
     }
+    const float* center = centers[0].data();
     if (cn > 0) {
-        for (int k = 0; k < 3; k++) center[k] /= (float)cn;
         float radius = 0.f;
         for (int i = 0; i < cn; i++) {
             for (int e = 0; e < 2; e++) {
-                const float* p = out[33 + i * 2 + e];
+                const float* p = out[kSlotCapsules + i * 2 + e];
                 float dx = p[0] - center[0], dy = p[1] - center[1], dz = p[2] - center[2];
                 radius = std::max(radius, std::sqrt(dx * dx + dy * dy + dz * dz) +
-                                              out[33 + i * 2][3]);
+                                              out[kSlotCapsules + i * 2][3]);
             }
         }
-        out[31][1] = radius + 0.05f;
-        out[32][0] = center[0]; out[32][1] = center[1]; out[32][2] = center[2];
+        out[kSlotCapsMeta][1] = radius + 0.05f;
+        out[kSlotCapsCenter][0] = center[0];
+        out[kSlotCapsCenter][1] = center[1];
+        out[kSlotCapsCenter][2] = center[2];
     }
-    out[31][0] = (float)cn;
+    out[kSlotCapsMeta][0] = (float)cn;
 
-    // M4-P1 chunks: the traced body = smin-union over pieces of
-    // max(restField(invSkin * p), restCapsule(invSkin * p)). Rigid warps
-    // preserve the distance metric; max/min/smin keep Lipschitz <= 1.
+    // ---- ONE BLOCK PER FIGHTER ----
+    // This replaced three packings: the hero's pieces at slot 66, the
+    // opponent's near-identical copy at 293, and a dead third — the M4-P1
+    // per-CAPSULE pieces, one Piece per bone for a rigged asset. That last one
+    // went because the thing it fed is gone: brick_read.wgsl deleted the
+    // inverse-LBS warp along with the armature, so charDistI has exactly two
+    // modes now — "no pieces" (rest volume drawn unposed) and the affine brush
+    // rig. Packing 16 bone chunks into a shader that only knows how to
+    // box-clip three disjoint brushes could not have drawn anything correct;
+    // BrickSystem::kPiecesPerFighter = 3 makes that explicit rather than
+    // leaving 16 slots of vestigial capacity per fighter.
     static const bool noPieces = std::getenv("CLAYFRAY_NO_PIECES") != nullptr;
     const bool affine = affineOn(look);
-    // Skeleton-free with the rig switched off: pn = 0 puts the shader on its
-    // un-rigged path (the rest volume drawn where it was authored, all three
-    // brushes visible side by side). That is the debug A/B described in
-    // affineOn — NOT a fallback anything ships with.
-    int pn = (brushRig || noPieces) ? 0 : cn;
-    float bodyBoundR = 0.f;
-    if (affine && !noPieces) {
-        // Three pieces replace the per-capsule ones. The posed bound comes off
-        // the pieces' own rest boxes rather than the capsule endpoints below,
-        // because a squish can push clay past any bound measured at rest.
-        pn = packAffinePieces(out, 66, affinePieces_, skinMats_);
-        bodyBoundR = affineBoundR(affinePieces_, skinMats_, center);
+    // Highest live fighter + 1: the shader loops 0..sceneMeta.x-1 and skips
+    // any whose meta.x is 0, so a gap in the middle costs one rejected test,
+    // not a wrong body.
+    int live = 1; // the hero always draws
+    for (int i = 0; i < kMaxPlayers; i++) {
+        const Fighter& f = fighters_[i];
+        if (i > 0 && !f.enabled) continue;
+        live = i + 1;
+        const int base = fighterSlot(i);
+        // Skeleton-free with the rig switched off: pn = 0 puts the shader on
+        // its un-rigged path (the rest volume drawn where it was authored, all
+        // three brushes side by side). That is the debug A/B described in
+        // affineOn — NOT a fallback anything ships with.
+        const int pn =
+            (affine && !noPieces) ? packAffinePieces(out, i, f.pieces, f.skinMats) : 0;
+
+        // The reject sphere the tracer tests before touching the volume. Both
+        // centre and radius are re-derived EVERY FRAME rather than measured
+        // once at rest, because a squish can push clay past any rest-mesh
+        // bound — and a sphere that is too SMALL clips the fighter out of the
+        // frame entirely, which is a far louder failure than one too large.
+        const float* c = centers[i].data();
+        float r = bodyBoundRest_;
+        if (pn > 0 && !f.pieces.empty()) r = affineBoundR(f.pieces, f.skinMats, c);
+        out[base][0] = 1.f;       // enabled
+        out[base][1] = (float)pn; // piece count (0 = draw the rest volume)
+        out[base][2] = r + 0.05f;
+        out[base + 1][0] = c[0];
+        out[base + 1][1] = c[1];
+        out[base + 1][2] = c[2];
     }
-    // ...otherwise the M4-P1 per-capsule pieces, one per bone.
-    const int legacyPn = (affine || brushRig) ? 0 : pn;
-    for (int i = 0; i < legacyPn; i++) {
-        const BoneCapsule& c = capsules_[i];
-        float inv[16];
-        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
-            matInvAffine(&skinMats_[c.bone * 16], inv);
-        } else {
-            matIdentity(inv);
-        }
-        float* base = out[66 + i * 12];
-        std::memcpy(base, inv, 16 * sizeof(float)); // 4 slots: column-major mat4
-        // forward skin matrix: the trace warp round-trips its blended rest
-        // sample through the forward blend and rejects inconsistent samples
-        // (vacated-space ghosts)
-        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
-            std::memcpy(out[66 + i * 12 + 4], &skinMats_[c.bone * 16],
-                        16 * sizeof(float));
-        } else {
-            float ident[16];
-            matIdentity(ident);
-            std::memcpy(out[66 + i * 12 + 4], ident, 16 * sizeof(float));
-        }
-        float* lo = out[66 + i * 12 + 8];
-        float* hi = out[66 + i * 12 + 9];
-        float* ca = out[66 + i * 12 + 10];
-        float* cb = out[66 + i * 12 + 11];
-        // squash/stretch (bone scale channels) makes the warp non-rigid:
-        // rest distances overestimate world distances by up to the smallest
-        // scale factor. Store min column norm of the skin matrix; the shader
-        // multiplies sampled distances by it to restore Lipschitz <= 1.
-        float sMin = 1.f;
-        if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
-            const float* sm = &skinMats_[c.bone * 16];
-            sMin = 1e9f;
-            for (int col = 0; col < 3; col++) {
-                float len = std::sqrt(sm[col * 4] * sm[col * 4] +
-                                      sm[col * 4 + 1] * sm[col * 4 + 1] +
-                                      sm[col * 4 + 2] * sm[col * 4 + 2]);
-                sMin = std::min(sMin, len);
-            }
-            sMin = std::min(std::max(sMin, 0.25f), 1.f); // never inflate steps
-        }
-        lo[3] = sMin;
-        lo[0] = c.lo[0]; lo[1] = c.lo[1]; lo[2] = c.lo[2];
-        hi[0] = c.hi[0]; hi[1] = c.hi[1]; hi[2] = c.hi[2];
-        ca[0] = c.a[0]; ca[1] = c.a[1]; ca[2] = c.a[2]; ca[3] = c.rPiece;
-        cb[0] = c.b[0]; cb[1] = c.b[1]; cb[2] = c.b[2];
-        cb[3] = (float)c.bone; // weight-ownership gate compares joint ids
-        // posed far bound: piece content stays within rPiece + box diagonal
-        // slack of its posed capsule endpoints
-        const float* pa = out[33 + i * 2];
-        const float* pb = out[34 + i * 2];
-        for (int e = 0; e < 2; e++) {
-            const float* p = e ? pb : pa;
-            float dx = p[0] - center[0], dy = p[1] - center[1], dz = p[2] - center[2];
-            bodyBoundR = std::max(bodyBoundR,
-                                  std::sqrt(dx * dx + dy * dy + dz * dz) + c.rPiece);
-        }
-    }
-    out[65][0] = (float)pn;
-    // joint smin k: with exclusive dominance regions (no double-render) the
-    // blend only bridges hairline handoff cracks; ~2 voxels seals them
-    // without re-introducing ring bulges. VOXEL-relative, not metres — as a
-    // fixed 0.008 m it shrank to 1.5 voxels at kGrid=37 and the cracks
-    // reopened at the shoulders (see kJointSminVoxels in brick.h).
-    out[65][1] = BrickSystem::kJointSminVoxels * BrickSystem::kVoxel;
+    out[kSlotSceneMeta][0] = (float)live;
+    // joint smin k: with disjoint brush regions the blend only bridges
+    // hairline handoff cracks; ~2 voxels seals them without re-introducing
+    // ring bulges. VOXEL-relative, not metres — as a fixed 0.008 m it shrank
+    // to 1.5 voxels at kGrid=37 and the cracks reopened at the shoulders (see
+    // kJointSminVoxels in brick.h).
+    out[kSlotSceneMeta][1] = BrickSystem::kJointSminVoxels * BrickSystem::kVoxel;
     // box test margin: sample within, bound outside. Span-relative for the
     // same reason.
-    out[65][2] = BrickSystem::kBoxMarginSpans * BrickSystem::kSpan;
-    out[65][3] = bodyBoundR + 0.05f;
-
-    // Player 1's pieces (slots 293..484, count at 485). Identical packing to
-    // the hero's above but driven by ITS skeleton, which is what lets it play
-    // its own clip instead of standing rigid.
-    int fpn = 0;
-    if (affine && foeEnabled_ && !noPieces && brushRig) {
-        fpn = packAffinePieces(out, 293, foeAffinePieces_, foeSkinMats_);
-    } else if (affine && foeEnabled_ && !noPieces &&
-               foeSkinMats_.size() >= bones_.size() * 16) {
-        fpn = packAffinePieces(out, 293, affinePieces_, foeSkinMats_);
-    } else if (foeEnabled_ && !noPieces && !brushRig &&
-               foeSkinMats_.size() >= bones_.size() * 16) {
-        fpn = std::min((int)capsules_.size(), 16);
-        for (int i = 0; i < fpn; i++) {
-            const BoneCapsule& c = capsules_[i];
-            const bool ok =
-                c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= foeSkinMats_.size();
-            float inv[16];
-            if (ok) matInvAffine(&foeSkinMats_[c.bone * 16], inv);
-            else matIdentity(inv);
-            float* base = out[293 + i * 12];
-            std::memcpy(base, inv, 16 * sizeof(float));
-            if (ok) {
-                std::memcpy(out[293 + i * 12 + 4], &foeSkinMats_[c.bone * 16],
-                            16 * sizeof(float));
-            } else {
-                float ident[16];
-                matIdentity(ident);
-                std::memcpy(out[293 + i * 12 + 4], ident, 16 * sizeof(float));
-            }
-            float* lo = out[293 + i * 12 + 8];
-            float* hi = out[293 + i * 12 + 9];
-            float* ca = out[293 + i * 12 + 10];
-            float* cb = out[293 + i * 12 + 11];
-            float sMin = 1.f;
-            if (ok) {
-                const float* sm = &foeSkinMats_[c.bone * 16];
-                sMin = 1e9f;
-                for (int col = 0; col < 3; col++) {
-                    float len = std::sqrt(sm[col * 4] * sm[col * 4] +
-                                          sm[col * 4 + 1] * sm[col * 4 + 1] +
-                                          sm[col * 4 + 2] * sm[col * 4 + 2]);
-                    sMin = std::min(sMin, len);
-                }
-                sMin = std::min(std::max(sMin, 0.25f), 1.f);
-            }
-            lo[3] = sMin;
-            lo[0] = c.lo[0]; lo[1] = c.lo[1]; lo[2] = c.lo[2];
-            hi[0] = c.hi[0]; hi[1] = c.hi[1]; hi[2] = c.hi[2];
-            ca[0] = c.a[0]; ca[1] = c.a[1]; ca[2] = c.a[2]; ca[3] = c.rPiece;
-            cb[0] = c.b[0]; cb[1] = c.b[1]; cb[2] = c.b[2];
-            cb[3] = (float)c.bone;
-        }
-    }
-    out[485][0] = (float)fpn;
-
-    // M-PERF rig select (slot 486). Appended, never inserted, so no earlier
-    // index moves — and mirrored into BOTH shader roots (trap 2). y is the
-    // count of baked hand-pose volumes; 0 means the mitts are sampled out of
-    // the shared rest volume, which is the only mode today's asset supports.
-    out[486][0] = affine ? 1.f : 0.f;
-    out[486][1] = 0.f;
+    out[kSlotSceneMeta][2] = BrickSystem::kBoxMarginSpans * BrickSystem::kSpan;
 
     // M4.6 conservation: in-flight gobs (12 Hz-stepped positions) + the
     // ground field's clay top bound (0 disables the field in the tracer).
-    // These slot indices are hand-mirrored in trace.wgsl AND pick.wgsl —
-    // this static_assert catches only the C++ side overrunning the buffer;
-    // the WGSL side has no compile-time link, so CLAUDE.md flags the mirror.
-    static_assert(kUniformSlots >= 487,
-                  "gobs reach out[282], groundMeta out[283], sword out[284-286], "
-                  "foePieces out[293-485], rigMeta out[486]; keep kUniformSlots "
-                  "and the Uniforms struct in trace.wgsl + pick.wgsl in sync");
+    // These slots are hand-mirrored in trace.wgsl AND pick.wgsl (trap 2);
+    // this static_assert catches only the C++ side overrunning the buffer.
+    static_assert(kSlotFighters + kFighterSlots * kMaxPlayers == kUniformSlots,
+                  "fighter blocks must end exactly at kUniformSlots; keep the "
+                  "Uniforms struct in trace.wgsl + pick.wgsl in sync");
     int gn = std::min((int)gobs_.size(), 12);
     for (int i = 0; i < gn; i++) {
         const Gob& g = gobs_[i];
-        float* slotA = out[259 + i * 2];
-        float* slotB = out[260 + i * 2];
+        float* slotA = out[kSlotGobs + i * 2];
+        float* slotB = out[kSlotGobs + i * 2 + 1];
         slotA[0] = g.disp[0]; slotA[1] = g.disp[1]; slotA[2] = g.disp[2];
         slotA[3] = g.radius;
         slotB[0] = g.col[0]; slotB[1] = g.col[1]; slotB[2] = g.col[2];
     }
-    out[258][0] = (float)gn;
-    out[283][0] = GroundClay::kOrigin;
-    out[283][1] = GroundClay::kTexel;
-    out[283][2] = (float)GroundClay::kN;
-    out[283][3] = ground_.maxTopY();
+    out[kSlotGobMeta][0] = (float)gn;
+    out[kSlotGroundMeta][0] = GroundClay::kOrigin;
+    out[kSlotGroundMeta][1] = GroundClay::kTexel;
+    out[kSlotGroundMeta][2] = (float)GroundClay::kN;
+    out[kSlotGroundMeta][3] = ground_.maxTopY();
 
     // M4.7 sword: emissive blade endpoints (radius 0 = inactive). memset above
     // already zeroed the slots, so the disabled case needs no write.
     if (swordWorld_.enabled && (!bones_.empty() || brushRig)) {
         float hilt[3], tip[3], gA[3], gB[3];
         swordGeometry(swordWorld_, hilt, tip, gA, gB);
-        out[284][0] = hilt[0]; out[284][1] = hilt[1]; out[284][2] = hilt[2];
-        out[284][3] = swordWorld_.radius;
-        out[285][0] = tip[0]; out[285][1] = tip[1]; out[285][2] = tip[2];
-        out[286][0] = swordWorld_.color[0];
-        out[286][1] = swordWorld_.color[1];
-        out[286][2] = swordWorld_.color[2];
-    }
-
-    // M5 fighter 1: world -> its rest volume (slots 287..290), then the
-    // bounding sphere the tracer rejects against (291..292). Rigid, so the
-    // inverse is just the transpose-rotation plus the moved origin, and the
-    // sampled distance needs no Lipschitz rescale.
-    {
-        float cy = std::cos(foeDisp_.yaw), sy = std::sin(foeDisp_.yaw);
-        // forward: R = yaw(Y), t = foe pos. inverse: R^T, -R^T t
-        float inv[16] = {cy, 0.f, sy, 0.f,
-                         0.f, 1.f, 0.f, 0.f,
-                         -sy, 0.f, cy, 0.f,
-                         0.f, 0.f, 0.f, 1.f};
-        const float* t = foeDisp_.pos;
-        inv[12] = -(cy * t[0] + sy * t[2]);
-        inv[13] = -t[1];
-        inv[14] = -(-sy * t[0] + cy * t[2]);
-        std::memcpy(out[287], inv, 16 * sizeof(float));
-        out[291][0] = foeEnabled_ ? 1.f : 0.f;
-        out[291][1] = foeBoundR_;
-        // bound centre in WORLD: rotate the rest centre and translate
-        out[292][0] = t[0] + cy * foeCenterRest_[0] + sy * foeCenterRest_[2];
-        out[292][1] = t[1] + foeCenterRest_[1];
-        out[292][2] = t[2] - sy * foeCenterRest_[0] + cy * foeCenterRest_[2];
-        // Under the affine rig the yaw-only inverse above no longer describes
-        // the foe's body — a squish is not a rotation — so re-derive the
-        // reject sphere from its actual posed pieces. Too SMALL a sphere
-        // clips the opponent out of the frame, so this has to track the
-        // squish rather than reuse the rest-mesh radius.
-        if (affine && fpn > 0 &&
-            (brushRig || foeSkinMats_.size() >= bones_.size() * 16)) {
-            const std::vector<AffinePiece>& fp =
-                brushRig ? foeAffinePieces_ : affinePieces_;
-            float m[16];
-            if (brushRig) {
-                if (fp.empty()) matIdentity(m);
-                else std::memcpy(m, fp[0].xform, sizeof(m));
-            } else {
-                const int sb = fp.empty() ? -1 : fp[0].srcBone;
-                if (sb >= 0 && (size_t)(sb * 16 + 16) <= foeSkinMats_.size()) {
-                    std::memcpy(m, &foeSkinMats_[sb * 16], sizeof(m));
-                } else {
-                    matIdentity(m);
-                }
-            }
-            float c[3];
-            matTransformPoint(m, foeCenterRest_, c);
-            out[292][0] = c[0]; out[292][1] = c[1]; out[292][2] = c[2];
-            out[291][1] = affineBoundR(fp, foeSkinMats_, c) + 0.05f;
-        }
+        float* a = out[kSlotSwordA];
+        float* b = out[kSlotSwordA + 1];
+        float* col = out[kSlotSwordA + 2];
+        a[0] = hilt[0]; a[1] = hilt[1]; a[2] = hilt[2];
+        a[3] = swordWorld_.radius;
+        b[0] = tip[0]; b[1] = tip[1]; b[2] = tip[2];
+        col[0] = swordWorld_.color[0];
+        col[1] = swordWorld_.color[1];
+        col[2] = swordWorld_.color[2];
     }
 }
 
@@ -1236,18 +1142,18 @@ int Renderer::clipIndex(const char* name) const {
 void Renderer::resolveSword(const LookParams& look) {
     swordWorld_ = look.sword;
     if (!look.sword.carry) return;
-    float cy = std::cos(fighterDisp_.yaw), sy = std::sin(fighterDisp_.yaw);
+    float cy = std::cos(fighters_[0].disp.yaw), sy = std::sin(fighters_[0].disp.yaw);
     const float* p = look.sword.pos;
     // lean tips the held sword with the body: rotate about the travel-perp
     // axis, which in character space is +X (forward is +Z)
-    float cl = std::cos(fighterDisp_.lean), sl = std::sin(fighterDisp_.lean);
+    float cl = std::cos(fighters_[0].disp.lean), sl = std::sin(fighters_[0].disp.lean);
     float ly = p[1] * cl - p[2] * sl;
     float lz = p[1] * sl + p[2] * cl;
-    swordWorld_.pos[0] = fighterDisp_.pos[0] + cy * p[0] + sy * lz;
-    swordWorld_.pos[1] = fighterDisp_.pos[1] + ly;
-    swordWorld_.pos[2] = fighterDisp_.pos[2] - sy * p[0] + cy * lz;
-    swordWorld_.yaw = look.sword.yaw + fighterDisp_.yaw;
-    swordWorld_.pitch = look.sword.pitch + fighterDisp_.lean;
+    swordWorld_.pos[0] = fighters_[0].disp.pos[0] + cy * p[0] + sy * lz;
+    swordWorld_.pos[1] = fighters_[0].disp.pos[1] + ly;
+    swordWorld_.pos[2] = fighters_[0].disp.pos[2] - sy * p[0] + cy * lz;
+    swordWorld_.yaw = look.sword.yaw + fighters_[0].disp.yaw;
+    swordWorld_.pitch = look.sword.pitch + fighters_[0].disp.lean;
 }
 
 void Renderer::swordGeometry(const SwordParams& s, float hilt[3], float tip[3],
@@ -1274,15 +1180,14 @@ void Renderer::setCharacter(CharacterAsset asset) {
     bones_ = asset.bones;
     clips_ = asset.clips;
     capsules_ = deriveCapsules(asset);
-    evalPose(bones_, nullptr, 0.f, skinMats_); // identity: rest pose
+    evalPose(bones_, nullptr, 0.f, fighters_[0].skinMats); // identity: rest pose
 
     // ---- M-RIG: the skeleton-free brush rig ----
     // Built entirely from the imported MeshParts, so it needs no armature. Done
     // FIRST because it decides whether any of the bone machinery below runs at
     // all (on this asset none of it does: every loop is over an empty bones_).
     brush_ = BrushRig{};
-    affinePieces_.clear();
-    foeAffinePieces_.clear();
+    for (Fighter& f : fighters_) f.pieces.clear();
     if (asset.hasBrushRig()) {
         const MeshPart& body = asset.parts[asset.partBody];
         const MeshPart& hr = asset.parts[asset.partHandRest];
@@ -1326,9 +1231,12 @@ void Renderer::setCharacter(CharacterAsset asset) {
 
         // Three pieces: body, left hand, right hand. srcBone stays -1 — these
         // are driven by updateBrushRig writing `xform` directly.
-        affinePieces_.resize(3);
-        for (int i = 0; i < 3; i++) affinePieces_[i].srcBone = -1;
-        foeAffinePieces_ = affinePieces_;
+        // Every fighter gets its own copy: same three brushes, but each
+        // fighter's own pose writes its own `xform` per frame.
+        for (Fighter& f : fighters_) {
+            f.pieces.resize(BrickSystem::kPiecesPerFighter);
+            for (AffinePiece& ap : f.pieces) ap.srcBone = -1;
+        }
 
         // Shadow proxy. deriveCapsules() fits capsules to BONES and there are
         // none, so synthesise one per brush from its own AABB: the capsule runs
@@ -1347,7 +1255,7 @@ void Renderer::setCharacter(CharacterAsset asset) {
         };
         // Rest-pose defaults. packUniforms REFITS the a/b/r of each of these
         // every frame from its piece's current brush box, so these values only
-        // serve foeCaps_ (the rest capsules used for blade hit tests).
+        // serve the blade hit test, which works in rest space.
         addCapsule(brush_.bodyLo, brush_.bodyHi, 0);
         addCapsule(brush_.handLo[0], brush_.handHi[0], 1);
         addCapsule(brush_.handLo[0], brush_.handHi[0], 2);
@@ -1522,7 +1430,7 @@ void Renderer::setCharacter(CharacterAsset asset) {
     autoReach_ = 0.f;
     if (!bodyCom_.bone.empty()) {
         float com[3];
-        evalBodyCom(bodyCom_, skinMats_, com); // skinMats_ = rest pose here
+        evalBodyCom(bodyCom_, fighters_[0].skinMats, com); // fighters_[0].skinMats = rest pose here
         for (const HandIkChain& c : handIk_) {
             float w[3];
             restOrigin(c.wrist, w);
@@ -1538,7 +1446,7 @@ void Renderer::setCharacter(CharacterAsset asset) {
     // matters: this used to start with an unconditional clear() that would
     // silently throw the brush pieces away.
     if (!bones_.empty()) {
-        affinePieces_.clear();
+        fighters_[0].pieces.clear();
         std::vector<int> owner(nb, 0); // default: the body
         std::vector<int> srcBone{-1};  // piece 0 is the body; filled below
         for (const HandIkChain& c : handIk_) {
@@ -1598,9 +1506,9 @@ void Renderer::setCharacter(CharacterAsset asset) {
         }
         if (pieces[0].hi[0] >= pieces[0].lo[0]) {
             for (const AffinePiece& ap : pieces)
-                if (ap.boneMask != 0 && ap.hi[0] >= ap.lo[0]) affinePieces_.push_back(ap);
+                if (ap.boneMask != 0 && ap.hi[0] >= ap.lo[0]) fighters_[0].pieces.push_back(ap);
         }
-        if (bones_.size() > 16 && !affinePieces_.empty()) {
+        if (bones_.size() > 16 && !fighters_[0].pieces.empty()) {
             std::fprintf(stderr,
                          "[rig] %zu bones exceeds the 16-bone ownership mask; "
                          "falling back to the 13-piece warp\n",
@@ -1610,11 +1518,10 @@ void Renderer::setCharacter(CharacterAsset asset) {
     std::printf("anim: %zu bones, %zu clip(s), %zu shadow capsules, %zu hand(s), "
                 "rest reach %.3f m, %zu affine piece(s)\n",
                 bones_.size(), clips_.size(), capsules_.size(), handIk_.size(),
-                autoReach_, affinePieces_.size());
-    // fighter 1 is the same character in its own volume — "identical second
-    // fighter". Rest capsules are shared (same mesh), and the bound sphere
-    // comes off the mesh so the tracer's cheap reject is tight.
-    foeCaps_ = capsules_;
+                autoReach_, fighters_[0].pieces.size());
+    // Every fighter is the same character in its own volume slice. The rest
+    // capsules are shared outright (same mesh), and the rest bound below is
+    // the fallback the tracer rejects against before the pieces exist.
     {
         float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
         if (brush_.valid) {
@@ -1638,21 +1545,21 @@ void Renderer::setCharacter(CharacterAsset asset) {
         }
         float r2 = 0.f;
         for (int a = 0; a < 3; a++) {
-            foeCenterRest_[a] = (lo[a] + hi[a]) * 0.5f;
+            bodyCenterRest_[a] = (lo[a] + hi[a]) * 0.5f;
             float h = (hi[a] - lo[a]) * 0.5f;
             r2 += h * h;
         }
-        foeBoundR_ = std::sqrt(r2) + 0.05f;
+        bodyBoundRest_ = std::sqrt(r2) + 0.05f;
     }
-    // Both fighters are the same character, so the mesh-derived half of the
-    // import (bins, watertight parity, smooth normals, per-cell skin field,
-    // and the read-only GPU uploads) is computed ONCE and shared. Doing it
-    // per BrickSystem cost ~2.5 s of startup and a duplicate ~32 MB upload
-    // for byte-identical results.
+    // Every fighter is the same character, so the mesh-derived half of the
+    // import (bins, watertight parity, smooth normals, and the read-only GPU
+    // uploads) is computed ONCE and shared. Doing it per BrickSystem cost
+    // ~2.5 s of startup and a duplicate ~32 MB upload PER EXTRA FIGHTER for
+    // byte-identical results — at four bodies that would have been ~7.5 s and
+    // ~96 MB. Only the OUTPUT volume slice is per fighter.
     std::shared_ptr<BrickSystem::MeshImport> mesh =
         BrickSystem::prepareImport(*gpu_, asset);
-    foe_.requestImport(mesh);
-    brick_.requestImport(std::move(mesh));
+    for (Fighter& f : fighters_) f.vol.requestImport(mesh);
 }
 
 void Renderer::encodePick(wgpu::CommandEncoder& enc) {
@@ -1660,7 +1567,6 @@ void Renderer::encodePick(wgpu::CommandEncoder& enc) {
     pass.SetPipeline(pickPipeline_);
     pass.SetBindGroup(0, pickBind_);
     pass.SetBindGroup(1, pickBrickBind_);
-    pass.SetBindGroup(2, pickFoeBind_);
     pass.DispatchWorkgroups(1);
     pass.End();
     if (!pickMapPending_) {
@@ -1692,6 +1598,9 @@ void Renderer::pollPick() {
                                pickRest_[0] = d[12];
                                pickRest_[1] = d[13];
                                pickRest_[2] = d[14];
+                               // which fighter's volume pickRest_ addresses;
+                               // -1 when the ray hit no clay at all
+                               pickPlayer_ = (int)d[15];
                                pickRead_.Unmap();
                                // world vs rest at the cursor: the gap between
                                // them IS the articulation, and edits must use
@@ -1701,10 +1610,10 @@ void Renderer::pollPick() {
                                    std::getenv("CLAYFRAY_DEBUG_PICK") != nullptr;
                                if (dbg && pickValid_) {
                                    std::printf("[pick] world (%.4f %.4f %.4f) rest "
-                                               "(%.4f %.4f %.4f) mat %.1f\n",
+                                               "(%.4f %.4f %.4f) mat %.1f player %d\n",
                                                pickPos_[0], pickPos_[1], pickPos_[2],
                                                pickRest_[0], pickRest_[1], pickRest_[2],
-                                               pickMat_);
+                                               pickMat_, pickPlayer_);
                                    std::fflush(stdout);
                                }
                            }
@@ -1713,6 +1622,13 @@ void Renderer::pollPick() {
 }
 
 BrickEdit Renderer::queueBrickEdit(BrickEdit e) {
+    // WHICH body gets cut comes from the edit itself (BrickEdit::player), NOT
+    // from the live pick: `pos` is rest space, so the caller that produced the
+    // coordinates is the only one that knows which slice they address. The
+    // interactive sculpt path sets it from pickPlayer(); everything scripted
+    // leaves it at the hero, which is what every journal and --carve-test
+    // assumes.
+    const int target = clampPlayer(e.player);
     // snapshot the wound's facing + material color for the gobs this edit
     // will tear off (measurement arrives frames later; pick moves on)
     if (pickValid_ && !e.fromGob) {
@@ -1723,14 +1639,16 @@ BrickEdit Renderer::queueBrickEdit(BrickEdit e) {
         }
     } else if (e.worldPos[0] == 0.f && e.worldPos[1] == 0.f && e.worldPos[2] == 0.f) {
         // scripted edit (ctl/replay/carve-test): authored in rest space, so
-        // place its wound by the fighter root. Exact while unposed, and only
-        // the gob spawn point rides on it.
-        float cy = std::cos(fighterDisp_.yaw), sy = std::sin(fighterDisp_.yaw);
-        e.worldPos[0] = fighterDisp_.pos[0] + cy * e.pos[0] + sy * e.pos[2];
-        e.worldPos[1] = fighterDisp_.pos[1] + e.pos[1];
-        e.worldPos[2] = fighterDisp_.pos[2] - sy * e.pos[0] + cy * e.pos[2];
+        // place its wound by the TARGET fighter's root. Exact while unposed,
+        // and only the gob spawn point rides on it.
+        const FighterPose& d = fighters_[target].disp;
+        float cy = std::cos(d.yaw), sy = std::sin(d.yaw);
+        e.worldPos[0] = d.pos[0] + cy * e.pos[0] + sy * e.pos[2];
+        e.worldPos[1] = d.pos[1] + e.pos[1];
+        e.worldPos[2] = d.pos[2] - sy * e.pos[0] + cy * e.pos[2];
     }
-    brick_.queueEdit(e);
+    e.player = target;
+    fighters_[target].vol.queueEdit(e);
     return e;
 }
 
@@ -1739,10 +1657,11 @@ void Renderer::absorbMeasured() {
     // with conservation off — or a measurement queued while ON but arriving
     // while OFF would desync the ledger the next time it's toggled back on.
     // The toggle gates SPAWNING (updateConservation), not accounting.
-    // Both fighters bill to ONE ledger: clay carved off either body becomes
-    // the same gobs and lands on the same arena, so conservation is arena-wide.
+    // EVERY fighter bills to ONE ledger: clay carved off any body becomes the
+    // same gobs and lands on the same arena, so conservation is arena-wide.
     MeasuredEdit m;
-    for (BrickSystem* bs : {&brick_, &foe_}) {
+    for (Fighter& fighter : fighters_) {
+      BrickSystem* bs = &fighter.vol;
       while (bs->takeMeasured(m)) {
         if (std::getenv("CLAYFRAY_DEBUG_LEDGER")) {
             std::printf("[sploot] mode %d measured %.1f ml\n", m.edit.mode,
@@ -1775,7 +1694,8 @@ void Renderer::absorbMeasured() {
 }
 
 void Renderer::updateBladeCut(const LookParams& look) {
-    if (!swordWorld_.enabled || !foeEnabled_ || foeCaps_.empty()) {
+    // Player 0 wields the sword; anyone else on the field is a target.
+    if (!swordWorld_.enabled || capsules_.empty()) {
         haveBlade_ = false;
         return;
     }
@@ -1818,28 +1738,32 @@ void Renderer::updateBladeCut(const LookParams& look) {
     // foe's hitboxes sitting at the origin while the foe itself stands
     // elsewhere, and the sword would cut empty air.
     const bool brushRig = skeletonFree();
-    // Bail only when there is NO posing data at all. This guard used to read
-    // `foeSkinMats_.empty()` alone, which is ALWAYS true once the armature is
-    // gone — so the sword silently stopped cutting while UI carving still
-    // worked, because the return fired before the brush-rig path below could
-    // ever run.
-    if (brushRig ? foeAffinePieces_.empty() : foeSkinMats_.empty()) return;
     if (std::getenv("CLAYFRAY_DEBUG_BLADE")) {
-        std::printf("[blade] sweep=%.4f brushRig=%d foeCaps=%zu foePieces=%zu "
+        std::printf("[blade] sweep=%.4f brushRig=%d caps=%zu "
                     "hilt=(%.2f %.2f %.2f) tip=(%.2f %.2f %.2f)\n",
-                    sweep, (int)brushRig, foeCaps_.size(),
-                    foeAffinePieces_.size(), hilt[0], hilt[1], hilt[2],
-                    tip[0], tip[1], tip[2]);
+                    sweep, (int)brushRig, capsules_.size(), hilt[0], hilt[1],
+                    hilt[2], tip[0], tip[1], tip[2]);
         std::fflush(stdout);
     }
-    auto foeToWorld = [&](const BoneCapsule& c, const float* r, float* w) {
+
+    // ONE TARGET. Called for every fighter but the wielder, so a four-way
+    // brawl cuts whoever the blade actually passes through instead of only
+    // ever player 1. Each target drains its own kOpsPerFrame substep budget
+    // (separate BrickSystems), so they do not compete for edit slots.
+    auto cut = [&](Fighter& tgt) {
+    // Blade tests happen in WORLD space, so the target's rest capsules have to
+    // be posed first. Under the brush rig `bone` is a PIECE index into THAT
+    // FIGHTER'S piece table — falling through to identity would leave its
+    // hitboxes at the origin while the body stands elsewhere, and the sword
+    // would cut empty air.
+    auto toWorld = [&](const BoneCapsule& c, const float* r, float* w) {
         if (brushRig) {
-            if (c.bone >= 0 && (size_t)c.bone < foeAffinePieces_.size()) {
-                matTransformPoint(foeAffinePieces_[c.bone].xform, r, w);
+            if (c.bone >= 0 && (size_t)c.bone < tgt.pieces.size()) {
+                matTransformPoint(tgt.pieces[c.bone].xform, r, w);
                 return;
             }
-        } else if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= foeSkinMats_.size()) {
-            matTransformPoint(&foeSkinMats_[c.bone * 16], r, w);
+        } else if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= tgt.skinMats.size()) {
+            matTransformPoint(&tgt.skinMats[c.bone * 16], r, w);
             return;
         }
         w[0] = r[0]; w[1] = r[1]; w[2] = r[2];
@@ -1872,10 +1796,10 @@ void Renderer::updateBladeCut(const LookParams& look) {
             float t = (float)i / (float)kSamples;
             float p[3] = {h0[0] + (t0s[0] - h0[0]) * t, h0[1] + (t0s[1] - h0[1]) * t,
                           h0[2] + (t0s[2] - h0[2]) * t};
-            for (const BoneCapsule& c : foeCaps_) {
+            for (const BoneCapsule& c : capsules_) {
                 float a2[3], b2[3];
-                foeToWorld(c, c.a, a2);
-                foeToWorld(c, c.b, b2);
+                toWorld(c, c.a, a2);
+                toWorld(c, c.b, b2);
                 float ab[3] = {b2[0] - a2[0], b2[1] - a2[1], b2[2] - a2[2]};
                 float ap[3] = {p[0] - a2[0], p[1] - a2[1], p[2] - a2[2]};
                 float len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
@@ -1917,28 +1841,29 @@ void Renderer::updateBladeCut(const LookParams& look) {
             wA[k] = h0[k] + dirW[k] * t0;
             wB[k] = h0[k] + dirW[k] * t1;
         }
-        // world -> the opponent's REST volume (trap 6: edits are rest space),
-        // through the bone the blade actually met
+        // world -> the TARGET'S REST volume (trap 6: edits are rest space),
+        // through the piece the blade actually met
         float invBone[16];
         matIdentity(invBone);
         if (brushRig) {
-            if (hitBone >= 0 && (size_t)hitBone < foeAffinePieces_.size()) {
-                matInvAffine(foeAffinePieces_[hitBone].xform, invBone);
+            if (hitBone >= 0 && (size_t)hitBone < tgt.pieces.size()) {
+                matInvAffine(tgt.pieces[hitBone].xform, invBone);
             }
-        } else if (hitBone >= 0 && (size_t)(hitBone * 16 + 16) <= foeSkinMats_.size()) {
-            matInvAffine(&foeSkinMats_[hitBone * 16], invBone);
+        } else if (hitBone >= 0 && (size_t)(hitBone * 16 + 16) <= tgt.skinMats.size()) {
+            matInvAffine(&tgt.skinMats[hitBone * 16], invBone);
         }
         matTransformPoint(invBone, wA, e.pos);
         matTransformPoint(invBone, wB, e.posB);
         for (int k = 0; k < 3; k++) e.worldPos[k] = (wA[k] + wB[k]) * 0.5f;
         std::memcpy(e.outDir, nrm, sizeof(e.outDir)); // gobs spray off the cut
+        e.player = tgt.vol.slot(); // whose clay this is, for the ledger/snapshot
         e.fromBlade = true; // pool this into the slice gob, don't dribble it
         // editInBounds is what queueEdit re-checks, so testing it here keeps
         // slicePending_ counting exactly the edits that will be measured — an
         // edit silently dropped at the volume boundary (trap 5) must not leave
         // the slice waiting forever for a measurement that never comes.
-        if (foe_.editInBounds(e)) {
-            foe_.queueEdit(e);
+        if (tgt.vol.editInBounds(e)) {
+            tgt.vol.queueEdit(e);
             // The gob spawns where the blade LEAVES the body, so latch wB —
             // the tip-side end of the span inside the opponent — rather than
             // the midpoint the edit carries for the dribble path. Overwritten
@@ -1955,6 +1880,19 @@ void Renderer::updateBladeCut(const LookParams& look) {
             slicePending_++;
             sliceWait_ = 0;
         }
+    }
+    };
+
+    for (int ti = 1; ti < kMaxPlayers; ti++) {
+        Fighter& tgt = fighters_[ti];
+        if (!tgt.enabled) continue;
+        // Bail only when there is NO posing data at all. This guard used to
+        // read `skinMats.empty()` alone, which is ALWAYS true once the
+        // armature is gone — so the sword silently stopped cutting while UI
+        // carving still worked, because the return fired before the brush-rig
+        // path could ever run.
+        if (brushRig ? tgt.pieces.empty() : tgt.skinMats.empty()) continue;
+        cut(tgt);
     }
 }
 
@@ -2113,16 +2051,16 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
         // piece's transform; refit from its current brush box for the same
         // reason packUniforms does (a grab hand's box lives 0.98 m away).
         if (brushRig) {
-            if (c.bone >= 0 && (size_t)c.bone < affinePieces_.size()) {
-                const AffinePiece& ap = affinePieces_[c.bone];
+            if (c.bone >= 0 && (size_t)c.bone < fighters_[0].pieces.size()) {
+                const AffinePiece& ap = fighters_[0].pieces[c.bone];
                 float ca[3], cb[3];
                 capsuleFromBox(ap.lo, ap.hi, ca, cb, pc.r);
                 matTransformPoint(ap.xform, ca, pc.a);
                 matTransformPoint(ap.xform, cb, pc.b);
             }
-        } else if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= skinMats_.size()) {
-            matTransformPoint(&skinMats_[c.bone * 16], c.a, pc.a);
-            matTransformPoint(&skinMats_[c.bone * 16], c.b, pc.b);
+        } else if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= fighters_[0].skinMats.size()) {
+            matTransformPoint(&fighters_[0].skinMats[c.bone * 16], c.a, pc.a);
+            matTransformPoint(&fighters_[0].skinMats[c.bone * 16], c.b, pc.b);
         }
         caps.push_back(pc);
     }
@@ -2179,21 +2117,21 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
                     if (brushRig) {
                         // world -> the BRUSH region this piece samples, which
                         // is the volume address the edit must carry (trap 6).
-                        if (pc.bone >= 0 && (size_t)pc.bone < affinePieces_.size()) {
+                        if (pc.bone >= 0 && (size_t)pc.bone < fighters_[0].pieces.size()) {
                             float inv[16];
-                            matInvAffine(affinePieces_[pc.bone].xform, inv);
+                            matInvAffine(fighters_[0].pieces[pc.bone].xform, inv);
                             matTransformPoint(inv, g.pos, rest);
                         }
                     } else if (pc.bone >= 0 &&
-                               (size_t)(pc.bone * 16 + 16) <= skinMats_.size()) {
+                               (size_t)(pc.bone * 16 + 16) <= fighters_[0].skinMats.size()) {
                         float inv[16];
-                        matInvAffine(&skinMats_[pc.bone * 16], inv);
+                        matInvAffine(&fighters_[0].skinMats[pc.bone * 16], inv);
                         matTransformPoint(inv, g.pos, rest);
                     }
                     std::memcpy(e.pos, rest, sizeof(e.pos));
                     std::memcpy(e.color, g.col, sizeof(e.color));
-                    if (brick_.editInBounds(e)) {
-                        brick_.queueEdit(e);
+                    if (fighters_[0].vol.editInBounds(e)) {
+                        fighters_[0].vol.queueEdit(e);
                         gone = true; // ledger settles when its measurement lands
                         break;
                     }
@@ -2249,12 +2187,11 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     // reads the latched pose, so the whole fighter steps together instead of
     // a 12 Hz body sliding on a 60 Hz root.
     if (!look.motion.stepRoot) {
-        fighterDisp_ = fighter_; // 60 Hz slide (pre-M-PERF behaviour)
-        foeDisp_ = foePose_;
+        // 60 Hz slide (pre-M-PERF behaviour)
+        for (Fighter& f : fighters_) f.disp = f.pose;
     } else if (frame.poseTime != dispPoseTime_) {
         dispPoseTime_ = frame.poseTime;
-        fighterDisp_ = fighter_;
-        foeDisp_ = foePose_;
+        for (Fighter& f : fighters_) f.disp = f.pose;
     }
 
     // M-PERF: advance the affine body's squish spring. ON THE POSE GRID, not
@@ -2269,8 +2206,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                 ? std::min(std::max(frame.poseTime - springPoseTime_, 0.f), 0.25f)
                 : 0.f;
         springPoseTime_ = frame.poseTime;
-        stepSpring(spring_, look.rig, fighter_.moving, dt);
-        stepSpring(foeSpring_, look.rig, foePose_.moving, dt);
+        for (Fighter& f : fighters_) stepSpring(f.spring, look.rig, f.pose.moving, dt);
     }
 
     // pose the skeleton at the quantized clock; paused = rest pose
@@ -2288,15 +2224,19 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         const bool holding = swordWorld_.enabled && look.hands.ik;
         if (frame.poseTime != handPoseTime_) {
             handPoseTime_ = frame.poseTime;
-            handPose_[0] = handPose_[1] = holding ? 1 : 0;
-            // the opponent is not holding anything yet, so it keeps rest hands
-            foeHandPose_[0] = foeHandPose_[1] = 0;
+            // Only player 0 carries the sword, so only player 0 grips. The
+            // others keep rest hands until a second weapon exists.
+            fighters_[0].handPose[0] = fighters_[0].handPose[1] = holding ? 1 : 0;
+            for (int i = 1; i < kMaxPlayers; i++)
+                fighters_[i].handPose[0] = fighters_[i].handPose[1] = 0;
         }
-        updateBrushRig(affinePieces_, handPose_, fighterDisp_, spring_, look,
-                       (swordWorld_.enabled && look.hands.ik) ? &swordWorld_ : nullptr);
-        if (foeEnabled_) {
-            updateBrushRig(foeAffinePieces_, foeHandPose_, foeDisp_, foeSpring_, look,
-                           nullptr);
+        for (int i = 0; i < kMaxPlayers; i++) {
+            Fighter& f = fighters_[i];
+            if (i > 0 && !f.enabled) continue;
+            const SwordParams* grip =
+                (i == 0 && swordWorld_.enabled && look.hands.ik) ? &swordWorld_
+                                                                 : nullptr;
+            updateBrushRig(f.pieces, f.handPose, f.disp, f.spring, look, grip);
         }
     }
 
@@ -2314,43 +2254,43 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             // which is what keeps the A/B comparing like with like; the shape
             // they described — squash, spring, hop, lean — is what the affine
             // reproduces procedurally, at three pieces instead of thirteen.
-            evalPose(bones_, nullptr, 0.f, skinMats_);
+            evalPose(bones_, nullptr, 0.f, fighters_[0].skinMats);
             float A[16];
-            bodyAffine(fighterDisp_, spring_, look.rig, A);
-            for (size_t b = 0; b * 16 + 16 <= skinMats_.size(); b++) {
+            bodyAffine(fighters_[0].disp, fighters_[0].spring, look.rig, A);
+            for (size_t b = 0; b * 16 + 16 <= fighters_[0].skinMats.size(); b++) {
                 float tmp[16];
-                matMul(A, &skinMats_[b * 16], tmp);
-                std::memcpy(&skinMats_[b * 16], tmp, sizeof(tmp));
+                matMul(A, &fighters_[0].skinMats[b * 16], tmp);
+                std::memcpy(&fighters_[0].skinMats[b * 16], tmp, sizeof(tmp));
             }
         } else {
         // locomotion picks the clip: bounce while travelling, idle at rest.
         // Falls back to the first clip when the asset has neither name.
         int ci = -1;
         if (look.animPlay && !clips_.empty()) {
-            ci = clipIndex(fighterDisp_.moving ? "bounce" : "idle");
+            ci = clipIndex(fighters_[0].disp.moving ? "bounce" : "idle");
             if (ci < 0) ci = 0;
         }
         const AnimClip* clip = (ci >= 0 && clips_[ci].duration > 0.f) ? &clips_[ci] : nullptr;
         if (clip) {
-            animT_ = std::fmod(frame.poseTime * look.animSpeed, clip->duration);
+            fighters_[0].animT = std::fmod(frame.poseTime * look.animSpeed, clip->duration);
         }
-        evalPose(bones_, clip, animT_, skinMats_);
+        evalPose(bones_, clip, fighters_[0].animT, fighters_[0].skinMats);
 
         // root: lean about world X (before yaw), then yaw, then translate.
         // Applied to every skin matrix, so the clip stays authored in
         // character space and everything downstream is already world.
         {
-            const float cy = std::cos(fighterDisp_.yaw), sy = std::sin(fighterDisp_.yaw);
-            const float cl = std::cos(fighterDisp_.lean), sl = std::sin(fighterDisp_.lean);
+            const float cy = std::cos(fighters_[0].disp.yaw), sy = std::sin(fighters_[0].disp.yaw);
+            const float cl = std::cos(fighters_[0].disp.lean), sl = std::sin(fighters_[0].disp.lean);
             // R = yaw(Y) * lean(X), column-major
             float R[16] = {cy,        0.f, -sy,       0.f,
                            sy * sl,   cl,  cy * sl,   0.f,
                            sy * cl,   -sl, cy * cl,   0.f,
-                           fighterDisp_.pos[0], fighterDisp_.pos[1], fighterDisp_.pos[2], 1.f};
-            for (size_t b = 0; b * 16 + 16 <= skinMats_.size(); b++) {
+                           fighters_[0].disp.pos[0], fighters_[0].disp.pos[1], fighters_[0].disp.pos[2], 1.f};
+            for (size_t b = 0; b * 16 + 16 <= fighters_[0].skinMats.size(); b++) {
                 float tmp[16];
-                matMul(R, &skinMats_[b * 16], tmp);
-                std::memcpy(&skinMats_[b * 16], tmp, sizeof(tmp));
+                matMul(R, &fighters_[0].skinMats[b * 16], tmp);
+                std::memcpy(&fighters_[0].skinMats[b * 16], tmp, sizeof(tmp));
             }
         }
         }
@@ -2359,7 +2299,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         // does not bend a chain — it teleports each hand onto its grip, held
         // back only by the reach ball about the blob's centre of mass. The
         // body stays on the clip. Marbles/capsules below read the IK'd
-        // skinMats_.
+        // fighters_[0].skinMats.
         if (swordWorld_.enabled && look.hands.ik && !handIk_.empty()) {
             float hilt[3], tip[3], gA[3], gB[3];
             swordGeometry(swordWorld_, hilt, tip, gA, gB);
@@ -2371,7 +2311,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             // NOT cross(blade, up) — the sword rests in a VERTICAL guard, so
             // a blade-derived lateral axis degenerates exactly in the pose the
             // hands spend most of their time in.
-            const float cyG = std::cos(fighterDisp_.yaw), syG = std::sin(fighterDisp_.yaw);
+            const float cyG = std::cos(fighters_[0].disp.yaw), syG = std::sin(fighters_[0].disp.yaw);
             const float rightW[3] = {cyG, 0.f, -syG};
             for (HandIkChain& c : handIk_) {
                 const std::string& nm = bones_[c.wrist].name;
@@ -2402,11 +2342,11 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                 c.palmLen = c.restSpan * look.hands.palmFrac;
             }
             float com[3];
-            evalBodyCom(bodyCom_, skinMats_, com);
+            evalBodyCom(bodyCom_, fighters_[0].skinMats, com);
             float reach = look.hands.reach > 0.f
                               ? look.hands.reach
                               : autoReach_ * look.hands.reachScale;
-            applyHandIk(bones_, handIk_, com, reach, look.hands.orient, skinMats_);
+            applyHandIk(bones_, handIk_, com, reach, look.hands.orient, fighters_[0].skinMats);
         }
 
         // gaze last: it only touches the eye leaves, and it wants the head
@@ -2419,50 +2359,57 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                 Vec3 cp = cam.pos();
                 gazeTarget_[0] = cp.x; gazeTarget_[1] = cp.y; gazeTarget_[2] = cp.z;
             }
-            applyGaze(bones_, gaze_, gazeTarget_, look.gaze.maxAngle, skinMats_);
+            applyGaze(bones_, gaze_, gazeTarget_, look.gaze.maxAngle, fighters_[0].skinMats);
         }
     }
 
-    // Player 1 poses itself: its own clip clock, its own skeleton, its own
-    // root. It stands and idles rather than following the hero's animation.
-    if (foeEnabled_ && !bones_.empty() && affine) {
-        // same collapse as the hero, driven by ITS pose and ITS spring
-        evalPose(bones_, nullptr, 0.f, foeSkinMats_);
-        float A[16];
-        bodyAffine(foeDisp_, foeSpring_, look.rig, A);
-        for (size_t b = 0; b * 16 + 16 <= foeSkinMats_.size(); b++) {
-            float tmp[16];
-            matMul(A, &foeSkinMats_[b * 16], tmp);
-            std::memcpy(&foeSkinMats_[b * 16], tmp, sizeof(tmp));
+    // Every opponent poses ITSELF: its own clip clock, its own skeleton, its
+    // own root. They stand and idle rather than following the hero's
+    // animation. Rigged assets only — with the brush rig there is no skeleton
+    // and updateBrushRig above has already done the work.
+    for (int i = 1; i < kMaxPlayers && !bones_.empty(); i++) {
+        Fighter& f = fighters_[i];
+        if (!f.enabled) continue;
+        if (affine) {
+            // same collapse as the hero, driven by ITS pose and ITS spring
+            evalPose(bones_, nullptr, 0.f, f.skinMats);
+            float A[16];
+            bodyAffine(f.disp, f.spring, look.rig, A);
+            for (size_t b = 0; b * 16 + 16 <= f.skinMats.size(); b++) {
+                float tmp[16];
+                matMul(A, &f.skinMats[b * 16], tmp);
+                std::memcpy(&f.skinMats[b * 16], tmp, sizeof(tmp));
+            }
+            continue;
         }
-    } else if (foeEnabled_ && !bones_.empty()) {
-        int ci = clipIndex(foeDisp_.moving ? "bounce" : "idle");
+        int ci = clipIndex(f.disp.moving ? "bounce" : "idle");
         if (ci < 0) ci = 0;
         const AnimClip* clip =
             (look.animPlay && !clips_.empty() && clips_[ci].duration > 0.f)
                 ? &clips_[ci]
                 : nullptr;
         if (clip) {
-            // offset the phase so two identical fighters don't breathe in
-            // lockstep — that reads as one puppet duplicated, not two actors
-            foeAnimT_ = std::fmod(frame.poseTime * look.animSpeed + 0.37f,
-                                  clip->duration);
+            // Offset each fighter's phase so identical bodies don't breathe in
+            // lockstep — that reads as one puppet duplicated, not N actors.
+            // Scaled by index so a third and fourth are not in step either.
+            f.animT = std::fmod(frame.poseTime * look.animSpeed + 0.37f * (float)i,
+                                clip->duration);
         }
-        evalPose(bones_, clip, foeAnimT_, foeSkinMats_);
-        const float cy = std::cos(foeDisp_.yaw), sy = std::sin(foeDisp_.yaw);
-        const float cl = std::cos(foeDisp_.lean), sl = std::sin(foeDisp_.lean);
+        evalPose(bones_, clip, f.animT, f.skinMats);
+        const float cy = std::cos(f.disp.yaw), sy = std::sin(f.disp.yaw);
+        const float cl = std::cos(f.disp.lean), sl = std::sin(f.disp.lean);
         float R[16] = {cy,      0.f, -sy,     0.f,
                        sy * sl, cl,  cy * sl, 0.f,
                        sy * cl, -sl, cy * cl, 0.f,
-                       foeDisp_.pos[0], foeDisp_.pos[1], foeDisp_.pos[2], 1.f};
-        for (size_t b = 0; b * 16 + 16 <= foeSkinMats_.size(); b++) {
+                       f.disp.pos[0], f.disp.pos[1], f.disp.pos[2], 1.f};
+        for (size_t b = 0; b * 16 + 16 <= f.skinMats.size(); b++) {
             float tmp[16];
-            matMul(R, &foeSkinMats_[b * 16], tmp);
-            std::memcpy(&foeSkinMats_[b * 16], tmp, sizeof(tmp));
+            matMul(R, &f.skinMats[b * 16], tmp);
+            std::memcpy(&f.skinMats[b * 16], tmp, sizeof(tmp));
         }
     }
 
-    // the blade cuts fighter 1 before conservation, so a fresh wound is on
+    // the blade cuts its targets before conservation, so a fresh wound is on
     // the ledger the same frame it is made
     updateBladeCut(look);
 
@@ -2488,8 +2435,8 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     gpu_->queue.WriteBuffer(uniformBuf_, 0, uniforms, sizeof(uniforms));
 
     wgpu::CommandEncoder encoder = gpu_->device.CreateCommandEncoder();
-    brick_.encode(encoder);
-    foe_.encode(encoder); // fighter 1's own import/edit/JFA passes
+    // Each fighter's own import/edit/JFA/redistance passes, into its own slice.
+    for (Fighter& f : fighters_) f.vol.encode(encoder);
     ground_.encode(encoder);
 
     // ---- 12 Hz frame reuse ----
@@ -2498,9 +2445,10 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     // read AFTER encode() above, so an edit queued this frame re-traces this
     // frame rather than a frame late.
     uint64_t digest = traceInputDigest(uniforms);
-    for (uint32_t g : {brick_.generation(), foe_.generation(), ground_.generation()}) {
-        digest = (digest ^ g) * 1099511628211ull;
+    for (const Fighter& f : fighters_) {
+        digest = (digest ^ f.vol.generation()) * 1099511628211ull;
     }
+    digest = (digest ^ ground_.generation()) * 1099511628211ull;
     const bool reuse = reuseEnabled_ && traceValid_ && digest == traceDigest_;
     framesPresented_++;
 
@@ -2519,16 +2467,17 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     // the only kind that costs anything.
     const bool poseStepFrame = uniforms[3][3] != prevUniforms_[3][3];
     if (dbgReuse && !reuse && traceValid_ && !poseStepFrame) {
-        const uint32_t gens[3] = {brick_.generation(), foe_.generation(),
-                                  ground_.generation()};
-        const char* gname[3] = {"hero volume", "foe volume", "ground clay"};
         bool blamed = false;
-        for (int i = 0; i < 3; i++) {
-            if (gens[i] != prevGens_[i]) {
-                std::printf("[reuse] re-trace: %s generation %u -> %u\n", gname[i],
-                            prevGens_[i], gens[i]);
-                blamed = true;
-            }
+        for (int i = 0; i <= kMaxPlayers; i++) {
+            const uint32_t g = (i < kMaxPlayers) ? fighters_[i].vol.generation()
+                                                 : ground_.generation();
+            if (g == prevGens_[i]) continue;
+            char name[32];
+            if (i < kMaxPlayers) std::snprintf(name, sizeof(name), "player %d volume", i);
+            else std::snprintf(name, sizeof(name), "ground clay");
+            std::printf("[reuse] re-trace: %s generation %u -> %u\n", name,
+                        prevGens_[i], g);
+            blamed = true;
         }
         for (int s = 0; s < kUniformSlots && !blamed; s++) {
             for (int c = 0; c < 4; c++) {
@@ -2546,9 +2495,9 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     }
     if (dbgReuse) {
         std::memcpy(prevUniforms_, uniforms, sizeof(prevUniforms_));
-        prevGens_[0] = brick_.generation();
-        prevGens_[1] = foe_.generation();
-        prevGens_[2] = ground_.generation();
+        for (int i = 0; i < kMaxPlayers; i++)
+            prevGens_[i] = fighters_[i].vol.generation();
+        prevGens_[kMaxPlayers] = ground_.generation();
     }
 
     if (!reuse) {
@@ -2570,7 +2519,6 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         pass.SetPipeline(tracePipeline_);
         pass.SetBindGroup(0, traceBind_);
         pass.SetBindGroup(1, traceBrickBind_);
-        pass.SetBindGroup(2, traceFoeBind_);
         pass.DispatchWorkgroups((width_ + 7) / 8, (height_ + 7) / 8);
         pass.End();
     }
@@ -2622,13 +2570,15 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     }
     wgpu::CommandBuffer cmd = encoder.Finish();
     gpu_->queue.Submit(1, &cmd);
-    // BOTH fighters: the foe imports and is carveable, so it has its own pool
-    // to overflow. Its poll used to be armed and never finished, which left
-    // capPollArmed_ stuck true and made a foe-side overflow unreportable.
-    brick_.finishCapacityPoll();
-    foe_.finishCapacityPoll();
-    brick_.pollVolumes();
-    foe_.pollVolumes();
+    // EVERY fighter: each imports and is carveable, so each has its own pool
+    // partition to overflow. The foe's poll used to be armed and never
+    // finished, which left capPollArmed_ stuck true and made a foe-side
+    // overflow unreportable — a loop cannot forget the way a hand-written
+    // second call did.
+    for (Fighter& f : fighters_) {
+        f.vol.finishCapacityPoll();
+        f.vol.pollVolumes();
+    }
     if (queryThisFrame) {
         queryMapPending_ = true;
         auto alive = alive_;
@@ -2716,12 +2666,12 @@ void Renderer::syncMeasurements() {
 #else
     // Copies were submitted with the frame; they only need the event pump,
     // not more renders. Bounded wait so a lost map can't hang the app.
-    for (int guard = 0; !brick_.measurementsIdle() && guard < 20000; guard++) {
+    for (int guard = 0; !fighters_[0].vol.measurementsIdle() && guard < 20000; guard++) {
         gpu_->processEvents();
-        brick_.pollVolumes();
+        fighters_[0].vol.pollVolumes();
         std::this_thread::sleep_for(std::chrono::microseconds(250));
     }
-    if (!brick_.measurementsIdle()) {
+    if (!fighters_[0].vol.measurementsIdle()) {
         std::fprintf(stderr, "[snap] warning: volume measurements still in flight\n");
     }
 #endif
@@ -2765,7 +2715,12 @@ bool Renderer::saveSnapshot(const std::string& path, double simT,
         std::fprintf(stderr, "[snap] cannot write %s\n", path.c_str());
         return false;
     }
-    if (!brick_.save(w) || !ground_.save(w)) {
+    // Player 0's volume only, as before the slice refactor. Extra fighters
+    // need their own tagged sections (the format is per-fighter-clean — the
+    // saved indirection carries partition-LOCAL brick indices — so this is a
+    // section-naming job, not a format one). Until then a snapshot restores
+    // the hero's clay and leaves the others as imported.
+    if (!fighters_[0].vol.save(w) || !ground_.save(w)) {
         w.close();
         return false;
     }
@@ -2780,15 +2735,20 @@ bool Renderer::saveSnapshot(const std::string& path, double simT,
     std::memcpy(rc.woundCol, woundCol_, sizeof(rc.woundCol));
     rc.haveWound = haveWound_ ? 1 : 0;
     rc.gobSeed = gobSeed_;
-    rc.animT = animT_;
+    rc.animT = fighters_[0].animT;
     rc.simT = simT;
     w.section("RCPU", &rc, sizeof(rc));
     // M-PERF spring state, as its OWN section rather than fields on
-    // RenderSnapCpu: additive sections keep pre-rig snapshots loadable without
-    // a kVersion bump (see the dev-loop invariants in CLAUDE.md).
+    // RenderSnapCpu. Three floats per fighter, so its SIZE tracks kMaxPlayers
+    // — which is why snapshot.cpp's kVersion is bumped: a 2-player file would
+    // otherwise short-read here and silently leave two springs at neutral.
     {
-        const float rig[6] = {spring_.q,    spring_.v,    spring_.gait,
-                              foeSpring_.q, foeSpring_.v, foeSpring_.gait};
+        float rig[3 * kMaxPlayers];
+        for (int i = 0; i < kMaxPlayers; i++) {
+            rig[i * 3 + 0] = fighters_[i].spring.q;
+            rig[i * 3 + 1] = fighters_[i].spring.v;
+            rig[i * 3 + 2] = fighters_[i].spring.gait;
+        }
         w.section("RRIG", rig, sizeof(rig));
     }
     w.section("RGOB", gobs_.data(), gobs_.size() * sizeof(Gob));
@@ -2818,7 +2778,7 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
         std::fprintf(stderr, "[snap] missing RCPU section\n");
         return false;
     }
-    if (!brick_.load(r) || !ground_.load(r)) return false;
+    if (!fighters_[0].vol.load(r) || !ground_.load(r)) return false;
     gobs_.assign((size_t)std::max(rc.gobCount, 0), Gob{});
     if (rc.gobCount > 0 &&
         !r.read("RGOB", gobs_.data(), gobs_.size() * sizeof(Gob))) {
@@ -2834,7 +2794,7 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
     std::memcpy(woundCol_, rc.woundCol, sizeof(woundCol_));
     haveWound_ = rc.haveWound != 0;
     gobSeed_ = rc.gobSeed;
-    animT_ = rc.animT;
+    fighters_[0].animT = rc.animT;
     // Drop any in-progress slice rather than serialising it. sliceVol_ is only
     // a hold on debt, and rc.debt above is the authoritative figure, so letting
     // the restored debt dribble is correct and exactly balanced — carrying a
@@ -2847,12 +2807,15 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
     slicePending_ = 0;
     sliceWait_ = 0;
     // Spring state is optional: a snapshot taken before the affine rig landed
-    // has no RRIG, and starting from neutral is a valid pose.
+    // has no RRIG, and starting from neutral is a valid pose. The gait phase
+    // defaults are staggered per fighter so a restore that misses RRIG still
+    // does not put identical bodies in lockstep.
     {
-        float rig[6] = {0, 0, 0, 0, 0, 0.37f};
+        float rig[3 * kMaxPlayers] = {};
+        for (int i = 0; i < kMaxPlayers; i++) rig[i * 3 + 2] = 0.37f * (float)i;
         r.read("RRIG", rig, sizeof(rig));
-        spring_ = BodySpring{rig[0], rig[1], rig[2]};
-        foeSpring_ = BodySpring{rig[3], rig[4], rig[5]};
+        for (int i = 0; i < kMaxPlayers; i++)
+            fighters_[i].spring = BodySpring{rig[i * 3], rig[i * 3 + 1], rig[i * 3 + 2]};
     }
     // fresh dt baseline: the restored clock may sit anywhere on the timeline
     lastSimTime_ = -1.f;
@@ -2873,12 +2836,18 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
 int Renderer::addPlayer(const FighterPose& at) {
     if (playerCount_ >= kMaxPlayers) {
         std::fprintf(stderr,
-                     "addPlayer: %d is the volume budget (see PLAN.md "
-                     "\"fighters are SLICES\" to lift it)\n",
+                     "addPlayer: %d fighters is the store's slice count "
+                     "(BrickSystem::kMaxFighters); raising it costs pool "
+                     "memory, not shader bindings\n",
                      kMaxPlayers);
         return -1;
     }
-    foePose_ = at;
-    foeEnabled_ = true;
-    return playerCount_++;
+    const int idx = playerCount_++;
+    fighters_[idx].pose = at;
+    fighters_[idx].disp = at;
+    fighters_[idx].enabled = true;
+    // Stagger the squish phase so identical bodies don't breathe in lockstep —
+    // that reads as one puppet duplicated, not N actors.
+    fighters_[idx].spring.gait = 0.37f * (float)idx;
+    return idx;
 }

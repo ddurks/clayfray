@@ -10,11 +10,45 @@
 class SnapWriter;
 class SnapReader;
 
-// Sparse brickmap for the carveable character body. Owns the GPU volume
-// (indirection grid + brick pools + freelist) and the bake/edit/JFA passes.
-// One edit op is consumed per frame (uniform buffer contents are per-submit).
+class BrickSystem;
+
+// The three big GPU buffers, shared by EVERY fighter — this is PLAN.md's
+// "fighters are SLICES, not systems", and the reason it exists is CLAUDE.md
+// trap 8: core WebGPU guarantees a shader stage only 8 storage buffers, and at
+// one set of three per fighter the tracer ran out at two (7 of 8, ground
+// included). Sliced, N fighters cost the same 3 bindings as one, and trace
+// sits at 4 of 8 no matter how many fight.
+//
+// Each BrickSystem owns SLICE `slot` of all three. It binds its own slice as a
+// bind-group sub-range for every write pass, so edit/voxelize/jfa/redistance
+// index from zero and never learn that they are one of several — only the
+// tracer, which binds the whole buffers, adds a base index.
+//
+// What is NOT here: the allocator counters, freelist, dirty list and JFA
+// scratch. Those stay per-fighter because nothing in the trace pass binds
+// them, so they cost no bindings, and keeping them separate keeps each
+// fighter's allocation independent (~1.3 MB each).
+struct BrickStore {
+    wgpu::Buffer volume;     // kMaxFighters x kVolumeBytes
+    wgpu::Buffer distPool;   // kMaxFighters x kMaxBricks x 256 x 4
+    wgpu::Buffer albedoPool; // kMaxFighters x kMaxBricks x 512 x 4
+    bool init(Gpu& gpu);
+};
+
+// Sparse brickmap for one carveable character body: a slice of a BrickStore
+// (indirection grid + brick pool partition) plus this fighter's own freelist
+// and the bake/edit/JFA passes. Up to kOpsPerFrame edits are consumed per
+// frame (uniform buffer contents are per-submit).
 struct BrickEdit {
     int mode = 1; // 0 bake, 1 carve, 2 add
+    // WHICH fighter's volume this cuts. Explicit, and defaulting to the hero,
+    // because `pos` below is REST space: the same coordinates name different
+    // clay in every fighter's slice, so an edit without an owner is ambiguous
+    // the moment there is more than one body. Routing this off the live pick
+    // instead would have quietly redirected every SCRIPTED edit (ctl `edit`,
+    // --carve-test, replay journals — all authored against player 0) to
+    // whichever fighter happened to be under the cursor.
+    int player = 0;
     // REST space — the volume's own frame. A world position only addresses
     // the volume correctly while the fighter stands unposed at the origin.
     float pos[3] = {0, 0, 0};
@@ -52,6 +86,19 @@ struct MeasuredEdit {
 
 class BrickSystem {
   public:
+    // ---- how many fighters share one store ----
+    // The cap is now a MEMORY choice, not a binding one: the tracer costs the
+    // same 3 bindings at any N (see BrickStore). Raising it multiplies the
+    // pool budget below and the uniform block's fighter array, nothing else.
+    static constexpr int kMaxFighters = 4;
+    // Articulated regions per fighter: the brush rig is body + two mitts
+    // (trap 7). This sizes the `pieces` array inside each Fighter in the
+    // uniform block, so it is emitted into the shaders rather than
+    // hand-mirrored. The dead 13-piece inverse-LBS path wanted 16; a rigged
+    // asset would have to raise this (and pay 12 uniform slots per piece per
+    // fighter) before it could pose more than three.
+    static constexpr int kPiecesPerFighter = 3;
+
     // ---- volume geometry: THE one place these are authored ----
     // kGrid is the only free knob; everything below derives from it, and
     // wgslConstants() emits the whole block into the shaders. These used to be
@@ -124,17 +171,46 @@ class BrickSystem {
     // steps ~0.057 m, so it sweeps ~pi*0.0995^2*0.057 / SPAN^3 ~ 78 new cells
     // per step, ~4.7k total, landing near ~11.5k with the import floor.
     //
-    // 16384 is 2.4x the import floor, 2.0x the hard carve ceiling and ~1.4x
-    // that add-stress estimate, and costs 16 MiB + 32 MiB = 48 MiB per fighter
-    // instead of 144 MiB. Overflow past it is graceful (see finishCapacityPoll
-    // and the spill counter in brick.cpp), never corrupting.
+    // This is PER FIGHTER, and the pools are PARTITIONED, not pooled: fighter
+    // f owns bricks [0, kMaxBricks) of its own slice, its indirection words
+    // store indices LOCAL to that partition, and the tracer adds the base.
+    // A shared free-list across fighters would use the memory better (an
+    // untouched opponent would lend its unused bricks to a minced one), but it
+    // would also let one fighter's carving starve another's, and it would
+    // break save()'s "dense prefix up to the high-water mark" — partitioning
+    // keeps each fighter's clay genuinely private, which is what PLAN.md
+    // promised. Overflow is graceful (finishCapacityPoll and the spill counter
+    // in brick.cpp), never corrupting.
+    //
+    // 12288 was 16384 while each fighter owned its own pools. Slicing trades
+    // 25% of one fighter's headroom for TWICE the fighters at 1.75x the total:
+    //
+    //           per fighter   x2 fighters   x4 fighters
+    //   16384    48 MiB        96 MiB        192 MiB   <- albedo alone hits
+    //                                                     the 128 MiB core
+    //                                                     binding-size limit
+    //   12288    36 MiB        72 MiB        144 MiB   <- albedo 96 MiB
+    //
+    // What 12288 still covers: 1.82x the import floor, 1.47x the hard carve
+    // ceiling (which carving CANNOT exceed, see above), and it clears the
+    // worst case on record — CLAYFRAY_TEST_ADDSTRESS at ~11.5k — by 7%. That
+    // last margin is the thin one; if add-stress ever spills, raise this and
+    // re-check the 128 MiB albedo limit at kMaxFighters.
     //
     // RE-MEASURE THIS if kGrid changes, if the artist re-exports a
     // significantly larger fighter, or before trusting it on a long play
     // session: bricks scale with kGrid^2, so kGrid=74 would want ~4x this.
     //   CLAYFRAY_DEBUG_STATS=1 ./build/clayfray --carve-test ...   -> allocTop
     //   CLAYFRAY_TEST_ADDSTRESS=1 with the same flags               -> the peak
-    static constexpr uint32_t kMaxBricks = 16384;
+    static constexpr uint32_t kMaxBricks = 12288;
+    static constexpr uint64_t kDistBytes = (uint64_t)kMaxBricks * 256 * 4;
+    static constexpr uint64_t kAlbedoBytes = (uint64_t)kMaxBricks * 512 * 4;
+    // Core WebGPU guarantees maxStorageBufferBindingSize = 128 MiB, and the
+    // tracer binds each pool WHOLE. Blowing this fails to create the trace
+    // bind group on a conformant mobile device while working on desktop —
+    // the same silent-black-screen shape as trap 8's binding count.
+    static_assert(kAlbedoBytes * kMaxFighters <= 134217728ull,
+                  "albedo pool exceeds the 128 MiB core storage-binding limit");
     // The brick index is stored in the low 20 bits of an indirection word
     // (IND_IDX_MASK = 0x000FFFFF), so the encoding caps out at 1,048,575 —
     // shrinking the pool only uses less of that range. There is also a
@@ -146,20 +222,24 @@ class BrickSystem {
     static constexpr uint32_t kAxisVox = kGrid * kBrickUsable + 1;
     static constexpr uint32_t kRowWords = (kAxisVox + 31) / 32;
 
-    // ---- the four per-cell arrays share ONE buffer ----
-    // A Metal shader stage gets 10 storage buffers: 31 Metal buffer slots,
-    // less the one Dawn reserves for buffer lengths and its default uniform
-    // and vertex-buffer budget. The tracer samples TWO fighters plus the
-    // ground, and at one binding per array that came to 14 — the trace
-    // pipeline failed to create at all and the app drew nothing on macOS.
-    // (Vulkan's limit is effectively unbounded, which is why M5's second
-    // fighter looked fine on the Windows box.)
+    // ---- the three per-cell arrays share ONE buffer ----
+    // Core WebGPU guarantees a shader stage only 8 storage buffers (and Metal
+    // gives 10: 31 Metal buffer slots, less the one Dawn spends on buffer
+    // lengths and its default uniform/vertex budget). The tracer samples every
+    // fighter plus the ground, and at one binding per array TWO fighters came
+    // to 14 — the trace pipeline failed to create at all and the app drew
+    // nothing on macOS. (Vulkan's limit is effectively unbounded, which is why
+    // the Windows box never saw it.)
     //
     // So indirection, JFA seeds and the coarse field live at fixed offsets
     // inside `volume`. A pass that WRITES one binds just its own region as a
     // sub-range, so the write shaders are untouched; the tracer binds the whole
     // buffer once and adds a base index on the read (the CELL_* constants in
     // wgslConstants(), used by brick_read.wgsl).
+    //
+    // The SLICE offsets stack on top of these: a region of fighter f starts at
+    // `f * kVolumeBytes + kIndOff`. Same mechanism, one more term — which is
+    // exactly why the slice refactor was cheap on the write side.
     //
     // Every write-side binding of these regions is read_write ON PURPOSE:
     // Dawn rejects a buffer that is writable and read-only within one pass,
@@ -213,8 +293,19 @@ class BrickSystem {
     // teardown bails before it touches destroyed buffers/members.
     ~BrickSystem() { *alive_ = false; }
 
-    bool init(Gpu& gpu, const std::string& editSrc, const std::string& jfaSrc,
-              const std::string& redistSrc, const std::string& voxelizeSrc);
+    // `slot` is which slice of the shared store this fighter owns. Everything
+    // this object encodes is confined to that slice.
+    bool init(Gpu& gpu, BrickStore& store, int slot, const std::string& editSrc,
+              const std::string& jfaSrc, const std::string& redistSrc,
+              const std::string& voxelizeSrc);
+    int slot() const { return slot_; }
+    // Byte offsets of this fighter's slice inside each shared buffer. Every
+    // bind-group sub-range, ClearBuffer, CopyBufferToBuffer and WriteBuffer in
+    // brick.cpp goes through these — miss one and a fighter silently edits
+    // its neighbour's clay.
+    uint64_t volBase() const { return (uint64_t)slot_ * kVolumeBytes; }
+    uint64_t distBase() const { return (uint64_t)slot_ * kDistBytes; }
+    uint64_t albBase() const { return (uint64_t)slot_ * kAlbedoBytes; }
 
     // Replaces the analytic bake with a voxelized mesh. CPU side (binning,
     // watertight parity) happens here; GPU passes run on the next encode.
@@ -264,13 +355,17 @@ class BrickSystem {
     // refresh. Call once per frame before the trace pass.
     void encode(wgpu::CommandEncoder& enc);
 
-    // The per-cell arrays, packed at the kIndOff/kSeedOff/kCoarseOff offsets
-    // above:
+    // Handles to the SHARED store (wgpu::Buffer is a refcounted handle, so
+    // these name the same GPU allocations every fighter uses). THIS fighter's
+    // data starts at volBase()/distBase()/albBase().
+    //
+    // volume holds the per-cell arrays at the kIndOff/kSeedOff/kCoarseOff
+    // offsets above:
     //   ind    — indirection grid
     //   seed   — canonical JFA output (jfaA), read by tracer/pick
     //   coarse — per-cell signed coarse distance, read by tracer
     wgpu::Buffer volume;
-    // Sized by kMaxBricks: 16 MiB + 32 MiB per fighter. See the capacity
+    // Sized by kMaxBricks: 12 MiB + 24 MiB per fighter. See the capacity
     // derivation on kMaxBricks — these two are the app's memory budget.
     wgpu::Buffer distPool, albedoPool;
 
@@ -321,6 +416,7 @@ class BrickSystem {
     void encodeJfa(wgpu::CommandEncoder& enc);
 
     Gpu* gpu_ = nullptr;
+    int slot_ = 0; // which slice of the shared store this fighter owns
     wgpu::ComputePipeline classify_, fill_, jfaInit_, jfaStep_, jfaResolve_, jfaRelax_;
     wgpu::Buffer coarseB_;
     wgpu::BindGroup jfaRelaxG_[4];

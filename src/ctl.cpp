@@ -143,6 +143,11 @@ void CtlServer::buildRegistry() {
     addF("look.animSpeed", &l->animSpeed);
     addB("look.conserveClay", &l->conserveClay);
     addB("sword.enabled", &l->sword.enabled);
+    // Missing until now, which self-diagnosed exactly as CLAUDE.md says an
+    // unregistered tunable does: "err unknown param sword.carry". Without it a
+    // scenario could not put the hilt in WORLD space, so every scripted sword
+    // test was stuck with the carried offset riding the fighter's root.
+    addB("sword.carry", &l->sword.carry);
     addF("sword.pos", l->sword.pos, 3);
     addF("sword.yaw", &l->sword.yaw);
     addF("sword.pitch", &l->sword.pitch);
@@ -185,9 +190,28 @@ void CtlServer::buildRegistry() {
     addF("cam.target", &c->target.x, 3);
     addF("cam.fovY", &c->fovY);
     if (refs_.renderer) {
-        addB("foe.enabled", refs_.renderer->foeEnabledPtr());
-        addF("foe.pos", refs_.renderer->foePosePtr()->pos, 3);
-        addF("foe.yaw", &refs_.renderer->foePosePtr()->yaw);
+        // One set per opponent: p1.*, p2.*, ... (player 0 is `fighter.*`
+        // below, since it is the one the harness drives directly).
+        for (int i = 1; i < Renderer::kMaxPlayers; i++) {
+            char name[24];
+            std::snprintf(name, sizeof(name), "p%d.enabled", i);
+            addB(name, refs_.renderer->playerEnabledPtr(i));
+            std::snprintf(name, sizeof(name), "p%d.pos", i);
+            addF(name, refs_.renderer->playerPosePtr(i)->pos, 3);
+            std::snprintf(name, sizeof(name), "p%d.yaw", i);
+            addF(name, &refs_.renderer->playerPosePtr(i)->yaw);
+            std::snprintf(name, sizeof(name), "p%d.lean", i);
+            addF(name, &refs_.renderer->playerPosePtr(i)->lean);
+            std::snprintf(name, sizeof(name), "p%d.moving", i);
+            addB(name, &refs_.renderer->playerPosePtr(i)->moving);
+        }
+        // `foe.*` is player 1 under its old name. Journals are the durable
+        // form of a scenario (CLAUDE.md), and scenarios/ already contains
+        // recorded `set foe.pos` lines — dropping the name would break replay
+        // determinism checks for no gain.
+        addB("foe.enabled", refs_.renderer->playerEnabledPtr(1));
+        addF("foe.pos", refs_.renderer->playerPosePtr(1)->pos, 3);
+        addF("foe.yaw", &refs_.renderer->playerPosePtr(1)->yaw);
     }
     if (refs_.fighter) {
         addF("fighter.pos", refs_.fighter->pos, 3);
@@ -236,13 +260,15 @@ void CtlServer::stopRecord() {
 void CtlServer::recordEdit(const BrickEdit& e, long poseTick) {
     if (!rec_) return;
     char buf[256];
+    // The player index is the last field, so a diff against a pre-slice
+    // journal is one appended column rather than a reshuffle.
     std::snprintf(buf, sizeof(buf),
                   "edit %s %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g "
-                  "%.6g %.6g %.6g",
+                  "%.6g %.6g %.6g %d",
                   e.mode == 1 ? "carve" : "add", e.pos[0], e.pos[1], e.pos[2],
                   e.radius, e.color[0], e.color[1], e.color[2], e.outDir[0],
                   e.outDir[1], e.outDir[2], e.srcColor[0], e.srcColor[1],
-                  e.srcColor[2]);
+                  e.srcColor[2], e.player);
     record(poseTick, buf);
 }
 
@@ -311,28 +337,38 @@ bool CtlServer::execute(const std::string& line, long poseTick, std::string& out
         return ok(tok[1] + " = " + fmtFloats(v, p->n));
     }
     if (cmd == "edit") {
-        // edit carve|add x y z r [cr cg cb [dx dy dz sr sg sb]]
-        if (tok.size() != 6 && tok.size() != 9 && tok.size() != 15) {
-            return err("usage: edit carve|add x y z r [cr cg cb [dx dy dz sr sg sb]]");
+        // edit carve|add x y z r [cr cg cb [dx dy dz sr sg sb [player]]]
+        // The trailing player index is OPTIONAL and defaults to 0, so every
+        // journal recorded before fighters became slices replays unchanged
+        // against the hero — which is the body they were all authored for.
+        if (tok.size() != 6 && tok.size() != 9 && tok.size() != 15 &&
+            tok.size() != 16) {
+            return err("usage: edit carve|add x y z r [cr cg cb "
+                       "[dx dy dz sr sg sb [player]]]");
         }
         BrickEdit e;
         if (tok[1] == "carve") e.mode = 1;
         else if (tok[1] == "add") e.mode = 2;
         else return err("edit mode must be carve or add");
-        float v[13];
+        float v[14];
         size_t n = tok.size() - 2;
         if (!parseFloats(tok, 2, n, v)) return err("edit: bad number");
         std::memcpy(e.pos, v, 12);
         e.radius = v[3];
         if (n >= 7) std::memcpy(e.color, v + 4, 12);
-        bool inBounds = refs_.renderer->brick().editInBounds(e);
+        if (n == 14) e.player = (int)v[13];
+        if (e.player < 0 || e.player >= Renderer::kMaxPlayers) {
+            return err("edit: player out of range");
+        }
+        BrickSystem& vol = refs_.renderer->playerBrick(e.player);
+        bool inBounds = vol.editInBounds(e);
         BrickEdit resolved = e;
-        if (n == 13) {
+        if (n >= 13) {
             // explicit wound direction/color: bypass the live pick (replay)
             std::memcpy(e.outDir, v + 7, 12);
             std::memcpy(e.srcColor, v + 10, 12);
             resolved = e;
-            refs_.renderer->brick().queueEdit(e);
+            vol.queueEdit(e);
         } else {
             resolved = refs_.renderer->queueBrickEdit(e);
         }

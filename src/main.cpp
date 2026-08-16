@@ -901,6 +901,11 @@ void frameOnce(AppState& s) {
             e.pos[0] = p[0];
             e.pos[1] = p[1];
             e.pos[2] = p[2];
+            // The rest point belongs to the fighter the ray actually hit, so
+            // the edit has to name it — otherwise clicking on an opponent
+            // carves the same coordinates out of the HERO's slice, which looks
+            // like the click landing on the wrong body.
+            e.player = renderer.pickPlayer() > 0 ? renderer.pickPlayer() : 0;
             e.radius = brush.radius;
             e.color[0] = brush.color[0];
             e.color[1] = brush.color[1];

@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <functional>
 #include <memory>
 #include <string>
@@ -17,6 +18,12 @@
 // stitched together by a //#include preprocessor (WGSL has none).
 class Renderer {
   public:
+    // How many fighters can be on the field. One slice of the shared
+    // BrickStore each, so this is a MEMORY knob (see the capacity table on
+    // BrickSystem::kMaxBricks), not the shader-binding wall it used to be.
+    // Declared first because the uniform layout below is derived from it.
+    static constexpr int kMaxPlayers = BrickSystem::kMaxFighters;
+
     // Flip the alive sentinel so any MapAsync callback (pick, GPU timestamp)
     // still queued at teardown bails before touching destroyed buffers.
     ~Renderer() { *alive_ = false; }
@@ -38,6 +45,10 @@ class Renderer {
     // space, so a world position only addresses it correctly while the
     // fighter stands unposed at the origin.
     const float* pickRest() const { return pickRest_; }
+    // WHICH fighter pickRest() addresses. A rest point is meaningless without
+    // it once there is more than one volume: the same coordinates name a
+    // different body's clay in each slice. -1 when the ray hit no clay.
+    int pickPlayer() const { return pickPlayer_; }
     const float* pickNormal() const { return pickNormal_; }
     float pickMat() const { return pickMat_; }
     // headless serve mode runs the pick pass too so ctl `probe` works
@@ -45,8 +56,13 @@ class Renderer {
     // snapshots the pick normal/albedo into the edit so conservation gobs
     // launch outward from the wound wearing its color; returns the resolved
     // edit so the ctl journal can record it pick-independently
+    // The edit is routed to the fighter the pick landed on (pickPlayer()), so
+    // any body can be sculpted, not just the hero.
     BrickEdit queueBrickEdit(BrickEdit e);
-    BrickSystem& brick() { return brick_; }
+    // Player 0's volume. Callers that mean "the fighter being sculpted" want
+    // playerBrick(pickPlayer()) instead.
+    BrickSystem& brick() { return fighters_[0].vol; }
+    BrickSystem& playerBrick(int i) { return fighters_[clampPlayer(i)].vol; }
     void setCharacter(CharacterAsset asset);
     const SplootStats& sploot() const { return sploot_; }
 
@@ -64,8 +80,7 @@ class Renderer {
     // The serve loop calls this while paused/idle so ctl `stats` doesn't
     // report a stale ledger (absorption otherwise only runs in render()).
     void pumpLedger() {
-        brick_.pollVolumes();
-        foe_.pollVolumes();
+        for (Fighter& f : fighters_) f.vol.pollVolumes();
         absorbMeasured();
     }
 
@@ -93,45 +108,64 @@ class Renderer {
     bool buildPipelines();
     void buildTargets();
     void buildBindGroups();
-    // 13 look + mouse + 8 marbles x2 + marbleMeta + capsMeta + capsCenter +
-    // 16 capsules x2 + boneMeta + 16 pieces x12 (invSkin mat4, forward skin
-    // mat4, aabb lo/hi, rest capsule a/b) + gobMeta + 12 gobs x2 + groundMeta
-    // + swordA/swordB/swordCol.
-    // MUST match the Uniforms struct in trace.wgsl AND pick.wgsl — and a
-    // mismatch only bites after a rebuild (shaders hot-load, binaries don't).
-    // 287..292 foeInv/foeMeta/foeCenter, 293..484 foePieces, 485 foeBoneMeta
-    static constexpr int kUniformSlots = 488;
+    // ---- the uniform block's layout, DERIVED rather than counted ----
+    // MUST match the Uniforms struct in trace.wgsl AND pick.wgsl (trap 2), and
+    // a mismatch only bites after a rebuild (shaders hot-load, binaries don't).
+    // These used to be bare literals scattered through packUniforms — `out[65]`,
+    // `out[293 + i * 12]` — which is why appending a field meant re-deriving
+    // every later index by hand and the struct comment listed slot ranges.
+    // Naming each start makes inserting a field a one-line edit here.
+    static constexpr int kMaxMarbles = 4 * kMaxPlayers; // 2 eyes + 2 pupils each
+    static constexpr int kSlotMarbles = 14;             // after the 14 look slots
+    static constexpr int kSlotMarbleMeta = kSlotMarbles + kMaxMarbles * 2;
+    static constexpr int kSlotSceneMeta = kSlotMarbleMeta + 1;
+    static constexpr int kSlotCapsMeta = kSlotSceneMeta + 1;
+    static constexpr int kSlotCapsCenter = kSlotCapsMeta + 1;
+    static constexpr int kSlotCapsules = kSlotCapsCenter + 1;
+    static constexpr int kSlotGobMeta = kSlotCapsules + 32; // 16 capsules x2
+    static constexpr int kSlotGobs = kSlotGobMeta + 1;
+    static constexpr int kSlotGroundMeta = kSlotGobs + 24; // 12 gobs x2
+    static constexpr int kSlotSwordA = kSlotGroundMeta + 1;
+    static constexpr int kSlotFighters = kSlotSwordA + 3; // hilt, tip, colour
+    // One Piece: invSkin mat4 + forward skin mat4 + aabb lo/hi + capsule a/b.
+    static constexpr int kPieceSlots = 12;
+    // One Fighter: meta + center + its pieces. WGSL requires a uniform array's
+    // element stride to be a multiple of 16 bytes, i.e. a whole number of
+    // slots — which this is by construction.
+    static constexpr int kFighterSlots =
+        2 + kPieceSlots * BrickSystem::kPiecesPerFighter;
+    static constexpr int kUniformSlots =
+        kSlotFighters + kFighterSlots * kMaxPlayers;
     void packUniforms(const OrbitCamera& cam, const LookParams& look,
                       const FrameInfo& frame, float out[kUniformSlots][4]) const;
+    // First slot of fighter i's block.
+    static constexpr int fighterSlot(int i) {
+        return kSlotFighters + i * kFighterSlots;
+    }
     std::vector<MarbleProp> marbles_;
-    // P0 animation: skeleton + clips kept CPU-side; pose sampled at the 12 Hz
-    // quantized clock; marbles and the capsule shadow proxy ride the skin
-    // matrices. (The voxel body stays in rest pose until M4-P1.)
+    // ---- CHARACTER-level: one copy, shared by every fighter ----
+    // These come off the ASSET and are identical for all bodies: the skeleton
+    // (if any), its clips, and the rest capsules the shadow proxy is fitted
+    // from. Everything POSED lives per fighter, in Fighter below — that split
+    // is what let the hero/foe member pairs collapse into an array.
     std::vector<AssetBone> bones_;
     std::vector<AnimClip> clips_;
     std::vector<BoneCapsule> capsules_;
-    std::vector<float> skinMats_;
-    float animT_ = 0.f;
     // M4.7: floating-hand IK chains (built at setCharacter from bone names),
     // the blob's centre-of-mass decomposition that tethers them, and the
     // computed sword geometry for a frame (hilt/tip/two grips, world).
     std::vector<HandIkChain> handIk_;
     BodyCom bodyCom_;
-    // stands off to the front, turned to face the hero
-    FighterPose foePose_{{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false};
-    bool foeEnabled_ = false; // no opponent until addPlayer() makes one
-    int playerCount_ = 1;     // the hero always exists
-    std::vector<BoneCapsule> foeCaps_;  // rest capsules, for blade hit tests
-    float foeBoundR_ = 0.6f;            // rest bound radius about foe origin
-    float foeCenterRest_[3] = {0.f, 0.35f, 0.f};
+    int playerCount_ = 1;   // the hero always exists
     float autoReach_ = 0.f; // rest COM->wrist distance; hands.reach 0 uses it
-    // M4.8 gaze: eye bones, and the camera position LATCHED at the last pose
-    // step. Sampling the live camera would slide the eyes at frame rate and
-    // break the 12 Hz stop-motion the rest of the character obeys.
-    // player 1 runs its own pose clock and its own posed skeleton, so it can
-    // play idle while the hero does something else entirely
-    float foeAnimT_ = 0.f;
-    std::vector<float> foeSkinMats_;
+    // Rest-space bounding sphere of the character, measured off the asset at
+    // import. Every fighter re-derives its POSED reject sphere from this each
+    // frame (packUniforms); these two are only the un-rigged fallback.
+    float bodyCenterRest_[3] = {0.f, 0.35f, 0.f};
+    float bodyBoundRest_ = 0.6f;
+    // M4.8 gaze: the camera position LATCHED at the last pose step. Sampling
+    // the live camera would slide the eyes at frame rate and break the 12 Hz
+    // stop-motion the rest of the character obeys.
     std::vector<GazeChain> gaze_;
     float gazeTarget_[3] = {0.f, 0.6f, 3.f};
     // pose step the gaze target was last latched on; separate from
@@ -144,8 +178,7 @@ class Renderer {
     // what the renderer actually draws. Two consequences, both wanted: the
     // walk reads as stop-motion instead of gliding, and because the drawn
     // pose stops changing between pose steps, walking no longer invalidates
-    // frame reuse (13.8 -> 54 fps while moving).
-    FighterPose fighterDisp_, foeDisp_;
+    // frame reuse (13.8 -> 54 fps while moving). Per fighter: Fighter::disp.
     float dispPoseTime_ = -1.f;
 
     // ---- M-RIG: the three-piece brush rig ----
@@ -169,11 +202,6 @@ class Renderer {
         int srcBone = -1;
         float xform[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     };
-    std::vector<AffinePiece> affinePieces_;
-    // The opponent needs its OWN piece matrices (its own pose drives them), so
-    // it cannot share the hero's table the way the bone rig did via skinMats_.
-    std::vector<AffinePiece> foeAffinePieces_;
-
     // Static description of the three brushes, measured off the asset at import
     // and then constant. `canonLo/canonHi` are each hand brush's bounds mapped
     // back onto the authored (rest-hand) frame, so both poses are placed by the
@@ -188,10 +216,6 @@ class Renderer {
         float palm[2][3]; // grip point per pose, canonical frame
     };
     BrushRig brush_{};
-    // Pose index per hand, LATCHED on the 12 Hz grid: 0 = rest brush, 1 = grab
-    // brush. Discrete and never interpolated — see brick_read.wgsl.
-    int handPose_[2] = {0, 0};
-    int foeHandPose_[2] = {0, 0};
     float handPoseTime_ = -1.f;
 
     // Procedural squish: one scalar per fighter. q < 0 is compressed, q > 0
@@ -200,16 +224,51 @@ class Renderer {
     struct BodySpring {
         float q = 0.f, v = 0.f, gait = 0.f;
     };
-    BodySpring spring_;
-    // phase-offset so two identical fighters don't breathe in lockstep — that
-    // reads as one puppet duplicated, not two actors (the clip path offsets
-    // its own clock by the same 0.37 for the same reason)
-    BodySpring foeSpring_{0.f, 0.f, 0.37f};
     float springPoseTime_ = -1.f;
+
+  public:
+    // ---- ONE FIGHTER ----
+    // Every field here used to exist twice, as a `foo_`/`foeFoo_` pair, and
+    // that is exactly why the player cap was 2: adding a third body meant a
+    // third copy of a dozen members plus a third `else if` at every use.
+    // Player index is now the only thing that varies.
+    //
+    // `vol` is this fighter's slice of the renderer's one BrickStore — three
+    // storage bindings serve all of them (see brick.h), which is what lifted
+    // the cap in the first place.
+    struct Fighter {
+        BrickSystem vol;
+        FighterPose pose;
+        // What is actually DRAWN: the sim pose latched onto the 12 Hz grid.
+        FighterPose disp;
+        BodySpring spring;
+        // Posed skin matrices; empty under the brush rig (there is no skeleton).
+        std::vector<float> skinMats;
+        // Posed brush pieces — body affine + one rigid transform per mitt.
+        // Each fighter needs its OWN, since its own pose drives them.
+        std::vector<AffinePiece> pieces;
+        // Pose index per hand, LATCHED on the 12 Hz grid: 0 = rest brush,
+        // 1 = grab brush. Discrete, never interpolated — see brick_read.wgsl.
+        int handPose[2] = {0, 0};
+        // Its own clip clock, so two identical bodies don't breathe in
+        // lockstep — that reads as one puppet duplicated, not two actors.
+        float animT = 0.f;
+        // Player 0 is always live; the rest switch on via addPlayer().
+        bool enabled = false;
+    };
+
+  private:
+    std::array<Fighter, kMaxPlayers> fighters_;
+    // The hero, named for the many places that only ever mean player 0.
+    Fighter& hero() { return fighters_[0]; }
+    const Fighter& hero() const { return fighters_[0]; }
+
     bool affineOn(const LookParams& look) const;
     // True when the asset arrived without an armature and the brush rig is the
     // only rig there is.
-    bool skeletonFree() const { return bones_.empty() && !affinePieces_.empty(); }
+    bool skeletonFree() const {
+        return bones_.empty() && !fighters_[0].pieces.empty();
+    }
     static void stepSpring(BodySpring& s, const RigParams& r, bool moving, float dt);
     // Shadow-proxy capsule fitted to a brush's rest AABB (there are no bones
     // left for deriveCapsules to fit to).
@@ -223,9 +282,11 @@ class Renderer {
     void updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
                         const FighterPose& disp, const BodySpring& s,
                         const LookParams& look, const SwordParams* grip) const;
-    // Writes the three pieces at `base` (66 for the hero, 293 for the foe) and
-    // returns how many it wrote.
-    int packAffinePieces(float out[kUniformSlots][4], int base,
+    // Writes fighter `idx`'s pieces into its block and returns how many it
+    // wrote. Capped at BrickSystem::kPiecesPerFighter — the brush rig uses
+    // exactly three, and a piece that does not fit would silently vanish, so
+    // this also warns once if an asset asks for more.
+    int packAffinePieces(float out[kUniformSlots][4], int idx,
                          const std::vector<AffinePiece>& pieces,
                          const std::vector<float>& mats) const;
     // Tight posed bound over those pieces: each piece's rest AABB corners run
@@ -244,36 +305,41 @@ class Renderer {
     // Note the sim pose and the DISPLAY pose are different things: the sim
     // moves at 60 Hz, but what gets drawn snaps to the 12 Hz pose grid like
     // everything else that moves (trap 4). See fighterDisp_.
-    void setFighter(const FighterPose& f) { fighter_ = f; }
-    const FighterPose& fighter() const { return fighter_; }
+    void setFighter(const FighterPose& f) { fighters_[0].pose = f; }
+    const FighterPose& fighter() const { return fighters_[0].pose; }
     // index of a clip by name, -1 if absent (locomotion picks bounce/idle)
     int clipIndex(const char* name) const;
     // ---- players ----
     // Player 0 is the hero (articulated, holds the sword); every later player
-    // is a carveable body with its own volume, placed by its own root.
+    // is a carveable body of the same character, placed by its own root and
+    // running its own pose clock.
     //
-    // The cap is a SHADER limit, not a design one: WGSL bindings are static,
-    // so each extra volume today means another bound array. Lifting it means
-    // giving the per-cell arrays a per-player stride
-    // (`bIndirection[player * CELLS + cell]`) so one binding serves all — see
-    // PLAN.md "fighters are SLICES". addPlayer() keeps this signature when
-    // that lands; only its body changes.
-    static constexpr int kMaxPlayers = 2;
+    // The cap USED to be 2 and it was a shader limit: each extra volume was
+    // another set of static WGSL bindings, and two fighters plus the ground
+    // already sat at 7 of the 8 storage buffers core WebGPU guarantees. Now
+    // every fighter is a SLICE of one store (brick.h) and the tracer costs 4
+    // bindings at any N, so kMaxPlayers is purely a memory knob — see the
+    // capacity table on BrickSystem::kMaxBricks.
     int playerCount() const { return playerCount_; }
     // Returns the new player's index, or -1 if the volume budget is spent.
     int addPlayer(const FighterPose& at);
-    FighterPose& player(int i) { return i <= 0 ? fighter_ : foePose_; }
-    const FighterPose& player(int i) const { return i <= 0 ? fighter_ : foePose_; }
+    FighterPose& player(int i) { return fighters_[clampPlayer(i)].pose; }
+    const FighterPose& player(int i) const { return fighters_[clampPlayer(i)].pose; }
     void setPlayerEnabled(int i, bool on) {
-        if (i > 0) foeEnabled_ = on;
+        // player 0 is the hero and cannot be switched off
+        if (i > 0 && i < kMaxPlayers) fighters_[i].enabled = on;
     }
-    bool playerEnabled(int i) const { return i <= 0 ? true : foeEnabled_; }
-    // exposed so ctl/replay can place and toggle the opponent
-    FighterPose* foePosePtr() { return &foePose_; }
-    bool* foeEnabledPtr() { return &foeEnabled_; }
+    bool playerEnabled(int i) const {
+        return i <= 0 || (i < kMaxPlayers && fighters_[i].enabled);
+    }
+    // exposed so ctl/replay can place and toggle each opponent by index
+    FighterPose* playerPosePtr(int i) { return &fighters_[clampPlayer(i)].pose; }
+    bool* playerEnabledPtr(int i) { return &fighters_[clampPlayer(i)].enabled; }
 
   private:
-    FighterPose fighter_;
+    static int clampPlayer(int i) {
+        return i < 0 ? 0 : (i >= kMaxPlayers ? kMaxPlayers - 1 : i);
+    }
     // the sword resolved into WORLD space for this frame (carry mode folds in
     // the fighter root). Everything downstream — grips, IK, uniforms — reads
     // this, never look.sword directly.
@@ -325,10 +391,9 @@ class Renderer {
     int sliceWait_ = 0;        // pose steps spent waiting to flush
 
     Gpu* gpu_ = nullptr;
-    BrickSystem brick_;
-    // M5 fighter 1: its OWN carveable volume, so cutting it cannot touch the
-    // hero's clay. Rigid — it stands and takes hits, no piece/warp path.
-    BrickSystem foe_;
+    // The three big buffers every fighter's volume is a slice of. Created
+    // before any BrickSystem, because each one binds sub-ranges of these.
+    BrickStore store_;
     GroundClay ground_;
     std::vector<Gob> gobs_;
     SplootStats sploot_;
@@ -347,9 +412,10 @@ class Renderer {
 
     wgpu::ComputePipeline tracePipeline_, pickPipeline_;
     wgpu::RenderPipeline postPipeline_, blitPipeline_;
+    // group(1) is now the WHOLE store plus the ground — one bind group for
+    // every fighter, where M5 needed a second group per extra body.
     wgpu::BindGroup traceBind_, traceBrickBind_, postBind_, blitBind_;
     wgpu::BindGroup pickBind_, pickBrickBind_;
-    wgpu::BindGroup traceFoeBind_, pickFoeBind_; // group(2): fighter 1's volume
     wgpu::Buffer pickOut_, pickRead_;
     bool pickMapPending_ = false;
     bool alwaysPick_ = false;
@@ -357,6 +423,7 @@ class Renderer {
     bool pickValid_ = false;
     float pickPos_[3] = {0, 0, 0};
     float pickRest_[3] = {0, 0, 0};
+    int pickPlayer_ = -1;
     float pickNormal_[3] = {0, 1, 0};
     float pickAlbedo_[3] = {0.024f, 0.19f, 0.25f};
     float pickMat_ = 0.f;
@@ -378,7 +445,8 @@ class Renderer {
     // CLAYFRAY_DEBUG_REUSE only: last frame's traced inputs, so a re-trace can
     // name the input that changed instead of just counting itself.
     float prevUniforms_[kUniformSlots][4] = {};
-    uint32_t prevGens_[3] = {0, 0, 0};
+    // one per fighter volume, plus the ground field
+    uint32_t prevGens_[kMaxPlayers + 1] = {};
 
     // Shared with in-flight MapAsync callbacks; false once destroyed.
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);

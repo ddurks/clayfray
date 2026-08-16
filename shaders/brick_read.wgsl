@@ -18,72 +18,70 @@ const IND_INSIDE: u32 = 0x40000000u;
 const IND_IDX_MASK: u32 = 0x000FFFFFu;
 const IND_CHEB_MASK: u32 = 0x000000FFu;
 
-// The three per-cell arrays (indirection, JFA seeds, coarse distance) are ONE
-// buffer here, addressed through the CELL_* base indices in the //#constants
-// block. That is not packing for its own sake: a Metal shader stage gets 10
-// storage buffers, and two fighters plus the ground at one binding per array
-// needs 14 — the trace pipeline would not create at all. See the region map in
-// src/brick.h. (There was a fourth region, the per-cell skin field; M-RIG
-// deleted it along with the skeleton.)
+// ---------- THREE BINDINGS, ANY NUMBER OF FIGHTERS ----------
+// Two levels of packing stack here, and both exist for the same reason: core
+// WebGPU guarantees a shader stage only 8 storage buffers (CLAUDE.md trap 8),
+// and the tracer has to fit every fighter plus the ground inside that.
+//
+//  1. The three per-cell arrays (indirection, JFA seeds, coarse distance) are
+//     ONE buffer, addressed through the CELL_* base indices in the
+//     //#constants block. (There was a fourth region, the per-cell skin
+//     field; M-RIG deleted it along with the skeleton.)
+//  2. Every FIGHTER is a further slice of those same three buffers, at stride
+//     VOL_STRIDE (cells) and MAX_BRICKS (pool). So N fighters cost 3 bindings,
+//     not 3N — this is PLAN.md's "fighters are SLICES, not systems".
+//
+// The write passes never learn about (2): each fighter's BrickSystem binds its
+// own slice as a bind-group SUB-RANGE, so edit/voxelize/jfa/redistance still
+// index from zero and MAX_BRICKS still means "this fighter's pool". Only the
+// read side below adds a base, and only because the tracer binds whole buffers.
 @group(1) @binding(0) var<storage, read> bCells: array<u32>;
 @group(1) @binding(1) var<storage, read> bDist: array<u32>;    // 256 u32 per brick (512 f16)
 @group(1) @binding(2) var<storage, read> bAlbedo: array<u32>;  // 512 u32 per brick
 
-// ---------- fighter 1 (the opponent) ----------
-// A second body, in its own volume. Same layout, same code: every read below
-// goes through an accessor that picks the volume by `gFighter`, so one set of
-// sampling functions serves both fighters and nothing here is duplicated.
-// Fighter 1 runs the same brush rig as the hero, driven by its own pose.
-@group(2) @binding(0) var<storage, read> fCells: array<u32>;
-@group(2) @binding(1) var<storage, read> fDist: array<u32>;
-@group(2) @binding(2) var<storage, read> fAlbedo: array<u32>;
-
-// Which body the sampling functions are currently reading, and its pose data.
-// Set them, call, set them back — see foeDist/foeAlbedo at the bottom. This is
-// what lets ONE copy of the warp serve every player.
+// Which body the sampling functions are currently reading. These are BASE
+// INDICES, not an id to branch on: the two-fighter version of this file
+// selected the volume with `if (gFighter == 0u)` inside every accessor, which
+// does not extend (four bodies would be a four-way chain in the hottest code
+// in the frame) and cost real time even at two — see the note in
+// charDistAffine about fetching each bound field once. An add is free.
 var<private> gFighter: u32 = 0u;
+var<private> gCellBase: u32 = 0u;  // first u32 of this fighter's volume slice
+var<private> gDistBase: u32 = 0u;  // first u32 of its distance-pool partition
+var<private> gAlbBase: u32 = 0u;   // first u32 of its albedo-pool partition
 var<private> gPieceCount: i32 = 0;
 var<private> gFarCenter: vec3f = vec3f(0.0);
 var<private> gFarR: f32 = 0.0;
 
-fn usePlayer0() {
-  gFighter = 0u;
-  gPieceCount = i32(u.boneMeta.x);
-  gFarCenter = u.capsCenter.xyz;
-  gFarR = u.boneMeta.w;
-}
-fn usePlayer1() {
-  gFighter = 1u;
-  gPieceCount = i32(u.foeBoneMeta.x);
-  gFarCenter = u.foeCenter.xyz;
-  gFarR = u.foeMeta.y;
+fn usePlayer(f: u32) {
+  gFighter = f;
+  gCellBase = f * VOL_STRIDE;
+  gDistBase = f * MAX_BRICKS * 256u;
+  gAlbBase = f * MAX_BRICKS * 512u;
+  gPieceCount = i32(u.fighters[f].info.y);
+  gFarCenter = u.fighters[f].center.xyz;
+  gFarR = u.fighters[f].info.z;
 }
 // one piece of whichever player is selected
 fn pieceAt(i: i32) -> Piece {
-  if (gFighter == 0u) { return u.pieces[i]; }
-  return u.foePieces[i];
+  return u.fighters[gFighter].pieces[i];
 }
 
 fn rdIndir(i: u32) -> u32 {
-  if (gFighter == 0u) { return bCells[CELL_IND + i]; }
-  return fCells[CELL_IND + i];
+  return bCells[gCellBase + CELL_IND + i];
 }
 fn rdDist(i: u32) -> u32 {
-  if (gFighter == 0u) { return bDist[i]; }
-  return fDist[i];
+  return bDist[gDistBase + i];
 }
 fn rdAlb(i: u32) -> u32 {
-  if (gFighter == 0u) { return bAlbedo[i]; }
-  return fAlbedo[i];
+  return bAlbedo[gAlbBase + i];
 }
 fn rdSeed(i: u32) -> u32 {
-  if (gFighter == 0u) { return bCells[CELL_SEED + i]; }
-  return fCells[CELL_SEED + i];
+  return bCells[gCellBase + CELL_SEED + i];
 }
 // The coarse region is f32 data in the shared u32 buffer.
 fn rdCoarse(i: u32) -> f32 {
-  if (gFighter == 0u) { return bitcast<f32>(bCells[CELL_COARSE + i]); }
-  return bitcast<f32>(fCells[CELL_COARSE + i]);
+  return bitcast<f32>(bCells[gCellBase + CELL_COARSE + i]);
 }
 // M-RIG: rdCellW() read the per-cell skin field (a fourth region of the volume
 // buffer). It was the last consumer of a bone weight anywhere in the tracer.
@@ -359,7 +357,7 @@ fn charDistAffine(p: vec3f) -> f32 {
     let q = (pieceAt(i).invSkin * vec4f(p, 1.0)).xyz;
     let toBox = max(pLo.xyz - q, q - pHi.xyz);
     let boxDist = length(max(toBox, vec3f(0.0)));
-    if (boxDist > u.boneMeta.z) {
+    if (boxDist > u.sceneMeta.z) {
       // outside the test shell: the tight box bounds this brush's zero set,
       // so its distance is a safe lower bound (and >= margin, so no stall)
       d = min(d, boxDist * s);
@@ -368,7 +366,7 @@ fn charDistAffine(p: vec3f) -> f32 {
     // min, not smin. The brushes are separated by ~0.12 m of empty rest space
     // and the pieces land in the world as a blob plus two DETACHED mitts
     // (CLAUDE.md trap 7), so there is no seam to bridge; a smin at the packed
-    // joint width (u.boneMeta.y, ~2 voxels) would be an exact no-op that still
+    // joint width (u.sceneMeta.y, ~2 voxels) would be an exact no-op that still
     // costs every lane. Attach the mitts to the body on some future rig and
     // this is the one line to change.
     d = min(d, brushDist(q, boxDist) * s);
@@ -394,7 +392,7 @@ fn charLooseAffine(p: vec3f) -> f32 {
     let q = (pieceAt(i).invSkin * vec4f(p, 1.0)).xyz;
     let toBox = max(pLo.xyz - q, q - pHi.xyz);
     let boxDist = length(max(toBox, vec3f(0.0)));
-    if (boxDist > u.boneMeta.z) {
+    if (boxDist > u.sceneMeta.z) {
       d = min(d, boxDist * s);
       continue;
     }
@@ -424,7 +422,7 @@ fn charRestPointAffine(p: vec3f) -> vec3f {
     let q = (pieceAt(i).invSkin * vec4f(p, 1.0)).xyz;
     let toBox = max(pLo.xyz - q, q - pHi.xyz);
     let boxDist = length(max(toBox, vec3f(0.0)));
-    if (boxDist > u.boneMeta.z) {
+    if (boxDist > u.sceneMeta.z) {
       continue;
     }
     let d = brushDist(q, boxDist) * pLo.w;
@@ -485,53 +483,66 @@ fn charAlbedoI(p: vec3f) -> vec3f {
 }
 
 // ---------- player entry points ----------
-// The hero is player 0; each call re-selects it because the opponent's
-// sampling leaves the private selectors pointing elsewhere.
-fn charDist(p: vec3f) -> f32 {
-  usePlayer0();
+// Every fighter runs the same character, the same warp and the same sampling
+// code; what differs is its slice of the volume and its own posed pieces. Each
+// entry point states which fighter it wants, so there is no "restore the
+// selector afterwards" dance to forget (the two-fighter version had to call
+// usePlayer0() on the way out of every foe sampler).
+//
+// A DISABLED fighter must return 1e9 rather than sampling: its volume slice is
+// stale clay from whenever it was last live, and the pieces uniform is zeroed,
+// which would otherwise draw the rest volume unposed at the origin.
+// info.x ALONE, deliberately: a live fighter with ZERO pieces is the un-rigged
+// debug path (CLAYFRAY_NO_AFFINE / look.affineRig off), which draws the rest
+// volume where it was authored via charDistRest. Gating on the piece count too
+// would make that flag render nothing at all instead of answering "is the rig
+// wrong or is the volume wrong?".
+fn fighterActive(f: u32) -> bool {
+  return u.fighters[f].info.x > 0.5;
+}
+fn fighterDist(f: u32, p: vec3f) -> f32 {
+  if (!fighterActive(f)) {
+    return 1e9;
+  }
+  usePlayer(f);
   return charDistI(p);
 }
-fn charDistLoose(p: vec3f) -> f32 {
-  usePlayer0();
+// smooth twin for AO/penumbra — the trap 3 split, per fighter
+fn fighterDistLoose(f: u32, p: vec3f) -> f32 {
+  if (!fighterActive(f)) {
+    return 1e9;
+  }
+  usePlayer(f);
   return charDistLooseI(p);
 }
-fn charAlbedo(p: vec3f) -> vec3f {
-  usePlayer0();
+fn fighterAlbedo(f: u32, p: vec3f) -> vec3f {
+  usePlayer(f);
   return charAlbedoI(p);
 }
-fn charRestPoint(p: vec3f) -> vec3f {
-  usePlayer0();
+fn fighterRestPoint(f: u32, p: vec3f) -> vec3f {
+  usePlayer(f);
   return charRestPointI(p);
 }
-
-// Player 1: same character, same warp, its OWN volume and its own pose. The
-// root transform is folded into its piece matrices exactly like the hero's,
-// so it animates rather than standing rigid.
-fn foeActive() -> bool {
-  return u.foeMeta.x > 0.5;
-}
-fn foeDist(p: vec3f) -> f32 {
-  if (!foeActive() || u.foeBoneMeta.x < 0.5) {
-    return 1e9;
+// Nearest fighter's surface, over every live body. Returns (distance, index);
+// index is -1 when no fighter is closer than `best`. This is the one place the
+// fighter loop lives — map(), mapLoose(), mapPenumbra() and the pick shader all
+// go through it, so adding a body cannot miss a call site.
+fn fightersNearest(p: vec3f, best: f32) -> vec2f {
+  var d = best;
+  var hit = -1.0;
+  for (var f = 0u; f < u32(u.sceneMeta.x); f++) {
+    let df = fighterDist(f, p);
+    if (df < d) {
+      d = df;
+      hit = f32(f);
+    }
   }
-  usePlayer1();
-  let d = charDistI(p);
-  usePlayer0();
-  return d;
+  return vec2f(d, hit);
 }
-// smooth twin for AO/penumbra — same split the hero's field keeps (trap 3)
-fn foeDistLoose(p: vec3f) -> f32 {
-  if (!foeActive() || u.foeBoneMeta.x < 0.5) {
-    return 1e9;
+fn fightersDistLoose(p: vec3f, best: f32) -> f32 {
+  var d = best;
+  for (var f = 0u; f < u32(u.sceneMeta.x); f++) {
+    d = min(d, fighterDistLoose(f, p));
   }
-  usePlayer1();
-  let d = charDistLooseI(p);
-  usePlayer0();
   return d;
-}
-fn foeAlbedo(p: vec3f) -> vec3f {
-  usePlayer1();
-  let c = charAlbedoI(p);
-  usePlayer0();
-  return c;
 }

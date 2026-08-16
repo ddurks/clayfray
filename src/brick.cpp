@@ -120,28 +120,51 @@ std::string BrickSystem::wgslConstants() {
         "// tolerance) were emitted here until M-RIG deleted the skinned path.\n"
         "const CELL_IND: u32 = %uu;\n"
         "const CELL_SEED: u32 = %uu;\n"
-        "const CELL_COARSE: u32 = %uu;\n",
+        "const CELL_COARSE: u32 = %uu;\n"
+        "// Fighter slicing. VOL_STRIDE is one fighter's whole volume in u32\n"
+        "// elements, so the tracer reads bCells[f*VOL_STRIDE + CELL_* + i];\n"
+        "// the pools use MAX_BRICKS (which is PER FIGHTER) the same way.\n"
+        "// MAX_FIGHTERS and PIECES_PER_FIGHTER size the uniform block's\n"
+        "// fighter array in trace.wgsl and pick.wgsl — which is why the\n"
+        "// //#constants block has to come BEFORE the struct in both.\n"
+        "const VOL_STRIDE: u32 = %uu;\n"
+        "const MAX_FIGHTERS: u32 = %uu;\n"
+        "const PIECES_PER_FIGHTER: u32 = %uu;\n",
         kGrid, kBrickUsable, (double)kVoxel, (double)kSpan, (double)kOrigin[0],
         (double)kOrigin[1], (double)kOrigin[2], (double)kBand, kMaxBricks,
         kDirtyCap, (uint32_t)kGrid * kGrid * kGrid, (int)kAxisVox, kRowWords,
         (uint32_t)(kIndOff / 4), (uint32_t)(kSeedOff / 4),
-        (uint32_t)(kCoarseOff / 4));
+        (uint32_t)(kCoarseOff / 4), (uint32_t)(kVolumeBytes / 4),
+        (uint32_t)kMaxFighters, (uint32_t)kPiecesPerFighter);
     return buf;
 }
 
-bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& jfaSrc,
+bool BrickStore::init(Gpu& gpu) {
+    wgpu::Device& dev = gpu.device;
+    using K = BrickSystem;
+    volume = makeStorage(dev, K::kVolumeBytes * K::kMaxFighters, "brick volume store");
+    distPool = makeStorage(dev, K::kDistBytes * K::kMaxFighters, "brick dist pool");
+    albedoPool =
+        makeStorage(dev, K::kAlbedoBytes * K::kMaxFighters, "brick albedo pool");
+    return volume && distPool && albedoPool;
+}
+
+bool BrickSystem::init(Gpu& gpu, BrickStore& store, int slot,
+                       const std::string& editSrc, const std::string& jfaSrc,
                        const std::string& redistSrc, const std::string& voxelizeSrc) {
     gpu_ = &gpu;
+    slot_ = slot;
     wgpu::Device& dev = gpu.device;
     const uint32_t cells = kGrid * kGrid * kGrid;
 
-    // One buffer for indirection + seeds + coarse + cell weights (see the
-    // region map in brick.h — Metal's 10-storage-buffer stage cap). Created
-    // once at full size: import fills the weights in place, so bind groups
-    // built against it never go stale.
-    volume = makeStorage(dev, kVolumeBytes, "brick volume");
-    distPool = makeStorage(dev, kMaxBricks * 256ull * 4ull, "brick dist pool");
-    albedoPool = makeStorage(dev, kMaxBricks * 512ull * 4ull, "brick albedo pool");
+    // The three big buffers are the STORE's, shared with every other fighter;
+    // this object only ever touches the slice at volBase()/distBase()/albBase().
+    // (Handles are refcounted, so these copies name the same allocations.)
+    volume = store.volume;
+    distPool = store.distPool;
+    albedoPool = store.albedoPool;
+    // Everything below is genuinely per-fighter: no trace-pass binding reads
+    // them, so they cost nothing against the 8-storage-buffer budget.
     counters_ = makeStorage(dev, kCounterBytes, "brick counters");
     freelist_ = makeStorage(dev, kMaxBricks * 4ull, "brick freelist");
     jfaB_ = makeStorage(dev, cells * 4ull, "jfa B");
@@ -197,11 +220,17 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
                     std::vector<BindBuf> entries) {
         return makeBindGroup(gpu_->device, pipe, group, entries);
     };
-    // The `volume` regions these passes write, each at the binding its shader
-    // declares for it (indirection is always 0, seeds 1, coarse 5).
-    const BindBuf vInd{0, volume, kIndOff, kCellBytes};
-    const BindBuf vSeed{1, volume, kSeedOff, kCellBytes};
-    const BindBuf vCoarse{5, volume, kCoarseOff, kCellBytes};
+    // THIS FIGHTER'S SLICE of each shared buffer, at the binding its shader
+    // declares for it (indirection is always 0, seeds 1, coarse 5). Because
+    // every write pass sees only its own sub-range, edit.wgsl / voxelize.wgsl /
+    // jfa.wgsl / redistance.wgsl index from zero and are byte-identical to the
+    // one-fighter-one-buffer version — MAX_BRICKS just means "this fighter's
+    // pool" now. Only the tracer, which binds the buffers whole, adds a base.
+    const BindBuf vInd{0, volume, volBase() + kIndOff, kCellBytes};
+    const BindBuf vSeed{1, volume, volBase() + kSeedOff, kCellBytes};
+    const BindBuf vCoarse{5, volume, volBase() + kCoarseOff, kCellBytes};
+    const BindBuf pDist{1, distPool, distBase(), kDistBytes};
+    const BindBuf pAlbedo{2, albedoPool, albBase(), kAlbedoBytes};
 
     for (int i = 0; i < kOpsPerFrame; i++)
         classifyG0_[i] = bind(classify_, 0, {{0, editParams_[i]}});
@@ -209,7 +238,7 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
     classifyG2_ = bind(classify_, 2, {{0, counters_}, {1, freelist_}});
     for (int i = 0; i < kOpsPerFrame; i++)
         fillG0_[i] = bind(fill_, 0, {{0, editParams_[i]}});
-    fillG1_ = bind(fill_, 1, {vInd, {1, distPool}, {2, albedoPool}});
+    fillG1_ = bind(fill_, 1, {vInd, pDist, pAlbedo});
     fillG2_ = bind(fill_, 2, {{0, counters_}, {1, freelist_}});
     jfaInitG_ = bind(jfaInit_, 0, {vInd, vSeed});
     for (int i = 0; i < kJfaSteps; i++) {
@@ -218,10 +247,10 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
     }
     jfaResolveG_ = bind(jfaResolve_, 0,
                         {vInd, vSeed, {2, jfaB_}, {3, jfaResolveParams_},
-                         {4, distPool}, vCoarse});
+                         {4, distPool, distBase(), kDistBytes}, vCoarse});
     rdCompactG_ = bind(rdCompact_, 0, {vInd, {2, dirtyList_}, {3, counters_}});
     rdPrepG_ = bind(rdPrep_, 0, {{3, counters_}, {4, indirectArgs_}});
-    rdRedistG_ = bind(rdRedist_, 0, {vInd, {1, distPool}, {2, dirtyList_}});
+    rdRedistG_ = bind(rdRedist_, 0, {vInd, pDist, {2, dirtyList_}});
     rdClearG_ = bind(rdClear_, 0, {vInd, {2, dirtyList_}, {3, counters_}});
     // 4 relax rounds alternating direction; even count ends back in `coarse`
     for (int i = 0; i < 4; i++) {
@@ -250,7 +279,7 @@ void BrickSystem::debugStats(const char* label) {
     desc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
     wgpu::Buffer rb = gpu_->device.CreateBuffer(&desc);
     wgpu::CommandEncoder enc = gpu_->device.CreateCommandEncoder();
-    enc.CopyBufferToBuffer(volume, kIndOff, rb, 0, cells * 4ull);
+    enc.CopyBufferToBuffer(volume, volBase() + kIndOff, rb, 0, cells * 4ull);
     enc.CopyBufferToBuffer(counters_, 0, rb, cells * 4ull, kCounterBytes);
     wgpu::CommandBuffer cmd = enc.Finish();
     gpu_->queue.Submit(1, &cmd);
@@ -295,8 +324,8 @@ void BrickSystem::debugScanField() {
     desc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
     wgpu::Buffer rb = gpu_->device.CreateBuffer(&desc);
     wgpu::CommandEncoder enc = gpu_->device.CreateCommandEncoder();
-    enc.CopyBufferToBuffer(volume, kIndOff, rb, 0, cells * 4ull);
-    enc.CopyBufferToBuffer(distPool, 0, rb, cells * 4ull, distBytes);
+    enc.CopyBufferToBuffer(volume, volBase() + kIndOff, rb, 0, cells * 4ull);
+    enc.CopyBufferToBuffer(distPool, distBase(), rb, cells * 4ull, distBytes);
     wgpu::CommandBuffer cmd = enc.Finish();
     gpu_->queue.Submit(1, &cmd);
     bool ok = false;
@@ -348,7 +377,7 @@ void BrickSystem::debugScanField() {
     cdesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
     wgpu::Buffer crb = gpu_->device.CreateBuffer(&cdesc);
     wgpu::CommandEncoder cenc = gpu_->device.CreateCommandEncoder();
-    cenc.CopyBufferToBuffer(volume, kCoarseOff, crb, 0, cells * 4ull);
+    cenc.CopyBufferToBuffer(volume, volBase() + kCoarseOff, crb, 0, cells * 4ull);
     wgpu::CommandBuffer ccmd = cenc.Finish();
     gpu_->queue.Submit(1, &ccmd);
     bool cok = false;
@@ -573,8 +602,9 @@ void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
                   {{0, mesh_->pos}, {1, mesh_->idx}, {2, mesh_->col},
                    {4, mesh_->tris}, {5, vxParityBuf_}});
     vxG1_ = bindv(vxFill_, 1,
-                  {{0, volume, kIndOff, kCellBytes}, {1, distPool},
-                   {2, albedoPool}});
+                  {{0, volume, volBase() + kIndOff, kCellBytes},
+                   {1, distPool, distBase(), kDistBytes},
+                   {2, albedoPool, albBase(), kAlbedoBytes}});
     vxG2_ = bindv(vxClassify_, 2, {{0, counters_}, {1, freelist_}});
 
     importPending_ = true;
@@ -582,7 +612,7 @@ void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
 }
 
 void BrickSystem::encodeImport(wgpu::CommandEncoder& enc) {
-    enc.ClearBuffer(volume, kIndOff, kCellBytes);
+    enc.ClearBuffer(volume, volBase() + kIndOff, kCellBytes);
     // whole block, spill counter included: a re-import starts from an empty
     // pool, so a spill it reports afterwards is this import's, not a stale one
     enc.ClearBuffer(counters_, 0, kCounterBytes);
@@ -594,7 +624,7 @@ void BrickSystem::encodeImport(wgpu::CommandEncoder& enc) {
     };
     wgpu::BindGroup cg0 = bindc2(vxClassify_, 0, {{0, mesh_->pos}, {1, mesh_->idx},
                                                   {4, mesh_->tris}, {6, mesh_->inside}});
-    wgpu::BindGroup cg1 = bindc2(vxClassify_, 1, {{0, volume, kIndOff, kCellBytes}});
+    wgpu::BindGroup cg1 = bindc2(vxClassify_, 1, {{0, volume, volBase() + kIndOff, kCellBytes}});
     wgpu::BindGroup pg0 = bindc2(vxParity_, 0,
                                  {{0, mesh_->pos}, {1, mesh_->idx}, {5, vxParityBuf_}});
 
@@ -695,7 +725,8 @@ bool BrickSystem::load(SnapReader&) { return false; }
 
 bool BrickSystem::save(SnapWriter& w) {
     const uint32_t cells = kGrid * kGrid * kGrid;
-    std::vector<uint8_t> ind = readbackBuffer(*gpu_, volume, cells * 4ull, kIndOff);
+    std::vector<uint8_t> ind =
+        readbackBuffer(*gpu_, volume, cells * 4ull, volBase() + kIndOff);
     if (ind.empty()) return false;
     // pools are saved as a dense prefix up to the brick high-water mark:
     // alloc is counter-based so live indices are packed low, and freed holes
@@ -727,13 +758,18 @@ bool BrickSystem::save(SnapWriter& w) {
     // (the per-voxel bone weights). Both backing buffers are gone, so this is
     // a FORMAT change — snapshot.cpp's kVersion is bumped to match and stale
     // .snap files refuse cleanly instead of loading garbage.
+    // Offsets are into THIS FIGHTER'S SLICE. The section contents are still
+    // slice-local (indirection words carry partition-local brick indices), so
+    // a snapshot taken by player 2 restores correctly into player 0 — which is
+    // what makes per-player snapshot tags a naming problem, not a format one.
     const Sect sects[] = {
         {"BCNT", counters_, kCounterBytes},
         {"BFRE", freelist_, kMaxBricks * 4ull},
-        {"BJFA", volume, cells * 4ull, kSeedOff},   // jfaB_ is per-pass scratch
-        {"BCRS", volume, cells * 4ull, kCoarseOff}, // coarseB_ likewise
-        {"BDST", distPool, bricks * 256ull * 4ull},
-        {"BALB", albedoPool, bricks * 512ull * 4ull},
+        // jfaB_ / coarseB_ are per-pass scratch; the canonical sides are here
+        {"BJFA", volume, cells * 4ull, volBase() + kSeedOff},
+        {"BCRS", volume, cells * 4ull, volBase() + kCoarseOff},
+        {"BDST", distPool, bricks * 256ull * 4ull, distBase()},
+        {"BALB", albedoPool, bricks * 512ull * 4ull, albBase()},
     };
     for (const Sect& s : sects) {
         if (s.size == 0) {
@@ -768,13 +804,13 @@ bool BrickSystem::load(SnapReader& r) {
         uint64_t offset = 0;
     };
     const Sect sects[] = {
-        {"BIND", volume, cells * 4ull, kIndOff},
+        {"BIND", volume, cells * 4ull, volBase() + kIndOff},
         {"BCNT", counters_, kCounterBytes},
         {"BFRE", freelist_, kMaxBricks * 4ull},
-        {"BJFA", volume, cells * 4ull, kSeedOff},
-        {"BCRS", volume, cells * 4ull, kCoarseOff},
-        {"BDST", distPool, bricks * 256ull * 4ull},
-        {"BALB", albedoPool, bricks * 512ull * 4ull},
+        {"BJFA", volume, cells * 4ull, volBase() + kSeedOff},
+        {"BCRS", volume, cells * 4ull, volBase() + kCoarseOff},
+        {"BDST", distPool, bricks * 256ull * 4ull, distBase()},
+        {"BALB", albedoPool, bricks * 512ull * 4ull, albBase()},
     };
     for (const Sect& s : sects) {
         if (s.size == 0) continue;
@@ -973,7 +1009,7 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
     }
     if (bakePending_) {
         // fresh volume: zero the indirection (empty-outside) and counters
-        enc.ClearBuffer(volume, kIndOff, kCellBytes);
+        enc.ClearBuffer(volume, volBase() + kIndOff, kCellBytes);
         enc.ClearBuffer(counters_, 0, kCounterBytes);
         capSpillSeen_ = 0; // counters[4] just went back to zero
         BrickEdit bake{};

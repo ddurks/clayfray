@@ -321,8 +321,8 @@ body's centre of mass — the "arm length" of a fighter with no arms.
   carveable volume, running its own clip clock (phase-offset so two identical
   bodies don't breathe in lockstep) and carrying its own eye beads. The trace
   reads both through one set of sampling functions selected by a private
-  `gFighter`/`pieceAt` — no duplicated warp. CAP IS 2: each extra volume is
-  another static WGSL binding, so 3+ needs the slice refactor below
+  `gFighter`/`pieceAt` — no duplicated warp. (Cap was 2, one static WGSL
+  binding set per volume; **now 4**, see the slice section below)
 - [x] Slice = carve a channel. Three bugs worth remembering, each of which
   looked like "cutting doesn't work":
   1. A SPHERE at the blade's deepest contact sits wholly inside the body —
@@ -362,17 +362,43 @@ proposed and it is wrong. Three reasons, in order of severity:
    fighters = 530 MB, 4 = 1.06 GB.
 3. The uniform block cannot hold a second fighter anyway — see below.
 
-**Reason 1 has a hard number now (Metal, 2026-08-15).** M5 shipped the
-rejected design anyway — a second BrickSystem with its own group(2) — and it
-does not run on macOS at all: a Metal shader stage gets **10** storage
-buffers (31 Metal buffer slots, less the one Dawn spends on buffer lengths
-and its default uniform/vertex budget), and one binding per array put `trace`
-at 14. `CreateComputePipeline` failed outright and every frame after it was
-invalid. Vulkan's limit is effectively unbounded, which is why the Windows
-box never saw it. Mitigated, not fixed, by packing each fighter's four
-per-cell arrays into ONE `volume` buffer (brick.h): a fighter now costs 3
-bindings instead of 6, so trace sits at 9 of 10 — **fighter #3 still needs
-the slice work above**, it just fails at N=3 instead of N=2.
+**Reason 1 had a hard number (Metal, 2026-08-15).** M5 shipped the rejected
+design anyway — a second BrickSystem with its own group(2) — and it did not
+run on macOS at all: a Metal shader stage gets **10** storage buffers (31
+Metal buffer slots, less the one Dawn spends on buffer lengths and its
+default uniform/vertex budget), and one binding per array put `trace` at 14.
+`CreateComputePipeline` failed outright and every frame after it was invalid.
+Vulkan's limit is effectively unbounded, which is why the Windows box never
+saw it. Packing each fighter's per-cell arrays into ONE `volume` buffer
+mitigated it to 3 bindings per fighter (7 of 8 at N=2) — it just failed at
+N=3 instead of N=2.
+
+**DONE (M-SLICE).** Shipped as one `BrickStore` of three buffers, sliced
+`kMaxFighters` ways, with a `BrickSystem` per fighter owning slice `f`. Trace
+is **4 of 8 storage buffers at any N** and `kMaxPlayers` is 4. What actually
+landed, against what was planned below:
+
+- Per-cell stride: yes, but the WRITE side never sees it — each fighter binds
+  its own slice as a bind-group sub-range, so `edit`/`voxelize`/`jfa`/
+  `redistance` are byte-identical to the single-fighter versions. Only the
+  tracer, which binds whole buffers, adds a base index.
+- Brick pool shared: yes, but **PARTITIONED rather than free-list-shared**.
+  Fighter `f` owns `[0, kMaxBricks)` of its own partition and its indirection
+  words store partition-LOCAL indices. That keeps one fighter's carving from
+  starving another's and keeps `save()`'s dense-prefix format working; the
+  cost is that an untouched opponent cannot lend its unused bricks.
+  `kMaxBricks` fell 16384 -> 12288 per fighter so four of them stay under the
+  128 MiB core storage-binding limit (albedo is the binding that binds).
+- **"Pieces must leave the uniform block" turned out to be WRONG, and it was
+  billed as "the single biggest edit in the work".** It was true when written,
+  at 288 slots with the 13-piece rig live. The affine rig cut articulation to
+  three pieces, so four fighters at 3 pieces each cost 144 slots — *less than
+  the old single hero's 16-piece array*. The whole uniform block went 488 ->
+  262 slots while gaining two fighters. Pieces stayed put.
+- Per-fighter renderer state collapsed into one `Fighter` struct in an array.
+  The `foo_`/`foeFoo_` member pairs WERE the cap as much as the bindings were.
+
+Original plan, kept for the reasoning:
 
 **Locked: one BrickSystem, fighters are slices of it.**
 - Per-cell arrays get a fighter stride: `bIndirection[f * CELLS + cellIndex(c)]`.
@@ -390,7 +416,8 @@ the slice work above**, it just fails at N=3 instead of N=2.
 16 × 12 = 192 of the 288 uniform slots (66..257) — one fighter fills two
 thirds of the buffer. Pieces, capsules and marbles must move to storage
 buffers indexed by fighter. This is not optional and is the single biggest
-edit in the work.
+edit in the work. *(Superseded: the affine rig made three pieces enough, so
+this never had to happen. See the DONE note above.)*
 
 **Why the per-frame cost stays sane:**
 - Redistance/JFA is already dirty-list driven with indirect dispatch, so an
@@ -406,13 +433,25 @@ edit in the work.
 2. N = 2: second fighter standing, slice-carve routed by index.
 3. N players: input routing, per-fighter ledger and stats.
 
-**Open risks:**
-- **Pool capacity.** The one measurement on record is 12,417 of 49,152 bricks
-  allocated (older, taller character) — 4 fighters would sit right at the cap.
-  Re-measure with `CLAYFRAY_DEBUG_STATS=1` on the current blob before picking
-  a fighter limit; raising `kMaxBricks` costs ~5 MB per 1k bricks.
-- **Conservation ledger** is single-body (`sploot_`). It becomes per-fighter,
-  with gobs carrying a source id. `--carve-test` must stay exit-0 throughout.
+**Open risks, as resolved:**
+- **Pool capacity.** Settled at 12,288 bricks per fighter (see the derivation
+  on `BrickSystem::kMaxBricks`): 1.82x the import floor and 1.47x the hard
+  carve ceiling, with the thin margin against `CLAYFRAY_TEST_ADDSTRESS`
+  (~11.5k, 7% headroom). Four fighters = 144 MiB of pools.
+- **Conservation ledger** stayed SINGLE, arena-wide, and that is the right
+  answer rather than a shortcut: clay carved off any body becomes the same
+  gobs landing on the same ground, so there is one pot of clay in the arena,
+  not one per fighter. `absorbMeasured` drains every fighter into it.
+  `--carve-test` is exit 0, and a 4-way carve balanced to 0.00 ml debt.
+  `BrickEdit::player` carries the source id the plan asked for.
+
+**Still open after M-SLICE:**
+- Snapshots save player 0's volume only. The format is per-fighter-clean
+  (indirection carries partition-local brick indices), so this is a
+  section-naming job — `BIND`/`BDST`/`BALB` need a per-player tag prefix.
+- The capsule shadow proxy in `mapPenumbra` is player 0's alone, as it was at
+  N=2. Generalising it changes the hero's penumbra, so it wants its own pass
+  with a human looking at it (CLAUDE.md: a pixel diff cannot see shape).
 - **16-piece cap** is per fighter once pieces are indexed; the hero is at 15
   bones of 16 already, so that cap needs raising in the same pass.
 - Snapshots: bump `kVersion`, per-fighter sections.

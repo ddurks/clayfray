@@ -28,7 +28,10 @@ constexpr char kMagic[4] = {'C', 'F', 'S', 'N'};
 //        half is snapshot-transparent.
 //    (b) BrickEdit gained `fromBlade` (sword slices pool into one gob), and
 //        "BPND" stores BrickEdit raw, so its stride moved.
-constexpr uint32_t kVersion = 6;
+// 7: fighters became SLICES of a shared BrickStore. kMaxBricks fell from
+// 16384 to 12288 (BMET carries it, so a v6 file would be refused anyway) and
+// the RRIG spring section grew from 2 fighters to kMaxPlayers.
+constexpr uint32_t kVersion = 7;
 
 uint32_t tagWord(const char tag[4]) {
     uint32_t w;

@@ -78,18 +78,73 @@ Headless flags: `--screenshot PATH --size WxH --frames N --time T --aa N`,
 `--replay f.journal` (deterministic scenario replay), `--load NAME`
 (restore a snapshot at launch).
 
-## Players (M5)
+## Players — fighters are SLICES (M5, sliced M-SLICE)
 
 `Renderer::addPlayer(pose)` adds a fighter and returns its index; player 0 is
-the hero. **The cap is 2** — each body needs its own volume and WGSL bindings
-are static, so 3+ requires the per-player stride in PLAN.md ("fighters are
-SLICES"). That cap is now enforced by the API, not taste: a third fighter's
-3 bindings would put `trace` at 10, over the 8 storage buffers per stage that
-core WebGPU guarantees (trap 8). ctl exposes `foe.enabled`, `foe.pos`,
-`foe.yaw`.
+the hero. **The cap is 4** (`BrickSystem::kMaxFighters`), and it is now a
+MEMORY choice rather than a shader one.
 
-Both fighters bill to ONE conservation ledger: clay off either body becomes
-the same gobs on the same arena.
+Every fighter is a SLICE of one `BrickStore`: one `volume`, one `distPool`,
+one `albedoPool`, each cut into `kMaxFighters` partitions. So **the tracer
+costs 3 brick bindings + 1 ground = 4 of 8 AT ANY N** (it was 3N+1, which hit
+the wall at two — see trap 8). Raising the cap costs pool memory and uniform
+slots, nothing else.
+
+The split that makes it work, and the reason the write shaders were untouched:
+
+- **Write side binds SUB-RANGES.** Each `BrickSystem` binds its own slice as a
+  bind-group offset, so `edit.wgsl` / `voxelize.wgsl` / `jfa.wgsl` /
+  `redistance.wgsl` still index from zero and `MAX_BRICKS` still means "this
+  fighter's pool". Miss an offset in `brick.cpp` and a fighter silently edits
+  its neighbour's clay — every one goes through `volBase()`/`distBase()`/
+  `albBase()`.
+- **Read side adds a base.** The tracer binds the buffers whole, so
+  `brick_read.wgsl`'s accessors add `gCellBase`/`gDistBase`/`gAlbBase`, set by
+  `usePlayer(f)`. That replaced a per-accessor `if (gFighter == 0u)` branch,
+  which at four bodies would have been a four-way chain in the hottest code in
+  the frame.
+- **Pools are PARTITIONED, not pooled.** Indirection words carry brick indices
+  local to the fighter's partition, so one fighter's carving can never starve
+  or corrupt another's — and `save()`'s dense-prefix format still works.
+- **Materials carry the index**: fighter f is `MAT_BODY + 0.1*f` (3.0…3.3, all
+  under the 3.5 clay cutoff so every `m < 3.5` predicate still classifies every
+  fighter as clay). `pick.wgsl` returns it in `pickOut[3].w`, which is what
+  lets the mouse sculpt any body.
+
+Per-fighter renderer state lives in ONE `Renderer::Fighter` struct in an array.
+Every field there used to exist twice as a `foo_`/`foeFoo_` pair — that
+duplication *was* the cap, since a third body meant a third copy of a dozen
+members plus a third `else if` at each use.
+
+**A rest-space point is meaningless without its fighter.** The same
+coordinates name different clay in every slice, so `BrickEdit::player` is
+explicit (default 0 = the hero, which is what every journal and `--carve-test`
+assumes). Routing an edit off the live pick instead would silently redirect
+every SCRIPTED edit to whatever is under the cursor.
+
+ctl exposes `p1.*`…`p3.*` (`enabled`/`pos`/`yaw`/`lean`/`moving`), plus
+`foe.*` kept as an alias for player 1 so recorded journals still replay. The
+`edit` verb takes an optional trailing player index.
+
+EVERY fighter bills to ONE conservation ledger: clay off any body becomes the
+same gobs on the same arena.
+
+**The trace reject sphere is a SHADING input, not just an early-out.**
+`charLooseAffine` RETURNS `length(p - gFarCenter) - gFarR` for points outside
+it, and that value feeds AO and the penumbra term — so moving a fighter's
+bound repaints shading on surfaces it is nowhere near, including ones where
+the fighter is off-screen entirely. Measured at 640x360 aa2 vs origin/main:
+deriving the hero's centre from the transformed rest centre instead of the
+posed capsule average moved **38,295 px, max delta 59**. Every fighter now
+uses the capsule average (the hero's derivation), which makes the hero **4 px,
+max delta 1**. If you touch `packUniforms`' centre/radius, re-run that A/B.
+
+**Not done:** snapshots still save player 0's volume only (the format is
+per-fighter-clean, so it is a section-naming job, not a format one); the
+capsule shadow proxy in `mapPenumbra` is still player 0's alone (generalising
+it would change the hero's penumbra); and the opponent's reject sphere moved
+onto the hero's derivation, which is the whole residual against origin/main
+(~4% of pixels, max 17, almost all ±1 LSB of AO on ground near it).
 
 ## The affine rig (M-PERF) — how the fighter animates now
 
@@ -166,10 +221,21 @@ tools/ctl.sh quit
 ```
 
 Commands: `get NAME|*`, `set NAME V..` (any LookParams/sword/cam/brush field,
-names = struct paths like `sword.pitch`), `edit carve|add x y z r [rgb [dir
-srcRGB]]`, `bake`, `shot PATH`, `stats`, `probe`/`pickuv u v`, `pause`,
-`resume`, `step [N]`, `timescale F`, `snap save|load NAME`, `record
-PATH|stop`, `break ledger TOL_ML|off`, `quit`.
+names = struct paths like `sword.pitch`; plus `p1.*`…`p3.*` per opponent),
+`edit carve|add x y z r [rgb [dir srcRGB [player]]]`, `bake`, `shot PATH`,
+`stats`, `probe`/`pickuv u v`, `pause`, `resume`, `step [N]`, `timescale F`,
+`snap save|load NAME`, `record PATH|stop`, `break ledger TOL_ML|off`, `quit`.
+
+Four fighters, each carved in its own slice, from a cold `--serve`:
+
+```sh
+tools/ctl.sh "set p2.enabled 1" "set p2.pos -0.95 0 0.35" "set p2.yaw 1.4"
+tools/ctl.sh "edit carve 0.02 0.45 0.14 0.085 0.72 0.45 0.4 0 0 1 .15 .4 .45 2"
+```
+
+Every slice is imported at startup, so enabling a player is instant — but
+`playerCount()` only counts the ones `addPlayer()` made, and only `main.cpp`
+calls that (once, for player 1). Two fighters is still the default scene.
 
 Iteration rules of thumb:
 - **Don't render screenshots to check your own work — build it and hand it
@@ -320,7 +386,7 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    the AABB clip that separates the pieces and both are reported.
 
 8. **Core WebGPU guarantees a stage only 8 storage buffers, and `trace` uses
-   7.** Two limits stack here, and the SMALLER one is now the binding budget:
+   4.** Two limits stack here, and the SMALLER one is the binding budget:
 
    - **Core WebGPU: 8** (`maxStorageBuffersPerShaderStage`). This is the
      number that matters, because it is what a conformant implementation may
@@ -336,21 +402,26 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
      errored and every frame after it was invalid, while Vulkan (effectively
      unbounded) showed nothing wrong.
 
-   Two rounds of packing got `trace` from 14 to 7. Each fighter's per-cell
-   arrays (indirection, JFA seeds, coarse — there was a fourth, cell weights,
-   until the skeleton went) are REGIONS of one `volume` buffer, and the
-   ground's base/height/color are REGIONS of one `field` buffer. In both
-   cases: write passes bind their own region as a sub-range, which is why the
-   write shaders still declare them separately and need no index arithmetic,
-   and the tracer binds each buffer once and adds a base index (`CELL_*` from
-   `BrickSystem::wgslConstants` with accessors atop `brick_read.wgsl`; `G_*`
-   from `GroundClay::wgslConstants` with accessors atop `ground_read.wgsl`).
-   Region maps live in `src/brick.h` and `src/ground.h`.
+   THREE rounds of packing got `trace` from 14 to 4, and all three use the
+   same trick — **write passes bind a SUB-RANGE, the tracer binds the whole
+   buffer and adds a base index** — so no write shader has ever needed index
+   arithmetic for any of them:
 
-   Budget: **3 per fighter + 1 ground = 7 of 8**, i.e. ONE spare. **Adding a
-   storage binding to trace.wgsl costs the last of the mobile headroom** —
-   grow an existing region instead. Fighter #3 needs the per-fighter stride in
-   PLAN.md ("fighters are SLICES"), not three more bindings.
+   1. Each fighter's per-cell arrays (indirection, JFA seeds, coarse — there
+      was a fourth, cell weights, until the skeleton went) are REGIONS of one
+      `volume` buffer. `CELL_*` from `BrickSystem::wgslConstants`, accessors
+      atop `brick_read.wgsl`, region map in `src/brick.h`.
+   2. The ground's base/height/colour are REGIONS of one `field` buffer.
+      `G_*` from `GroundClay::wgslConstants`, accessors atop
+      `ground_read.wgsl`, region map in `src/ground.h`.
+   3. Every FIGHTER is a slice of those same three brick buffers, at stride
+      `VOL_STRIDE` / `MAX_BRICKS`. This is the one that removes N from the
+      equation entirely.
+
+   Budget: **3 for all fighters + 1 ground = 4 of 8**, i.e. FOUR spare, and it
+   does not grow with the player count. It was 3N+1, which is why M5's second
+   fighter (7 of 8) left no room for a third. Prefer growing an existing
+   region anyway — a new binding is a permanent tax on every future body.
 
    **Count per ENTRY POINT, not per module — and `voxelize.wgsl` is why.** It
    declares ELEVEN `var<storage>` across 3 groups, which looks like an
