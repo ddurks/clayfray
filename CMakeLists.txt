@@ -238,6 +238,14 @@ if(EMSCRIPTEN)
   # to read when a frame does not appear.
   target_link_options(clayfray PRIVATE
     "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/web/shell.html")
+  # A standalone capability probe, copied beside the build. It touches none of
+  # the wasm, so it separates "this browser/origin has no WebGPU" from "our
+  # code broke" — which is the first fork in the road every time a frame does
+  # not appear, and it also prints the device's real
+  # maxStorageBuffersPerShaderStage (see trap 8).
+  add_custom_command(TARGET clayfray POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_SOURCE_DIR}/web/webgpu-check.html $<TARGET_FILE_DIR:clayfray>)
   set_source_files_properties(${CMAKE_SOURCE_DIR}/web/shell.html PROPERTIES
     GENERATED FALSE)
   set_target_properties(clayfray PROPERTIES SUFFIX ".html")

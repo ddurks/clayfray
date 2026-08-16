@@ -90,12 +90,24 @@
   window.addEventListener('resize', sizeCanvas);
   sizeCanvas();
 
-  // WebGPU needs a secure origin. Say so plainly rather than letting the
-  // module fail later with "no adapter", which reads as a driver problem.
-  if (!navigator.gpu) {
-    statusEl.textContent =
-      'WebGPU unavailable.\nNeeds a recent Chrome/Edge (or Safari 18+) over ' +
-      'http://localhost or https — not file://';
+  // Distinguish the two failures, because they have different fixes and
+  // conflating them sends people chasing TLS when the real cause is a flag.
+  // http://localhost IS a secure origin; file:// is not.
+  if (!window.isSecureContext) {
+    statusEl.innerHTML =
+      '<b>Insecure origin.</b><br>WebGPU needs https:// or http://localhost' +
+      '<br>(a file:// URL will not work).';
+    logEl.classList.add('show');
+  } else if (!navigator.gpu) {
+    const safari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    statusEl.innerHTML = safari
+      ? '<b>WebGPU is switched off in this Safari.</b><br>' +
+        'Safari &gt; Settings &gt; Advanced &gt; "Show features for web developers",' +
+        '<br>then Develop &gt; Feature Flags &gt; WebGPU. Reload after enabling.' +
+        '<br><br>Chrome works without any of that.'
+      : '<b>This browser has no WebGPU.</b><br>' +
+        'Chrome/Edge 113+, or Safari 26+ with the WebGPU feature flag on.';
+    logEl.classList.add('show');
   }
 
   var Module = {

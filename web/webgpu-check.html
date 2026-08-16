@@ -1,0 +1,34 @@
+<!doctype html><meta charset=utf-8><title>WebGPU check</title>
+<style>body{font:14px ui-monospace,Menlo,monospace;background:#111;color:#ddd;padding:24px;line-height:1.7}
+b{color:#fff}.ok{color:#7fdc7f}.bad{color:#ff7f7f}</style>
+<h2>WebGPU capability check</h2><pre id=o>running…</pre>
+<script>
+const o = document.getElementById('o');
+const L = [];
+const say = (k,v,good) => L.push(`${k.padEnd(26)} <span class="${good===undefined?'':good?'ok':'bad'}">${v}</span>`);
+(async () => {
+  say('URL', location.href);
+  say('isSecureContext', window.isSecureContext, window.isSecureContext);
+  say('navigator.gpu', !!navigator.gpu ? 'present' : 'MISSING', !!navigator.gpu);
+  say('userAgent', navigator.userAgent.slice(0,90));
+  if (navigator.gpu) {
+    try {
+      const a = await navigator.gpu.requestAdapter();
+      say('requestAdapter()', a ? 'got an adapter' : 'returned NULL', !!a);
+      if (a) {
+        const i = a.info || {};
+        say('  vendor/arch', `${i.vendor||'?'} / ${i.architecture||'?'}`);
+        say('  description', i.description || '(none)');
+        const lim = a.limits;
+        say('  maxStorageBuffersPerShaderStage', lim.maxStorageBuffersPerShaderStage,
+            lim.maxStorageBuffersPerShaderStage >= 8);
+        say('  maxTextureDimension3D', lim.maxTextureDimension3D);
+        say('  maxBufferSize (MB)', Math.round(lim.maxBufferSize/1e6));
+        const d = await a.requestDevice();
+        say('requestDevice()', d ? 'OK' : 'failed', !!d);
+      }
+    } catch (e) { say('ERROR', e.message, false); }
+  }
+  o.innerHTML = L.join('\n');
+})();
+</script>

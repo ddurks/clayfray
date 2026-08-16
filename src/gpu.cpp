@@ -438,12 +438,25 @@ void Gpu::initAsync(SDL_Window* window, std::function<void(bool)> onReady) {
     const wgpu::RequestAdapterOptions opts = adapterOptions();
     requestAdapter(opts, wgpu::CallbackMode::AllowSpontaneous, [this, window, ready]() {
         if (!adapter) {
+            // Do NOT lead with "secure origin" here. The two failures look
+            // identical from C++ but have different fixes, and guessing wrong
+            // sends people chasing TLS when the real cause is a browser flag:
+            //   navigator.gpu MISSING  -> the browser has no WebGPU, or it is
+            //                             switched off. Safari: enable
+            //                             Settings > Advanced > "Show features
+            //                             for web developers", then Develop >
+            //                             Feature Flags > WebGPU.
+            //   navigator.gpu PRESENT  -> WebGPU exists but returned no
+            //                             adapter (insecure origin, blocklisted
+            //                             GPU, headless). http://localhost IS a
+            //                             secure origin; file:// is not.
+            // The shell's JS can tell these apart and says which one it is;
+            // this message just points at it rather than asserting a cause.
             std::fprintf(stderr,
-                         "wgpu: no adapter. In a browser this is almost always "
-                         "WebGPU itself being unavailable: it needs a "
-                         "WebGPU-capable browser AND a secure origin "
-                         "(https:// or http://localhost — opening the .html "
-                         "as a file:// URL will not work).\n");
+                         "wgpu: no adapter — nothing will render. The page "
+                         "banner says which of the two causes it is (no "
+                         "WebGPU in this browser, vs WebGPU present but no "
+                         "adapter).\n");
             (*ready)(false);
             return;
         }
