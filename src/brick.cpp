@@ -136,7 +136,7 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
     volume = makeStorage(dev, kVolumeBytes, "brick volume");
     distPool = makeStorage(dev, kMaxBricks * 256ull * 4ull, "brick dist pool");
     albedoPool = makeStorage(dev, kMaxBricks * 512ull * 4ull, "brick albedo pool");
-    counters_ = makeStorage(dev, 16, "brick counters");
+    counters_ = makeStorage(dev, kCounterBytes, "brick counters");
     freelist_ = makeStorage(dev, kMaxBricks * 4ull, "brick freelist");
     jfaB_ = makeStorage(dev, cells * 4ull, "jfa B");
     coarseB_ = makeStorage(dev, cells * 4ull, "coarse dist B");
@@ -230,12 +230,12 @@ bool BrickSystem::init(Gpu& gpu, const std::string& editSrc, const std::string& 
 void BrickSystem::debugStats(const char* label) {
     const uint32_t cells = kGrid * kGrid * kGrid;
     wgpu::BufferDescriptor desc{};
-    desc.size = cells * 4ull + 16;
+    desc.size = cells * 4ull + kCounterBytes;
     desc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
     wgpu::Buffer rb = gpu_->device.CreateBuffer(&desc);
     wgpu::CommandEncoder enc = gpu_->device.CreateCommandEncoder();
     enc.CopyBufferToBuffer(volume, kIndOff, rb, 0, cells * 4ull);
-    enc.CopyBufferToBuffer(counters_, 0, rb, cells * 4ull, 16);
+    enc.CopyBufferToBuffer(counters_, 0, rb, cells * 4ull, kCounterBytes);
     wgpu::CommandBuffer cmd = enc.Finish();
     gpu_->queue.Submit(1, &cmd);
     bool ok = false;
@@ -258,10 +258,14 @@ void BrickSystem::debugStats(const char* label) {
             inside++;
         }
     }
+    // allocTop is the number to size kMaxBricks from: it is the bump
+    // allocator's all-time high-water mark, so it survives frees. `spill` is
+    // nonzero only if the pool actually refused an allocation.
     std::printf("[brick %s] alloc=%u freshLeft=%u insideEmpty=%u maxIdx=%u "
-                "allocTop=%u freeTop=%u volFp=%u\n",
-                label, alloc, fresh, inside, maxIdx, d[cells], d[cells + 1],
-                d[cells + 3]);
+                "allocTop=%u/%u (%.1f%% of pool) freeTop=%u volFp=%u spill=%u\n",
+                label, alloc, fresh, inside, maxIdx, d[cells], kMaxBricks,
+                100.0 * d[cells] / kMaxBricks, d[cells + 1], d[cells + 3],
+                d[cells + 4]);
     rb.Unmap();
 }
 
@@ -562,7 +566,10 @@ void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
 
 void BrickSystem::encodeImport(wgpu::CommandEncoder& enc) {
     enc.ClearBuffer(volume, kIndOff, kCellBytes);
-    enc.ClearBuffer(counters_, 0, 16);
+    // whole block, spill counter included: a re-import starts from an empty
+    // pool, so a spill it reports afterwards is this import's, not a stale one
+    enc.ClearBuffer(counters_, 0, kCounterBytes);
+    capSpillSeen_ = 0;
     // per-pipeline bind groups against each auto layout
     auto bindc2 = [&](wgpu::ComputePipeline& pipe, uint32_t group,
                       std::vector<BindBuf> es) {
@@ -697,7 +704,7 @@ bool BrickSystem::save(SnapWriter& w) {
     // a FORMAT change — snapshot.cpp's kVersion is bumped to match and stale
     // .snap files refuse cleanly instead of loading garbage.
     const Sect sects[] = {
-        {"BCNT", counters_, 16},
+        {"BCNT", counters_, kCounterBytes},
         {"BFRE", freelist_, kMaxBricks * 4ull},
         {"BJFA", volume, cells * 4ull, kSeedOff},   // jfaB_ is per-pass scratch
         {"BCRS", volume, cells * 4ull, kCoarseOff}, // coarseB_ likewise
@@ -738,7 +745,7 @@ bool BrickSystem::load(SnapReader& r) {
     };
     const Sect sects[] = {
         {"BIND", volume, cells * 4ull, kIndOff},
-        {"BCNT", counters_, 16},
+        {"BCNT", counters_, kCounterBytes},
         {"BFRE", freelist_, kMaxBricks * 4ull},
         {"BJFA", volume, cells * 4ull, kSeedOff},
         {"BCRS", volume, cells * 4ull, kCoarseOff},
@@ -768,7 +775,27 @@ bool BrickSystem::load(SnapReader& r) {
     snapGen_++;
     for (VolSlot& s : volSlots_) s.copied = false;
     editsSinceCap_ = 0;
+    // the loaded counter block carries its own spill count; report it afresh
+    capSpillSeen_ = 0;
     return true;
+}
+
+// Copy the counter block out for the async watermark/spill check. Called for
+// edits (every 60), and also after import and bake: a right-sized pool is most
+// likely to bite at IMPORT, where the whole surface shell is allocated in one
+// dispatch, and the edits-only arming used to make that case invisible.
+void BrickSystem::armCapacityPoll(wgpu::CommandEncoder& enc) {
+    if (capMapPending_ || capPollArmed_) return;
+    editsSinceCap_ = 0;
+    if (!capRead_) {
+        wgpu::BufferDescriptor desc{};
+        desc.label = "brick capacity readback";
+        desc.size = kCounterBytes;
+        desc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+        capRead_ = gpu_->device.CreateBuffer(&desc);
+    }
+    enc.CopyBufferToBuffer(counters_, 0, capRead_, 0, kCounterBytes);
+    capPollArmed_ = true; // renderer maps it after submit
 }
 
 void BrickSystem::finishCapacityPoll() {
@@ -776,24 +803,40 @@ void BrickSystem::finishCapacityPoll() {
     capPollArmed_ = false;
     capMapPending_ = true;
     auto alive = alive_;
-    capRead_.MapAsync(wgpu::MapMode::Read, 0, 16, wgpu::CallbackMode::AllowSpontaneous,
-                      [this, alive](wgpu::MapAsyncStatus status, wgpu::StringView) {
-                          if (!*alive) return;
-                          if (status == wgpu::MapAsyncStatus::Success) {
-                              const uint32_t* c =
-                                  (const uint32_t*)capRead_.GetConstMappedRange(0, 16);
-                              uint32_t used = c[0] - std::min(c[0], c[1]);
-                              if (!capWarned_ && used > kMaxBricks * 9 / 10) {
-                                  capWarned_ = true;
-                                  std::fprintf(stderr,
-                                               "[brick] pool nearly full: %u/%u bricks "
-                                               "(sculpting may develop holes)\n",
-                                               used, kMaxBricks);
-                              }
-                              capRead_.Unmap();
-                          }
-                          capMapPending_ = false;
-                      });
+    capRead_.MapAsync(
+        wgpu::MapMode::Read, 0, kCounterBytes, wgpu::CallbackMode::AllowSpontaneous,
+        [this, alive](wgpu::MapAsyncStatus status, wgpu::StringView) {
+            if (!*alive) return;
+            if (status == wgpu::MapAsyncStatus::Success) {
+                const uint32_t* c =
+                    (const uint32_t*)capRead_.GetConstMappedRange(0, kCounterBytes);
+                uint32_t used = c[0] - std::min(c[0], c[1]);
+                const uint32_t spilled = c[4];
+                // Actually overflowed: cells were refused a brick. This is the
+                // loud one — it means visible damage (holes on import, carves
+                // that no-op and read solid), not just a tight fit. Re-fires
+                // whenever the count grows so a pool that keeps spilling keeps
+                // saying so, but never more than once per poll.
+                if (spilled > capSpillSeen_) {
+                    std::fprintf(stderr,
+                                 "[brick] POOL OVERFLOW: %u cell allocations refused "
+                                 "(%u total), pool %u/%u bricks. Carves in those "
+                                 "cells no-op and read solid; an import spill "
+                                 "leaves holes. Raise kMaxBricks in src/brick.h.\n",
+                                 spilled - capSpillSeen_, spilled, used, kMaxBricks);
+                    capSpillSeen_ = spilled;
+                }
+                if (!capWarned_ && used > kMaxBricks * 9 / 10) {
+                    capWarned_ = true;
+                    std::fprintf(stderr,
+                                 "[brick] pool nearly full: %u/%u bricks "
+                                 "(sculpting may develop holes)\n",
+                                 used, kMaxBricks);
+                }
+                capRead_.Unmap();
+            }
+            capMapPending_ = false;
+        });
 }
 
 void BrickSystem::encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e, int slot) {
@@ -897,18 +940,24 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
         encodeImport(enc);
         encodeJfa(enc);
         importPending_ = false;
+        // Import allocates the ENTIRE surface shell in one dispatch, so it is
+        // the likeliest place for a right-sized pool to spill — and a spill
+        // here imports a fighter with holes. Always poll it.
+        armCapacityPoll(enc);
         return;
     }
     if (bakePending_) {
         // fresh volume: zero the indirection (empty-outside) and counters
         enc.ClearBuffer(volume, kIndOff, kCellBytes);
-        enc.ClearBuffer(counters_, 0, 16);
+        enc.ClearBuffer(counters_, 0, kCounterBytes);
+        capSpillSeen_ = 0; // counters[4] just went back to zero
         BrickEdit bake{};
         bake.mode = 0;
         gen_++;
         encodeOp(enc, bake, 0);
         encodeJfa(enc);
         bakePending_ = false;
+        armCapacityPoll(enc);
         return;
     }
     if (!pending_.empty()) {
@@ -951,16 +1000,6 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
       }
       encodeJfa(enc);
       if (!std::getenv("CLAYFRAY_NO_REDIST")) encodeRedistance(enc);
-        if (++editsSinceCap_ >= 60 && !capMapPending_) {
-            editsSinceCap_ = 0;
-            if (!capRead_) {
-                wgpu::BufferDescriptor desc{};
-                desc.size = 16;
-                desc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
-                capRead_ = gpu_->device.CreateBuffer(&desc);
-            }
-            enc.CopyBufferToBuffer(counters_, 0, capRead_, 0, 16);
-            capPollArmed_ = true; // renderer maps it after submit
-        }
+        if (++editsSinceCap_ >= 60) armCapacityPoll(enc);
     }
 }

@@ -19,6 +19,50 @@ class GroundClay {
     static constexpr float kTexel = 3.5f / kN;
     static constexpr float kBaseTop = 0.058f; // tallest pebble the base can hold
 
+    // ---- base + height + color share ONE buffer ----
+    // Core WebGPU guarantees a shader stage only EIGHT storage buffers
+    // (maxStorageBuffersPerShaderStage). `trace` bound nine: three per fighter
+    // (brick.h packs each fighter's per-cell arrays for the same reason) plus
+    // this trio. Desktop Chrome reports the adapter's real limit so it worked,
+    // but a mobile browser reporting the guaranteed minimum would fail to
+    // CREATE the trace pipeline — the exact failure mode that made macOS draw
+    // nothing when Metal's 10 was exceeded (CLAUDE.md trap 8). Packing the
+    // trio takes trace to seven, inside the guaranteed minimum.
+    //
+    // Same technique as brick.h: a pass that WRITES a region binds just that
+    // region as a sub-range, so ground.wgsl keeps its own three bindings and
+    // needs no index arithmetic; the tracer binds the whole buffer once and
+    // adds a base index (G_BASE/G_HEIGHT/G_COLOR from wgslConstants(), via the
+    // accessors at the top of ground_read.wgsl).
+    //
+    // Every write-side binding of these regions is read_write ON PURPOSE:
+    // Dawn rejects a buffer that is writable and read-only within one pass and
+    // tracks that per BUFFER, not per bound range — so a single `read` binding
+    // on any region would break every pass that writes another. The tracer's
+    // read-only binding is safe only because it is a different pass.
+    //
+    // Region map (kN = 512, so a region is exactly 1 MiB and already 256-byte
+    // aligned; kAlign guards the invariant if kN ever stops being a power of
+    // two):
+    //     0x000000  base    512*512 f32   floor drape height, baked once
+    //     0x100000  height  512*512 f32   deposited clay thickness
+    //     0x200000  color   512*512 u32   packed rgba8 clay color
+    //     0x300000  = kFieldBytes (3 MiB)
+    static constexpr uint64_t kTexels = (uint64_t)kN * kN;
+    static constexpr uint64_t kTexelBytes = kTexels * 4;
+    static constexpr uint64_t kAlign = 256; // minStorageBufferOffsetAlignment
+    static constexpr uint64_t kRegionStride = (kTexelBytes + kAlign - 1) & ~(kAlign - 1);
+    static constexpr uint64_t kBaseOff = 0;
+    static constexpr uint64_t kHeightOff = kRegionStride;
+    static constexpr uint64_t kColorOff = kRegionStride * 2;
+    static constexpr uint64_t kFieldBytes = kColorOff + kRegionStride;
+
+    // The region map above as WGSL, stitched into every shader root by the
+    // renderer's `//#constants` directive alongside BrickSystem's block. The
+    // read side must NOT hand-copy these — kN is a snapshot-versioned size
+    // constant, and a drifted copy addresses the wrong region.
+    static std::string wgslConstants();
+
     bool init(Gpu& gpu, const std::string& src);
     bool rebuildPipelines(const std::string& src); // shader hot-reload
     // Deposit volumeM3 of clay centered at (x, z), linear color.
@@ -42,7 +86,9 @@ class GroundClay {
     // are not in the uniform buffer, so nothing else would notice a splat.
     uint32_t generation() const { return gen_; }
 
-    wgpu::Buffer base, height, color;
+    // base + height + color packed at kBaseOff/kHeightOff/kColorOff above.
+    // One buffer, one trace binding.
+    wgpu::Buffer field;
 
   private:
     struct Op {

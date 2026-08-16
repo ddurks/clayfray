@@ -25,9 +25,10 @@ Headless flags: `--screenshot PATH --size WxH --frames N --time T --aa N`,
 `Renderer::addPlayer(pose)` adds a fighter and returns its index; player 0 is
 the hero. **The cap is 2** — each body needs its own volume and WGSL bindings
 are static, so 3+ requires the per-player stride in PLAN.md ("fighters are
-SLICES"). That cap is now enforced by hardware, not taste: a third fighter's
-3 bindings would put `trace` at 12 of Metal's 10 (trap 8). ctl exposes
-`foe.enabled`, `foe.pos`, `foe.yaw`.
+SLICES"). That cap is now enforced by the API, not taste: a third fighter's
+3 bindings would put `trace` at 10, over the 8 storage buffers per stage that
+core WebGPU guarantees (trap 8). ctl exposes `foe.enabled`, `foe.pos`,
+`foe.yaw`.
 
 Both fighters bill to ONE conservation ledger: clay off either body becomes
 the same gobs on the same arena.
@@ -260,24 +261,45 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    leaves the volume box, or two brushes closer than the narrow band, breaks
    the AABB clip that separates the pieces and both are reported.
 
-8. **A shader stage gets 10 storage buffers on Metal, and `trace` uses 9.**
-   Metal gives a function 31 buffer slots; Dawn spends one on buffer lengths
-   and reserves its default uniform + vertex budget, leaving 10 — the adapter
-   genuinely reports that, so requesting full limits (which `gpu.cpp` already
-   does) buys nothing. M5's second fighter took `trace` to 14 bindings and the
-   pipeline failed to CREATE on macOS: `CreateComputePipeline` errored and
-   every frame after it was invalid, while Vulkan (effectively unbounded)
-   showed nothing wrong. So each fighter's per-cell arrays (indirection,
-   JFA seeds, coarse — there was a fourth, cell weights, until the skeleton
-   went) are REGIONS of one `volume` buffer: write
-   passes bind their own region as a sub-range, which is why the write shaders
-   still declare them separately, and the tracer binds the buffer once and
-   adds a base index (`CELL_*` from `wgslConstants`, accessors at the top of
-   `brick_read.wgsl`). Budget: 3 per fighter + 3 ground = 9. **Adding a
-   storage binding to trace.wgsl breaks macOS** — grow a region, or pack the
-   ground trio the same way, instead. Keep every write-side binding of those
-   regions `read_write`: Dawn rejects a buffer that is writable and read-only
-   within one pass and tracks that per BUFFER, not per bound range.
+8. **Core WebGPU guarantees a stage only 8 storage buffers, and `trace` uses
+   7.** Two limits stack here, and the SMALLER one is now the binding budget:
+
+   - **Core WebGPU: 8** (`maxStorageBuffersPerShaderStage`). This is the
+     number that matters, because it is what a conformant implementation may
+     report at minimum. Desktop Chrome reports the adapter's real (larger)
+     limit, so a 9-binding `trace` ran fine there — but a mobile browser
+     reporting the guaranteed minimum would fail to create the trace pipeline
+     outright, which is the same silent-black-screen failure as below.
+   - **Metal: 10.** Metal gives a function 31 buffer slots; Dawn spends one on
+     buffer lengths and reserves its default uniform + vertex budget, leaving
+     10 — the adapter genuinely reports that, so requesting full limits (which
+     `gpu.cpp` already does) buys nothing. M5's second fighter took `trace` to
+     14 and the pipeline failed to CREATE on macOS: `CreateComputePipeline`
+     errored and every frame after it was invalid, while Vulkan (effectively
+     unbounded) showed nothing wrong.
+
+   Two rounds of packing got `trace` from 14 to 7. Each fighter's per-cell
+   arrays (indirection, JFA seeds, coarse — there was a fourth, cell weights,
+   until the skeleton went) are REGIONS of one `volume` buffer, and the
+   ground's base/height/color are REGIONS of one `field` buffer. In both
+   cases: write passes bind their own region as a sub-range, which is why the
+   write shaders still declare them separately and need no index arithmetic,
+   and the tracer binds each buffer once and adds a base index (`CELL_*` from
+   `BrickSystem::wgslConstants` with accessors atop `brick_read.wgsl`; `G_*`
+   from `GroundClay::wgslConstants` with accessors atop `ground_read.wgsl`).
+   Region maps live in `src/brick.h` and `src/ground.h`.
+
+   Budget: **3 per fighter + 1 ground = 7 of 8**, i.e. ONE spare. **Adding a
+   storage binding to trace.wgsl costs the last of the mobile headroom** —
+   grow an existing region instead. Fighter #3 needs the per-fighter stride in
+   PLAN.md ("fighters are SLICES"), not three more bindings.
+
+   Keep every write-side binding of those regions `read_write`: Dawn rejects a
+   buffer that is writable and read-only within one pass and tracks that per
+   BUFFER, not per bound range — so one `read` binding on any region breaks
+   every pass that writes another. (`jfa.wgsl`'s `bDistRO` is declared
+   `read_write` purely for this reason.) The tracer's read-only bindings are
+   safe only because tracing is a different pass from every write.
 
 ## Verifying a conservation (M4.6) change
 

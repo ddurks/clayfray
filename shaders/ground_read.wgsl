@@ -4,13 +4,24 @@
 // slopes. Includers must already have declared the Uniforms `u`
 // (groundMeta: x = origin, y = texel, z = N, w = clay top bound).
 
-@group(1) @binding(7) var<storage, read> gBase: array<f32>;
-@group(1) @binding(8) var<storage, read> gHeight: array<f32>;
-@group(1) @binding(9) var<storage, read> gColor: array<u32>;
+// The three ground arrays (floor drape, deposited thickness, clay color) are
+// ONE buffer here, addressed through the G_* base indices in the //#constants
+// block. That is not packing for its own sake: core WebGPU guarantees a shader
+// stage only EIGHT storage buffers, and two fighters at three bindings each
+// plus a ground trio needs nine — a mobile browser reporting the guaranteed
+// minimum would fail to create the trace pipeline outright. See the region map
+// in src/ground.h.
+//
+// G_N / G_ORIGIN / G_TEXEL / G_BASE / G_HEIGHT / G_COLOR come from the
+// //#constants block in the including ROOT (trace.wgsl), generated from
+// src/ground.h. They used to be hand-copied here; don't reintroduce that.
+@group(1) @binding(7) var<storage, read> gField: array<u32>;
 
-const G_N: i32 = 512;
-const G_ORIGIN: f32 = -1.75;
-const G_TEXEL: f32 = 0.0068359375;
+// Base and height are f32 data in the shared u32 buffer; color is already u32.
+fn gBase(i: u32) -> f32 { return bitcast<f32>(gField[G_BASE + i]); }
+fn gHeight(i: u32) -> f32 { return bitcast<f32>(gField[G_HEIGHT + i]); }
+fn gColor(i: u32) -> u32 { return gField[G_COLOR + i]; }
+
 // vertical-distance Lipschitz guard: tolerates surface slope up to ~3
 const G_KLIP: f32 = 0.3;
 
@@ -35,7 +46,7 @@ fn groundThicknessAt(xz: vec2f) -> f32 {
   let f = g - floor(g);
   var h: array<f32, 4>;
   for (var k = 0; k < 4; k++) {
-    h[k] = gHeight[gTexIdx(t0 + vec2i(k & 1, k >> 1))];
+    h[k] = gHeight(gTexIdx(t0 + vec2i(k & 1, k >> 1)));
   }
   return mix(mix(h[0], h[1], f.x), mix(h[2], h[3], f.x), f.y);
 }
@@ -48,7 +59,7 @@ fn groundTopAt(xz: vec2f) -> f32 {
   var top: array<f32, 4>;
   for (var k = 0; k < 4; k++) {
     let idx = gTexIdx(t0 + vec2i(k & 1, k >> 1));
-    top[k] = gBase[idx] + gHeight[idx];
+    top[k] = gBase(idx) + gHeight(idx);
   }
   return mix(mix(top[0], top[1], f.x), mix(top[2], top[3], f.x), f.y);
 }
@@ -135,7 +146,7 @@ fn groundClaySmooth(p: vec3f) -> f32 {
 
 fn groundAlbedo(p: vec3f) -> vec3f {
   let g = (p.xz - vec2f(G_ORIGIN)) / G_TEXEL - 0.5;
-  let c = unpack4x8unorm(gColor[gTexIdx(vec2i(round(g)))]).rgb;
+  let c = unpack4x8unorm(gColor(gTexIdx(vec2i(round(g))))).rgb;
   // same handled-plasticine mottle the body wears
   return c * (0.82 + 0.32 * fbm(p * 9.0));
 }

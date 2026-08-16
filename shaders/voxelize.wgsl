@@ -31,10 +31,13 @@ const IND_IDX_MASK: u32 = 0x000FFFFFu;
 @group(1) @binding(1) var<storage, read_write> bDist: array<u32>;
 @group(1) @binding(2) var<storage, read_write> bAlbedo: array<u32>;
 // M-RIG: binding(3) was `bWeights`, 512 packed top-2 bone weights per brick —
-// kMaxBricks * 512 * 4 = 100.7 MB PER FIGHTER of GPU memory that was written
-// once at import and never read by any shader or by the renderer. It was
-// skeleton residue; with the armature gone it could never be read again.
+// a whole albedo-pool's worth of GPU memory PER FIGHTER (96 MiB at the then
+// kMaxBricks of 49152) that was written once at import and never read by any
+// shader or by the renderer. It was skeleton residue; with the armature gone
+// it could never be read again.
 
+// counters[4] is the pool-spill count — see the block comment on
+// BrickSystem::kCounterBytes in src/brick.h.
 @group(2) @binding(0) var<storage, read_write> counters: array<atomic<u32>>;
 @group(2) @binding(1) var<storage, read_write> freelist: array<u32>;
 
@@ -228,6 +231,11 @@ fn meshClassify(@builtin(global_invocation_id) gid: vec3u) {
   }
   if (brick >= MAX_BRICKS) {
     atomicSub(&counters[0], 1u);
+    // Pool exhausted mid-IMPORT. The indirection grid was just cleared, so
+    // this cell stays 0 = empty-outside and the fighter imports with a hole —
+    // far more visible than an edit spill, and the reason the capacity poll is
+    // armed after import too. counters[4] makes it say so instead of guessing.
+    atomicAdd(&counters[4], 1u);
     return;
   }
   // no FRESH bit: import fill writes unconditionally, and a leftover FRESH

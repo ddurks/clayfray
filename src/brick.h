@@ -83,7 +83,59 @@ class BrickSystem {
     static constexpr float kOriginNudge = kVoxel * 0.5f;
     static constexpr float kOrigin[3] = {-kExtent / 2 + kOriginNudge, -0.1582f,
                                          -kExtent / 2 + kOriginNudge};
-    static constexpr uint32_t kMaxBricks = 49152;
+    // ---- brick pool capacity: SIZED FROM THE GEOMETRY, not from taste ----
+    // This is the single biggest number in the app's memory budget: it sizes
+    // distPool (kMaxBricks * 256 * 4) and albedoPool (kMaxBricks * 512 * 4)
+    // PER FIGHTER, i.e. 3 MiB per 1k bricks per fighter, doubled by the foe.
+    // It was 49152 — a guess inherited from M0, never re-derived after kGrid
+    // fell from 74 to 50 — which is why the pools were ~7x oversized.
+    //
+    // A brick exists only for a cell whose CENTRE is within 2.1 SPAN of the
+    // surface (voxelize.wgsl meshClassify / edit.wgsl classify). So the
+    // allocated set is a shell ~4.2 cells thick wrapped around the skin, and
+    // the count is surface-area driven: ~4.2 * A / SPAN^2.
+    //
+    // Measured against assets/fighter.glb at kGrid=50 by replaying the
+    // classify rule on the CPU (exact point-triangle distance to every cell
+    // centre, all three brushes: body + hand.rest + hand.grab):
+    //
+    //   mesh surface area          1.2601 m^2
+    //   SPAN^2                     8.0248e-4 m^2
+    //   analytic 4.2*A/SPAN^2      6,595 bricks
+    //   ACTUAL cells within 2.1 SPAN   6,748 bricks   <- the import floor
+    //   solid (inside) cells           3,978
+    //   alloc UNION inside             8,363 bricks   <- see below
+    //
+    // 8,363 is a HARD ceiling for carving. A carve only ever moves the surface
+    // into clay that is already there, so every cell it newly allocates was
+    // either in the band already or was solid interior; in the limit where the
+    // fighter is minced to swiss cheese at cell scale, the allocated set is
+    // exactly that union. Carving alone therefore CANNOT overflow the pool.
+    //
+    // Adds are the open-ended direction: they create surface in air, so they
+    // are bounded only by the volume box. The worst case on record is
+    // CLAYFRAY_TEST_ADDSTRESS (60 adds of r=0.04 marching along an arc): each
+    // deposit allocates a ball of radius 0.04 + 2.1*SPAN ~ 0.0995 m, the arc
+    // steps ~0.057 m, so it sweeps ~pi*0.0995^2*0.057 / SPAN^3 ~ 78 new cells
+    // per step, ~4.7k total, landing near ~11.5k with the import floor.
+    //
+    // 16384 is 2.4x the import floor, 2.0x the hard carve ceiling and ~1.4x
+    // that add-stress estimate, and costs 16 MiB + 32 MiB = 48 MiB per fighter
+    // instead of 144 MiB. Overflow past it is graceful (see finishCapacityPoll
+    // and the spill counter in brick.cpp), never corrupting.
+    //
+    // RE-MEASURE THIS if kGrid changes, if the artist re-exports a
+    // significantly larger fighter, or before trusting it on a long play
+    // session: bricks scale with kGrid^2, so kGrid=74 would want ~4x this.
+    //   CLAYFRAY_DEBUG_STATS=1 ./build/clayfray --carve-test ...   -> allocTop
+    //   CLAYFRAY_TEST_ADDSTRESS=1 with the same flags               -> the peak
+    static constexpr uint32_t kMaxBricks = 16384;
+    // The brick index is stored in the low 20 bits of an indirection word
+    // (IND_IDX_MASK = 0x000FFFFF), so the encoding caps out at 1,048,575 —
+    // shrinking the pool only uses less of that range. There is also a
+    // structural ceiling of kCellCount (one brick per cell, at most), which
+    // no value above 125,000 could ever reach at kGrid=50.
+    static_assert(kMaxBricks <= 0x000FFFFF, "brick index must fit IND_IDX_MASK");
     static constexpr uint32_t kDirtyCap = 65535; // indirect dispatch x-dim limit
     // Watertight-parity lattice: one bit per voxel along x, packed into rows.
     static constexpr uint32_t kAxisVox = kGrid * kBrickUsable + 1;
@@ -213,18 +265,30 @@ class BrickSystem {
     //   seed   — canonical JFA output (jfaA), read by tracer/pick
     //   coarse — per-cell signed coarse distance, read by tracer
     wgpu::Buffer volume;
-    // NOTE (mobile memory): these two are sized by kMaxBricks (49152) but
-    // measured usage is ~12.4k bricks, so both are roughly 4x oversized. Left
-    // alone here on purpose — shrinking kMaxBricks has capacity-overflow
-    // consequences and is its own change.
+    // Sized by kMaxBricks: 16 MiB + 32 MiB per fighter. See the capacity
+    // derivation on kMaxBricks — these two are the app's memory budget.
     wgpu::Buffer distPool, albedoPool;
 
     // Blocking readbacks; debug only.
     void debugStats(const char* label);
     void debugScanField();
 
-    // Async pool watermark check; call after queue submit.
+    // Async pool watermark check; call after queue submit. Reports both the
+    // high-water mark and any allocations the shaders had to DROP.
     void finishCapacityPoll();
+
+    // The allocator's shared counter block, mirrored in edit.wgsl /
+    // voxelize.wgsl / redistance.wgsl as `counters: array<atomic<u32>>`:
+    //   [0] allocTop  bump pointer (also the all-time high-water mark)
+    //   [1] freeTop   entries currently on the freelist
+    //   [2] dirty     redistance work-list length
+    //   [3] volFp     |occupancy delta| of the op being measured, fixed point
+    //   [4] spill     allocations REFUSED because the pool was full
+    // Slot 4 exists so a full pool cannot fail silently: the shaders drop the
+    // cell (keeping its previous indirection word) and count the drop, and
+    // finishCapacityPoll turns that into a warning. Sized to 32 B rather than
+    // 20 so the block stays 16-byte aligned and has room for the next counter.
+    static constexpr uint64_t kCounterBytes = 32;
 
     // Conservation: arm MapAsync on completed volume copies (call after
     // submit, like finishCapacityPoll) and drain finished measurements.
@@ -281,9 +345,14 @@ class BrickSystem {
     // volume's own import pass, so it is NOT shared.
     wgpu::Buffer vxParityBuf_;
     bool importPending_ = false;
+    void armCapacityPoll(wgpu::CommandEncoder& enc);
     wgpu::Buffer capRead_;
     int editsSinceCap_ = 0;
     bool capPollArmed_ = false, capMapPending_ = false, capWarned_ = false;
+    // Spill count already reported. A full pool keeps dropping cells every
+    // frame, so the warning re-fires only when the count GROWS — one line per
+    // poll at worst, never a per-frame spam.
+    uint32_t capSpillSeen_ = 0;
 
     // Volume readback pool: one op measures per frame, but maps only
     // complete once the GPU catches up — headless runs queue ~100 frames

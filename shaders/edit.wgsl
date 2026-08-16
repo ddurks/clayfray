@@ -26,7 +26,9 @@ struct EditParams {
 @group(1) @binding(0) var<storage, read_write> bIndirection: array<u32>;
 @group(1) @binding(1) var<storage, read_write> bDist: array<u32>;
 @group(1) @binding(2) var<storage, read_write> bAlbedo: array<u32>;
-@group(2) @binding(0) var<storage, read_write> counters: array<atomic<u32>>; // 0 allocTop, 1 freeTop
+// 0 allocTop, 1 freeTop, 2 dirty, 3 volFp, 4 pool spill — the full map is on
+// BrickSystem::kCounterBytes in src/brick.h.
+@group(2) @binding(0) var<storage, read_write> counters: array<atomic<u32>>;
 @group(2) @binding(1) var<storage, read_write> freelist: array<u32>;
 
 fn cellIndex(c: vec3i) -> u32 {
@@ -140,7 +142,13 @@ fn classify(@builtin(global_invocation_id) gid: vec3u) {
   }
   if (brick >= MAX_BRICKS) {
     atomicSub(&counters[0], 1u);
-    return; // pool exhausted; skip (logged CPU-side via counter readback later)
+    // Pool exhausted. Leave bIndirection[ci] ALONE: the cell keeps whatever it
+    // said before, so a carve that cannot allocate simply leaves that cell
+    // reporting solid rather than writing a half-built brick. Graceful, but it
+    // must never be silent — counters[4] is the spill count the CPU polls and
+    // warns on (BrickSystem::finishCapacityPoll).
+    atomicAdd(&counters[4], 1u);
+    return;
   }
   bIndirection[ci] = IND_ALLOC | IND_FRESH | (select(0u, IND_INSIDE, inside)) | brick;
 }

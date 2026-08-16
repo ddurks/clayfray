@@ -37,10 +37,13 @@ std::string readFileRaw(const std::string& path) {
 
 // Stitch //#include name.wgsl lines (recursive, no duplicate guard — the
 // include graph is a tree by construction) and expand //#constants into the
-// volume geometry block generated from src/brick.h.
+// generated geometry blocks: the volume block from src/brick.h and the ground
+// field's region map from src/ground.h.
 //
 // //#constants goes in each compiled ROOT, never in an include: brick_read is
-// pulled into both trace and pick, and WGSL rejects a duplicate const.
+// pulled into both trace and pick, and WGSL rejects a duplicate const. A root
+// that uses only one of the two blocks (pick.wgsl reads no ground) just gets
+// unused consts, which WGSL allows.
 std::string loadShader(const char* name) {
     std::string src = readFileRaw(shaderPath(name));
     std::stringstream out;
@@ -50,6 +53,7 @@ std::string loadShader(const char* name) {
         const std::string tag = "//#include ";
         if (line.rfind("//#constants", 0) == 0) {
             out << BrickSystem::wgslConstants();
+            out << GroundClay::wgslConstants();
         } else if (line.rfind(tag, 0) == 0) {
             std::string inc = line.substr(tag.size());
             while (!inc.empty() && (inc.back() == ' ' || inc.back() == '\r')) inc.pop_back();
@@ -294,10 +298,13 @@ void Renderer::buildBindGroups() {
         traceBind_ = dev.CreateBindGroup(&desc);
     }
     {
-        // One binding covers indirection + seeds + coarse + cell weights: they
-        // are regions of brick_.volume, and Metal allows a stage only 10
-        // storage buffers (brick.h). Six here plus fighter 1's three = 9.
-        wgpu::BindGroupEntry entries[6] = {};
+        // Two packed buffers, not five: indirection + seeds + coarse are
+        // regions of brick_.volume (brick.h), and the ground's base + height +
+        // color are regions of ground_.field (ground.h). Four here plus
+        // fighter 1's three puts `trace` at SEVEN storage buffers — inside the
+        // EIGHT that core WebGPU guarantees a stage, which is the limit that
+        // governs mobile. See CLAUDE.md trap 8.
+        wgpu::BindGroupEntry entries[4] = {};
         entries[0].binding = 0;
         entries[0].buffer = brick_.volume;
         entries[1].binding = 1;
@@ -305,14 +312,10 @@ void Renderer::buildBindGroups() {
         entries[2].binding = 2;
         entries[2].buffer = brick_.albedoPool;
         entries[3].binding = 7;
-        entries[3].buffer = ground_.base;
-        entries[4].binding = 8;
-        entries[4].buffer = ground_.height;
-        entries[5].binding = 9;
-        entries[5].buffer = ground_.color;
+        entries[3].buffer = ground_.field;
         wgpu::BindGroupDescriptor desc{};
         desc.layout = tracePipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 6;
+        desc.entryCount = 4;
         desc.entries = entries;
         traceBrickBind_ = dev.CreateBindGroup(&desc);
     }
@@ -2469,7 +2472,11 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     }
     wgpu::CommandBuffer cmd = encoder.Finish();
     gpu_->queue.Submit(1, &cmd);
+    // BOTH fighters: the foe imports and is carveable, so it has its own pool
+    // to overflow. Its poll used to be armed and never finished, which left
+    // capPollArmed_ stuck true and made a foe-side overflow unreportable.
     brick_.finishCapacityPoll();
+    foe_.finishCapacityPoll();
     brick_.pollVolumes();
     foe_.pollVolumes();
     if (queryThisFrame) {

@@ -25,12 +25,42 @@ struct SplatParamsCpu {
     int32_t tile[4]; // xy first texel, zw dims
 };
 
+// A bind group entry that may point at a SUB-RANGE of a buffer. base, height
+// and color are regions of one `field` buffer (see ground.h), so each pass
+// binds only the region it touches and ground.wgsl keeps its own bindings.
+struct BindBuf {
+    uint32_t binding;
+    wgpu::Buffer buf;
+    uint64_t offset = 0;
+    uint64_t size = wgpu::kWholeSize;
+};
+
 } // namespace
+
+// Emitted into each shader root by the renderer's `//#constants` directive,
+// next to BrickSystem::wgslConstants(). %.9g round-trips a float exactly.
+std::string GroundClay::wgslConstants() {
+    char buf[1024];
+    std::snprintf(
+        buf, sizeof(buf),
+        "// GENERATED from GroundClay in src/ground.h — do not hand-copy these\n"
+        "// into a shader. G_BASE/G_HEIGHT/G_COLOR are base indices (in u32\n"
+        "// elements) of the three regions inside the one `gField` storage\n"
+        "// buffer the tracer binds; see the region map in src/ground.h.\n"
+        "const G_N: i32 = %d;\n"
+        "const G_ORIGIN: f32 = %.9g;\n"
+        "const G_TEXEL: f32 = %.9g;\n"
+        "const G_BASE: u32 = %uu;\n"
+        "const G_HEIGHT: u32 = %uu;\n"
+        "const G_COLOR: u32 = %uu;\n",
+        kN, (double)kOrigin, (double)kTexel, (uint32_t)(kBaseOff / 4),
+        (uint32_t)(kHeightOff / 4), (uint32_t)(kColorOff / 4));
+    return buf;
+}
 
 bool GroundClay::init(Gpu& gpu, const std::string& src) {
     gpu_ = &gpu;
     wgpu::Device& dev = gpu.device;
-    const uint64_t texels = (uint64_t)kN * kN;
 
     auto storage = [&](uint64_t size, const char* label) {
         wgpu::BufferDescriptor desc{};
@@ -40,9 +70,9 @@ bool GroundClay::init(Gpu& gpu, const std::string& src) {
                      wgpu::BufferUsage::CopySrc; // CopySrc: snapshot readback
         return dev.CreateBuffer(&desc);
     };
-    base = storage(texels * 4, "ground base");
-    height = storage(texels * 4, "ground height");
-    color = storage(texels * 4, "ground color");
+    // One buffer for base + height + color (region map in ground.h — core
+    // WebGPU guarantees a stage only 8 storage buffers, and trace bound 9).
+    field = storage(kFieldBytes, "ground field");
     for (int i = 0; i < kOpsPerFrame; i++) {
         wgpu::BufferDescriptor desc{};
         desc.label = "ground splat params";
@@ -71,12 +101,13 @@ bool GroundClay::rebuildPipelines(const std::string& src) {
 }
 
 void GroundClay::buildBindGroups() {
-    auto bind = [&](wgpu::ComputePipeline& pipe,
-                    std::vector<std::pair<uint32_t, wgpu::Buffer>> entries) {
+    auto bind = [&](wgpu::ComputePipeline& pipe, std::vector<BindBuf> entries) {
         std::vector<wgpu::BindGroupEntry> e(entries.size());
         for (size_t i = 0; i < entries.size(); i++) {
-            e[i].binding = entries[i].first;
-            e[i].buffer = entries[i].second;
+            e[i].binding = entries[i].binding;
+            e[i].buffer = entries[i].buf;
+            e[i].offset = entries[i].offset;
+            e[i].size = entries[i].size;
         }
         wgpu::BindGroupDescriptor desc{};
         desc.layout = pipe.GetBindGroupLayout(0);
@@ -84,9 +115,16 @@ void GroundClay::buildBindGroups() {
         desc.entries = e.data();
         return gpu_->device.CreateBindGroup(&desc);
     };
-    initG_ = bind(initPipe_, {{1, base}});
+    // Each write pass sees ONLY its own region, starting at element 0, so
+    // ground.wgsl indexes with a plain texel index and never learns about the
+    // packing. Both splat regions stay read_write (see ground.h): binding one
+    // of them read-only would poison the whole buffer for this pass.
+    const BindBuf gBase{1, field, kBaseOff, kTexelBytes};
+    const BindBuf gHeight{2, field, kHeightOff, kTexelBytes};
+    const BindBuf gColor{3, field, kColorOff, kTexelBytes};
+    initG_ = bind(initPipe_, {gBase});
     for (int i = 0; i < kOpsPerFrame; i++) {
-        splatG_[i] = bind(splatPipe_, {{0, params_[i]}, {2, height}, {3, color}});
+        splatG_[i] = bind(splatPipe_, {{0, params_[i]}, gHeight, gColor});
     }
 }
 
@@ -148,16 +186,19 @@ float GroundClay::approxTopAt(float x, float z) const {
 }
 
 bool GroundClay::save(SnapWriter& w) {
-    const uint64_t texels = (uint64_t)kN * kN;
     uint32_t meta[4] = {kN, kMirror, basePending_ ? 1u : 0u, 0};
     w.section("GMET", meta, sizeof(meta));
+    // Sections keep their pre-merge names, sizes and contents; the three now
+    // read out of a REGION of `field` rather than a buffer of their own, so
+    // this half of the merge is snapshot-transparent.
     struct Sect {
         const char* tag;
-        wgpu::Buffer buf;
+        uint64_t offset;
     };
-    const Sect sects[] = {{"GBAS", base}, {"GHGT", height}, {"GCOL", color}};
+    const Sect sects[] = {
+        {"GBAS", kBaseOff}, {"GHGT", kHeightOff}, {"GCOL", kColorOff}};
     for (const Sect& s : sects) {
-        std::vector<uint8_t> data = readbackBuffer(*gpu_, s.buf, texels * 4);
+        std::vector<uint8_t> data = readbackBuffer(*gpu_, field, kTexelBytes, s.offset);
         if (data.empty()) return false;
         w.section(s.tag, data.data(), data.size());
     }
@@ -167,7 +208,6 @@ bool GroundClay::save(SnapWriter& w) {
 }
 
 bool GroundClay::load(SnapReader& r) {
-    const uint64_t texels = (uint64_t)kN * kN;
     uint32_t meta[4];
     if (!r.read("GMET", meta, sizeof(meta)) || meta[0] != kN || meta[1] != kMirror) {
         std::fprintf(stderr, "[snap] ground field mismatch\n");
@@ -175,16 +215,17 @@ bool GroundClay::load(SnapReader& r) {
     }
     struct Sect {
         const char* tag;
-        wgpu::Buffer buf;
+        uint64_t offset;
     };
-    const Sect sects[] = {{"GBAS", base}, {"GHGT", height}, {"GCOL", color}};
+    const Sect sects[] = {
+        {"GBAS", kBaseOff}, {"GHGT", kHeightOff}, {"GCOL", kColorOff}};
     for (const Sect& s : sects) {
         std::vector<uint8_t> data = r.blob(s.tag);
-        if (data.size() != texels * 4) {
+        if (data.size() != kTexelBytes) {
             std::fprintf(stderr, "[snap] ground section %s wrong size\n", s.tag);
             return false;
         }
-        gpu_->queue.WriteBuffer(s.buf, 0, data.data(), data.size());
+        gpu_->queue.WriteBuffer(field, s.offset, data.data(), data.size());
     }
     if (!r.read("GMAX", &maxH_, sizeof(maxH_))) return false;
     if (!r.read("GMIR", mirror_, sizeof(mirror_))) return false;
@@ -197,8 +238,10 @@ void GroundClay::encode(wgpu::CommandEncoder& enc) {
     if (basePending_) {
         basePending_ = false;
         gen_++;
-        enc.ClearBuffer(height, 0, (uint64_t)kN * kN * 4);
-        enc.ClearBuffer(color, 0, (uint64_t)kN * kN * 4);
+        // clear the two deposit regions in place; the base region is about to
+        // be baked by initBase, so it needs no clear
+        enc.ClearBuffer(field, kHeightOff, kTexelBytes);
+        enc.ClearBuffer(field, kColorOff, kTexelBytes);
         wgpu::ComputePassEncoder pass = enc.BeginComputePass();
         pass.SetPipeline(initPipe_);
         pass.SetBindGroup(0, initG_);
