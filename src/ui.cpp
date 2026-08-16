@@ -92,6 +92,7 @@ void uiNewFrame(LookParams& look, OrbitCamera& cam, BrushState& brush, float fps
         ImGui::SliderFloat("auto reach scale", &h.reachScale, 0.5f, 3.f);
         ImGui::SliderFloat("palm along mitt", &h.palmFrac, 0.f, 1.f);
         ImGui::Checkbox("wrap mitts around handle", &h.orient);
+        ImGui::SliderInt("grip axis (blade thru)", &look.hands.gripAxis, 0, 2);
         ImGui::SliderFloat("grip roll", &h.gripRoll, -3.14f, 3.14f);
         ImGui::SliderFloat("grip spread (sword radii)", &h.gripSpread, 0.f, 6.f);
         ImGui::SliderFloat("finger curl (about handle)", &h.gripCurl, -2.0f, 2.0f);

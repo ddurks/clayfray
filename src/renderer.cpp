@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include <array>
 
 #include <algorithm>
 #include <chrono>
@@ -593,17 +594,54 @@ void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPo
             const float sideSign = (side == 1) ? 1.f : -1.f;
             const float* g = (side == 1) ? gA : gB; // right takes the near grip
             const float lateral = look.hands.gripSpread * grip->radius * sideSign;
-            float col0[3] = {offs[0], offs[1], offs[2]};
-            float col1[3] = {blade[0], blade[1], blade[2]};
-            float col2[3] = {col0[1] * col1[2] - col0[2] * col1[1],
-                             col0[2] * col1[0] - col0[0] * col1[2],
-                             col0[0] * col1[1] - col0[1] * col1[0]};
-            // columns (fingerDir, bladeDir, fingerDir x bladeDir) — orthonormal
-            // and det +1, so the ONLY reflection in the piece is the explicit
-            // mirror below.
-            M[0] = col0[0] * mir; M[1] = col0[1] * mir; M[2] = col0[2] * mir; M[3] = 0.f;
-            M[4] = col1[0];       M[5] = col1[1];       M[6] = col1[2];       M[7] = 0.f;
-            M[8] = col2[0];       M[9] = col2[1];       M[10] = col2[2];      M[11] = 0.f;
+            // WHICH mitt axis runs along the blade: the grip HOLE, i.e. the
+            // axis the fingers curl AROUND. Read it off the grab morph rather
+            // than guessing — its deltas are large in y (-0.154..0.050) and z
+            // (-0.117..0.046) and small in x (-0.051..0.031), so the fingers
+            // rotate about the mitt's x axis and the blade passes along x.
+            // Mapping the THINNEST axis to the blade instead put the blade
+            // across the knuckles rather than through the gap.
+            float c0[3] = {blade[0], blade[1], blade[2]};
+            float c1[3] = {offs[0], offs[1], offs[2]};
+            // gripRoll spins the mitt about the blade so the finger gap can be
+            // lined up by eye without a rebuild (ctl: hands.gripRoll). Mirrored
+            // per side so both hands roll the same way relative to their own
+            // palm rather than opposite ways in world space.
+            {
+                const float a = look.hands.gripRoll * ((side == 1) ? -1.f : 1.f);
+                const float ca = std::cos(a), sa = std::sin(a);
+                float perp[3] = {c0[1] * c1[2] - c0[2] * c1[1],
+                                 c0[2] * c1[0] - c0[0] * c1[2],
+                                 c0[0] * c1[1] - c0[1] * c1[0]};
+                for (int k = 0; k < 3; k++) c1[k] = c1[k] * ca + perp[k] * sa;
+            }
+            float c2[3] = {c0[1] * c1[2] - c0[2] * c1[1],
+                           c0[2] * c1[0] - c0[0] * c1[2],
+                           c0[0] * c1[1] - c0[1] * c1[0]};
+            // WHICH mitt axis runs along the blade is a LOOK call, not a
+            // derivable one — it depends on how the artist authored the mesh,
+            // and reasoning from the grab morph's delta axes gave the wrong
+            // answer. So it is a control: hands.gripAxis picks the brush axis
+            // (0=x, 1=y, 2=z) that the blade threads through, and gripRoll
+            // spins the mitt about the blade. Both are ctl-settable and live
+            // in the panel, so the orientation is dialled by eye in the
+            // running app without a rebuild.
+            //
+            // frame[0] is the blade, frame[1] the lateral (toward the other
+            // hand), frame[2] their cross. Writing them into M's columns in a
+            // rotated order is what re-labels which brush axis is which.
+            const float frame[3][3] = {{c0[0], c0[1], c0[2]},
+                                       {c1[0], c1[1], c1[2]},
+                                       {c2[0], c2[1], c2[2]}};
+            const int ax = ((look.hands.gripAxis % 3) + 3) % 3;
+            for (int c = 0; c < 3; c++) {
+                // column `ax` gets the blade, the other two follow in order
+                const int f = (c - ax + 3) % 3;
+                // mir on the LATERAL column only, so det flips exactly once
+                const float sgn = (f == 1) ? mir : 1.f;
+                for (int k = 0; k < 3; k++) M[c * 4 + k] = frame[f][k] * sgn;
+                M[c * 4 + 3] = 0.f;
+            }
             for (int k = 0; k < 3; k++) M[12 + k] = g[k] + offs[k] * lateral;
             M[15] = 1.f;
         } else {
@@ -787,6 +825,9 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // deliberately NOT scaled by it: glass beads don't breathe with the torso.
     const bool brushRig = skeletonFree();
     int n = 0;
+    // world centre + radius per packed bead, so the gaze pass below can pair
+    // each pupil with its ball without re-deriving the transforms
+    std::array<std::array<float, 4>, 8> eyeWorld{};
     auto packMarbles = [&](const std::vector<float>& mats,
                            const std::vector<AffinePiece>& pieces) {
         for (const MarbleProp& m : marbles_) {
@@ -802,12 +843,59 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
             slotA[0] = pos[0]; slotA[1] = pos[1]; slotA[2] = pos[2];
             slotA[3] = m.radius;
             slotB[0] = m.color[0]; slotB[1] = m.color[1]; slotB[2] = m.color[2];
+            eyeWorld[n] = {pos[0], pos[1], pos[2], m.radius};
             n++;
         }
     };
     packMarbles(skinMats_, affinePieces_);
     if (foeEnabled_ && (!foeSkinMats_.empty() || brushRig))
         packMarbles(foeSkinMats_, foeAffinePieces_);
+    // ---- gaze, without bones ----
+    // The eye bones died with the armature, but a bead does not need one: an
+    // eye is a big sphere (the ball) with a small one sitting on it (the
+    // pupil), so gaze is just ROTATING the pupil about the ball's centre to
+    // face the target. Pair them by proximity — the two beads of one eye are
+    // nearly concentric — and the smaller of the pair is the pupil.
+    //
+    // Latched to the pose grid, like everything else that moves (trap 4):
+    // sliding the pupils at 60 Hz would both break the stop-motion and make a
+    // STANDING fighter a unique frame every frame, costing the idle reuse.
+    if (look.gaze.track) {
+        for (int i = 0; i < n; i++) {
+            int mate = -1;
+            float best = 1e9f;
+            for (int j = 0; j < n; j++) {
+                if (j == i) continue;
+                float d2 = 0.f;
+                for (int k = 0; k < 3; k++) {
+                    const float t = eyeWorld[i][k] - eyeWorld[j][k];
+                    d2 += t * t;
+                }
+                if (d2 < best) { best = d2; mate = j; }
+            }
+            // pupil = the smaller of a near-concentric pair
+            if (mate < 0 || eyeWorld[i][3] >= eyeWorld[mate][3]) continue;
+            if (best > eyeWorld[mate][3] * eyeWorld[mate][3]) continue;
+            const float* ball = eyeWorld[mate].data();
+            float off[3], len = 0.f;
+            for (int k = 0; k < 3; k++) {
+                off[k] = eyeWorld[i][k] - ball[k];
+                len += off[k] * off[k];
+            }
+            len = std::sqrt(len);
+            if (len < 1e-5f) continue;
+            float dir[3], dl = 0.f;
+            for (int k = 0; k < 3; k++) {
+                dir[k] = gazeTarget_[k] - ball[k];
+                dl += dir[k] * dir[k];
+            }
+            dl = std::sqrt(dl);
+            if (dl < 1e-5f) continue;
+            // clamp off the ball's forward so an eye never rolls fully round
+            float* slotA = out[14 + i * 2];
+            for (int k = 0; k < 3; k++) slotA[k] = ball[k] + dir[k] / dl * len;
+        }
+    }
     out[30][0] = (float)n;
 
     // Posed capsule shadow proxy. Under the brush rig `bone` carries the PIECE
@@ -1685,13 +1773,26 @@ void Renderer::updateBladeCut(const LookParams& look) {
     // without ever breaking the surface — 1.4 litres removed, nothing visible.
     // capsules posed by the opponent's OWN skeleton (root already folded in),
     // so the hit test tracks it while it animates
-    if (foeSkinMats_.empty()) return;
     // Blade tests happen in WORLD space, so the opponent's rest capsules have
     // to be posed first. Under the brush rig `bone` is a PIECE index into the
     // foe's own piece table — falling through to identity here would leave the
     // foe's hitboxes sitting at the origin while the foe itself stands
     // elsewhere, and the sword would cut empty air.
     const bool brushRig = skeletonFree();
+    // Bail only when there is NO posing data at all. This guard used to read
+    // `foeSkinMats_.empty()` alone, which is ALWAYS true once the armature is
+    // gone — so the sword silently stopped cutting while UI carving still
+    // worked, because the return fired before the brush-rig path below could
+    // ever run.
+    if (brushRig ? foeAffinePieces_.empty() : foeSkinMats_.empty()) return;
+    if (std::getenv("CLAYFRAY_DEBUG_BLADE")) {
+        std::printf("[blade] sweep=%.4f brushRig=%d foeCaps=%zu foePieces=%zu "
+                    "hilt=(%.2f %.2f %.2f) tip=(%.2f %.2f %.2f)\n",
+                    sweep, (int)brushRig, foeCaps_.size(),
+                    foeAffinePieces_.size(), hilt[0], hilt[1], hilt[2],
+                    tip[0], tip[1], tip[2]);
+        std::fflush(stdout);
+    }
     auto foeToWorld = [&](const BoneCapsule& c, const float* r, float* w) {
         if (brushRig) {
             if (c.bone >= 0 && (size_t)c.bone < foeAffinePieces_.size()) {

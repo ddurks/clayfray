@@ -143,7 +143,8 @@ void CtlServer::buildRegistry() {
     addF("hands.reachScale", &l->hands.reachScale);
     addF("hands.palmFrac", &l->hands.palmFrac);
     addB("hands.orient", &l->hands.orient);
-    addF("hands.gripRoll", &l->hands.gripRoll);
+    addI("hands.gripAxis", &l->hands.gripAxis);
+        addF("hands.gripRoll", &l->hands.gripRoll);
     addF("hands.gripSpread", &l->hands.gripSpread);
     addF("hands.gripCurl", &l->hands.gripCurl);
     addB("gaze.track", &l->gaze.track);

@@ -44,6 +44,11 @@ struct HandParams {
     float reachScale = 1.5f; // auto reach = rest COM->wrist distance * this
     float palmFrac = 0.6f;   // where along wrist->fingertip the grip sits
     bool orient = true;      // wrap the mitts around the handle
+    // Which mitt axis threads the blade (0=x, 1=y, 2=z) and how far the mitt
+    // is spun about it. Authoring-dependent, so these are dialled by eye in
+    // the running app (ctl: hands.gripAxis / hands.gripRoll) rather than
+    // derived — reasoning from the grab morph's delta axes got it wrong.
+    int gripAxis = 0;
     float gripRoll = -1.5f;  // radians about the handle: where fingers point
     // Two-handed grip. The mitts sit on OPPOSITE faces of the blade rather
     // than both on its axis — each offset sideways by half the blade's width,

@@ -1,0 +1,17 @@
+# Walk into range and sweep a HORIZONTAL blade through the opponent.
+# Regression scenario for the sword cut: the ledger must move.
+0 set fighter.pos 0.70 0 0.25
+0 set fighter.yaw 0
+0 set sword.pitch 0
+6 set sword.yaw 1.050
+7 set sword.yaw 1.145
+8 set sword.yaw 1.241
+9 set sword.yaw 1.336
+10 set sword.yaw 1.432
+11 set sword.yaw 1.527
+12 set sword.yaw 1.623
+13 set sword.yaw 1.718
+14 set sword.yaw 1.814
+15 set sword.yaw 1.909
+16 set sword.yaw 2.005
+17 set sword.yaw 2.100
