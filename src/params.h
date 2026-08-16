@@ -48,15 +48,15 @@ struct HandParams {
     // is spun about it. Authoring-dependent, so these are dialled by eye in
     // the running app (ctl: hands.gripAxis / hands.gripRoll) rather than
     // derived — reasoning from the grab morph's delta axes got it wrong.
-    int gripAxis = 0;
+    int gripAxis = 2;
     float gripRoll = -1.5f;  // radians about the handle: where fingers point
-    // Two-handed grip. The mitts sit on OPPOSITE faces of the blade rather
-    // than both on its axis — each offset sideways by half the blade's width,
-    // so `gripSpread` is measured in sword radii (1 = exactly half the width
-    // to each side, i.e. each palm on its own face). Then each hand rolls
-    // INWARD by gripCurl, mirrored, so the fingers wrap toward each other the
-    // way they do around a real handle instead of both pointing the same way.
-    float gripSpread = 2.5f;  // lateral offset per hand, in sword radii
+    // Lateral offset per hand, in sword radii. ZERO now, and the reason it
+    // used to be 2.5 is worth keeping: under the old bone rig the mitts sat on
+    // OPPOSITE FACES of the blade, pushed half a blade-width to each side,
+    // because nothing threaded the handle. The brush rig puts the blade
+    // THROUGH the gap between the fingers (gripAxis), so both hands belong on
+    // the blade's own axis and any offset just slides them off it.
+    float gripSpread = 0.f;
     // Finger curl: rotates the thumb/finger subtrees ABOUT THE HANDLE AXIS so
     // the digits wrap onto the blade. The wrist is deliberately untouched —
     // rolling the whole mitt moves the palm off the grip, which is a different
