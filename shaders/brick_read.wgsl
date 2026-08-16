@@ -509,6 +509,65 @@ fn fighterRestPoint(f: u32, p: vec3f) -> vec3f {
   usePlayer(f);
   return charRestPointI(p);
 }
+// ---------- PER-RAY FIGHTER CULLING ----------
+// Which fighters the CURRENT ray can possibly reach, one bit each. All ones
+// means "no culling", which is what every path other than the march wants.
+//
+// The problem it solves: map() takes the min over every live fighter at every
+// march step, so a second body costs a point-sphere test per step per pixel
+// and — for any ray entering its (generous) bound sphere — a full three-piece
+// evaluation per step, whether or not the ray could ever hit it. Measured at
+// 5.3 ms of a 23.3 ms frame, 23%, just for the opponent.
+//
+// A ray-sphere test done ONCE per pixel replaces ~35 point-sphere tests, and
+// more importantly lets a ray that cannot hit a body skip its pieces outright.
+//
+// WHY SKIPPING IS SAFE FOR THE MARCH. Sphere tracing may only step by a
+// distance that cannot overshoot a surface ON THE RAY. A fighter's clay lies
+// entirely inside its bound sphere (info.z comes from affineBoundR over the
+// posed piece boxes, plus slack), so a ray that never enters that sphere never
+// touches that fighter's surface — omitting it from the min can return a
+// LARGER distance, but there is no hit on this ray to overshoot.
+//
+// WHY IT IS NOT SAFE FOR ANYTHING ELSE, which is the trap that killed the last
+// attempt at this (a capsule-union early-out, worth 6.5 ms of 71, reverted
+// because it shifted 1.5% of pixels): calcNormal takes four taps OFF the ray,
+// and AO and soft shadows march different rays entirely. A mask built from the
+// primary ray is wrong for all of them. So the march sets it, and CLEARS IT
+// IMMEDIATELY AFTER — see trace.wgsl's cs(). Everything downstream sees the
+// full field.
+//
+// This is also the case where a branch actually pays, despite CLAUDE.md's
+// "conditional skips do not pay here": that note is about per-SAMPLE region
+// tests, where neighbouring pixels disagree and every lane runs the work
+// anyway. A per-PIXEL fighter mask is spatially coherent — a tile either sees
+// the opponent or it does not — so whole wavefronts take the same branch.
+var<private> gRayMask: u32 = 0xFFFFFFFFu;
+
+fn setRayMask(ro: vec3f, rd: vec3f) {
+  var m = 0u;
+  for (var f = 0u; f < u32(u.sceneMeta.x); f++) {
+    // A fighter with no pieces is the un-rigged debug draw, where the bound
+    // sphere describes the BODY brush but three brushes are drawn side by
+    // side ~0.6 m apart. The sphere does not enclose them, so never cull it.
+    if (u.fighters[f].info.y < 0.5) {
+      m |= 1u << f;
+      continue;
+    }
+    let oc = u.fighters[f].center.xyz - ro;
+    // closest approach along the FORWARD ray; t=0 handles a ray starting
+    // inside the sphere, which must never be culled
+    let t = max(dot(oc, rd), 0.0);
+    let q = oc - rd * t;
+    let r = u.fighters[f].info.z;
+    if (dot(q, q) <= r * r) {
+      m |= 1u << f;
+    }
+  }
+  gRayMask = m;
+}
+fn clearRayMask() { gRayMask = 0xFFFFFFFFu; }
+
 // Nearest fighter's surface, over every live body. Returns (distance, index);
 // index is -1 when no fighter is closer than `best`. This is the one place the
 // fighter loop lives — map(), mapLoose(), mapPenumbra() and the pick shader all
@@ -517,6 +576,9 @@ fn fightersNearest(p: vec3f, best: f32) -> vec2f {
   var d = best;
   var hit = -1.0;
   for (var f = 0u; f < u32(u.sceneMeta.x); f++) {
+    if ((gRayMask & (1u << f)) == 0u) {
+      continue;
+    }
     let df = fighterDist(f, p);
     if (df < d) {
       d = df;

@@ -276,12 +276,20 @@ fn mapPenumbra(p: vec3f) -> f32 {
 // moving frame (27%), and the MARCH is now the biggest single item at ~9.9.
 // Cheapening this alone can no longer buy much; cheapening a field
 // evaluation buys everywhere.
+// Step count and growth are a PAIR: both walk t from 0.02 out to ~4.5 m, past
+// any occluder in the arena, so changing one without the other changes the
+// reach rather than the sampling. g = (4.5/0.02)^(1/N):
+//   44 steps @ 1.13   the original, oversampled
+//   22 steps @ 1.28   half the mapPenumbra calls, image-identical
+//   16 steps @ 1.40   here — same reach again, 27% fewer calls
+// The early-out below is why LIT pixels pay the most: a shadowed one bails as
+// soon as res collapses, a lit one runs the loop out.
 fn softShadow(ro: vec3f, rd: vec3f, tmax: f32) -> f32 {
   var res = 1.0;
   var t = 0.02;
-  for (var i = 0; i < 22; i++) {
+  for (var i = 0; i < 16; i++) {
     res = min(res, u.material.z * mapPenumbra(ro + rd * t) / t);
-    t *= 1.28;
+    t *= 1.40;
     if (res < 0.004 || t > tmax) {
       break;
     }
@@ -449,7 +457,14 @@ fn cs(@builtin(global_invocation_id) gid: vec3u) {
       let rd = normalize(u.camFwd.xyz + ndc.x * th * u.camRight.w * u.camRight.xyz +
                          ndc.y * th * u.camUp.xyz);
       let ro = u.camPos.xyz;
+      // Cull fighters this ray cannot reach, for the MARCH ONLY, then clear
+      // the mask before anything shades. calcNormal taps off the ray and the
+      // AO/shadow rays are different rays entirely, so a mask built here is
+      // wrong for all of them — that is precisely what made the last early-out
+      // attempt shift 1.5% of pixels. See brick_read.wgsl's setRayMask.
+      setRayMask(ro, rd);
       let tm = march(ro, rd);
+      clearRayMask();
       var c: vec3f;
       if (tm.x < 0.0) {
         c = background(rd);
