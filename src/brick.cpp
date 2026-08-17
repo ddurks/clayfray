@@ -89,6 +89,11 @@ struct EditParamsCpu {
     float brush[4];
     float color[4];
     float brushB[4];
+    // x = capsule count, y = dent amplitude (m), z = paint strength
+    float parms[4];
+    // capsules 1..count-1, as (A.xyz, -) (B.xyz, -) pairs. Capsule 0 stays in
+    // brush/brushB so a one-capsule brush is byte-identical to the old one.
+    float caps[(kMaxBrushCaps - 1) * 2][4];
 };
 
 } // namespace
@@ -98,7 +103,10 @@ struct EditParamsCpu {
 // values to the CPU — which matters: a cell index computed from a slightly
 // different SPAN lands in a different brick.
 std::string BrickSystem::wgslConstants() {
-    char buf[2048];
+    // 3072 rather than 2048 since R19's MAX_BRUSH_CAPS block landed;
+    // wgslConstantsFit below is what turns a bad guess here into a loud
+    // failure rather than a shader that silently loses its last constant.
+    char buf[3072];
     const int need = std::snprintf(
         buf, sizeof(buf),
         "// GENERATED from BrickSystem in src/brick.h — do not edit here, and\n"
@@ -129,13 +137,19 @@ std::string BrickSystem::wgslConstants() {
         "// //#constants block has to come BEFORE the struct in both.\n"
         "const VOL_STRIDE: u32 = %uu;\n"
         "const MAX_FIGHTERS: u32 = %uu;\n"
-        "const PIECES_PER_FIGHTER: u32 = %uu;\n",
+        "const PIECES_PER_FIGHTER: u32 = %uu;\n"
+        "// Capsules one edit's brush may union (R19). edit.wgsl sizes its\n"
+        "// EditParams array off this: retyping the literal is trap 2, and a\n"
+        "// shader array shorter than the CPU struct fails EVERY bind group\n"
+        "// against that layout, not just this pass.\n"
+        "const MAX_BRUSH_CAPS: u32 = %uu;\n",
         kGrid, kBrickUsable, (double)kVoxel, (double)kSpan, (double)kOrigin[0],
         (double)kOrigin[1], (double)kOrigin[2], (double)kBand, kMaxBricks,
         kDirtyCap, (uint32_t)kGrid * kGrid * kGrid, (int)kAxisVox, kRowWords,
         (uint32_t)(kIndOff / 4), (uint32_t)(kSeedOff / 4),
         (uint32_t)(kCoarseOff / 4), (uint32_t)(kVolumeBytes / 4),
-        (uint32_t)kMaxFighters, (uint32_t)kPiecesPerFighter);
+        (uint32_t)kMaxFighters, (uint32_t)kPiecesPerFighter,
+        (uint32_t)kMaxBrushCaps);
     wgslConstantsFit(need, sizeof(buf), "BrickSystem");
     return buf;
 }
@@ -169,7 +183,11 @@ bool BrickSystem::init(Gpu& gpu, BrickStore& store, int slot,
     freelist_ = makeStorage(dev, kMaxBricks * 4ull, "brick freelist");
     jfaB_ = makeStorage(dev, cells * 4ull, "jfa B");
     coarseB_ = makeStorage(dev, cells * 4ull, "coarse dist B");
-    static_assert(sizeof(EditParamsCpu) == 80, "must match WGSL EditParams");
+    // 80 B of scalars + parms + (kMaxBrushCaps-1) capsule pairs. The WGSL side
+    // derives its array length from MAX_BRUSH_CAPS, so the two move together —
+    // but nothing links them at compile time, hence the number here.
+    static_assert(sizeof(EditParamsCpu) == 96 + (kMaxBrushCaps - 1) * 32,
+                  "must match WGSL EditParams");
     for (int i = 0; i < kOpsPerFrame; i++)
         editParams_[i] = makeStorage(dev, sizeof(EditParamsCpu), "edit params", true);
 
@@ -650,18 +668,30 @@ void BrickSystem::encodeImport(wgpu::CommandEncoder& enc) {
     pass.End();
 }
 
-bool BrickSystem::editInBounds(const BrickEdit& e) const {
-    if (e.mode == 0) return true;
+bool BrickSystem::capsuleInBounds(const float a[3], const float b[3],
+                                  float radius) const {
     // brush influence (radius + band margin) must stay inside the volume:
     // a blob clipped at the boundary renders as corruption
-    const float m = e.radius + 3.0f * kSpan;
+    const float m = radius + 3.0f * kSpan;
     for (int i = 0; i < 3; i++) {
         // a capsule edit must clear the boundary at BOTH ends
-        float lo = std::min(e.pos[i], e.segment ? e.posB[i] : e.pos[i]);
-        float hi = std::max(e.pos[i], e.segment ? e.posB[i] : e.pos[i]);
+        const float lo = std::min(a[i], b[i]);
+        const float hi = std::max(a[i], b[i]);
         if (lo - m < kOrigin[i] || hi + m > kOrigin[i] + kGrid * kSpan) {
             return false;
         }
+    }
+    return true;
+}
+
+bool BrickSystem::editInBounds(const BrickEdit& e) const {
+    if (e.mode == 0) return true;
+    // Mode 3 spends pos/posB on the dent's axis rather than on a swept brush,
+    // but the influence region is the same capsule, so the same test holds.
+    const float* b0 = (e.segment || e.mode == 3) ? e.posB : e.pos;
+    if (!capsuleInBounds(e.pos, b0, e.radius)) return false;
+    for (int i = 1; i < e.capCount && i <= kMaxBrushCaps - 1; i++) {
+        if (!capsuleInBounds(e.capA[i - 1], e.capB[i - 1], e.radius)) return false;
     }
     return true;
 }
@@ -692,10 +722,24 @@ void BrickSystem::pollVolumes() {
                                    }
                                    MeasuredEdit m;
                                    m.edit = s.edit;
+                                   // A dent measures its SIGNED net (R20): the
+                                   // core removes clay and the rim puts it
+                                   // back, and the whole design is that they
+                                   // cancel — an abs() would report ~2x the
+                                   // displaced volume instead of ~0. The shader
+                                   // accumulates two's complement into the same
+                                   // u32, so the sign is just how it is read.
+                                   // Carve and add stay UNSIGNED on purpose:
+                                   // a single op big enough to swallow ~6.3k
+                                   // solid cells passes 2^31 in fixed point,
+                                   // and reading that as negative would credit
+                                   // the ledger for clay it just removed.
+                                   const double raw = s.edit.mode == 3
+                                                          ? (double)(int32_t)fp
+                                                          : (double)fp;
                                    // fixed-point voxels (x1024) -> m^3
-                                   m.volume = (float)((double)fp / 1024.0 *
-                                                      (double)kVoxel * (double)kVoxel *
-                                                      (double)kVoxel);
+                                   m.volume = (float)(raw / 1024.0 * (double)kVoxel *
+                                                      (double)kVoxel * (double)kVoxel);
                                    measured_.push_back(m);
                                }
                                s.buf.Unmap();
@@ -910,14 +954,25 @@ void BrickSystem::encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e, int sl
         params.regionMin[0] = params.regionMin[1] = params.regionMin[2] = 0;
         regionDims[0] = regionDims[1] = regionDims[2] = kGrid;
     } else {
+        // The region is the UNION of every capsule's box. One dispatch over it
+        // replaces the per-substep dispatches a swing used to emit, and the
+        // substeps overlapped so heavily that the union is barely larger than
+        // any one of them.
+        const int caps = std::min(std::max(e.capCount, 1), kMaxBrushCaps);
         for (int i = 0; i < 3; i++) {
             // margin = brush influence reach (band, 1.7 spans) + cell diagonal
             // (0.87) + slack: cells outside the region keep stale voxels, and a
             // too-small margin leaves seams at shared voxel planes
             float pa = e.pos[i];
-            float pb = e.segment ? e.posB[i] : e.pos[i];
-            float lo = std::min(pa, pb) - e.radius - 3.0f * kSpan - kOrigin[i];
-            float hi = std::max(pa, pb) + e.radius + 3.0f * kSpan - kOrigin[i];
+            float pb = (e.segment || e.mode == 3) ? e.posB[i] : e.pos[i];
+            float lo = std::min(pa, pb);
+            float hi = std::max(pa, pb);
+            for (int c = 1; c < caps; c++) {
+                lo = std::min(lo, std::min(e.capA[c - 1][i], e.capB[c - 1][i]));
+                hi = std::max(hi, std::max(e.capA[c - 1][i], e.capB[c - 1][i]));
+            }
+            lo -= e.radius + 3.0f * kSpan + kOrigin[i];
+            hi += e.radius + 3.0f * kSpan - kOrigin[i];
             int c0 = (int)std::floor(lo / kSpan);
             int c1 = (int)std::floor(hi / kSpan);
             params.regionMin[i] = c0;
@@ -931,21 +986,39 @@ void BrickSystem::encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e, int sl
     params.brush[1] = e.pos[1];
     params.brush[2] = e.pos[2];
     params.brush[3] = e.radius;
-    for (int i = 0; i < 3; i++) params.brushB[i] = e.segment ? e.posB[i] : e.pos[i];
+    for (int i = 0; i < 3; i++)
+        params.brushB[i] = (e.segment || e.mode == 3) ? e.posB[i] : e.pos[i];
     params.brushB[3] = 0.f;
     params.color[0] = e.color[0];
     params.color[1] = e.color[1];
     params.color[2] = e.color[2];
     params.color[3] = (float)e.mode;
+    const int caps = std::min(std::max(e.capCount, 1), kMaxBrushCaps);
+    params.parms[0] = (float)caps;
+    params.parms[1] = e.dentAmp;
+    params.parms[2] = e.paint;
+    params.parms[3] = 0.f;
+    for (int c = 1; c < caps; c++) {
+        for (int i = 0; i < 3; i++) {
+            params.caps[(c - 1) * 2][i] = e.capA[c - 1][i];
+            params.caps[(c - 1) * 2 + 1][i] = e.capB[c - 1][i];
+        }
+    }
     gpu_->queue.WriteBuffer(editParams_[slot], 0, &params, sizeof(params));
 
     wgpu::ComputePassEncoder pass = enc.BeginComputePass();
-    pass.SetPipeline(classify_);
-    pass.SetBindGroup(0, classifyG0_[slot]);
-    pass.SetBindGroup(1, classifyG1_);
-    pass.SetBindGroup(2, classifyG2_);
-    pass.DispatchWorkgroups((regionDims[0] + 3) / 4, (regionDims[1] + 3) / 4,
-                            (regionDims[2] + 3) / 4);
+    // R20/R21: neither cheap mode allocates, so neither has a classify pass to
+    // run. That is most of why they are cheap — what is left is one fill over
+    // the cells that already exist, and for paint no JFA or redistance after it
+    // either (encode()).
+    if (e.mode < 3) {
+        pass.SetPipeline(classify_);
+        pass.SetBindGroup(0, classifyG0_[slot]);
+        pass.SetBindGroup(1, classifyG1_);
+        pass.SetBindGroup(2, classifyG2_);
+        pass.DispatchWorkgroups((regionDims[0] + 3) / 4, (regionDims[1] + 3) / 4,
+                                (regionDims[2] + 3) / 4);
+    }
     pass.SetPipeline(fill_);
     pass.SetBindGroup(0, fillG0_[slot]);
     pass.SetBindGroup(1, fillG1_);
@@ -1031,9 +1104,18 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
       // unzipping one per frame.
       gen_++;
       const int batch = std::min((int)pending_.size(), kOpsPerFrame);
+      // R21: an albedo stamp moves no surface, so a batch of nothing but paint
+      // needs neither the JFA nor the redistance pass. Tracked across the whole
+      // batch because they run once for all of it.
+      bool movedField = false;
       for (int op = 0; op < batch; op++) {
         BrickEdit e = pending_.front();
         pending_.erase(pending_.begin());
+        if (e.mode == 4) {
+            encodeOp(enc, e, op);
+            continue;
+        }
+        movedField = true;
         enc.ClearBuffer(counters_, 12, 4); // volume delta = 0
         encodeOp(enc, e, op);
         // conservation: park the measured delta in a free pool slot; the
@@ -1062,8 +1144,10 @@ void BrickSystem::encode(wgpu::CommandEncoder& enc) {
             slot->gen = snapGen_;
         }
       }
-      encodeJfa(enc);
-      if (!std::getenv("CLAYFRAY_NO_REDIST")) encodeRedistance(enc);
+      if (movedField) {
+        encodeJfa(enc);
+        if (!std::getenv("CLAYFRAY_NO_REDIST")) encodeRedistance(enc);
         if (++editsSinceCap_ >= 60) armCapacityPoll(enc);
+      }
     }
 }

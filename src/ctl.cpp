@@ -174,12 +174,6 @@ void CtlServer::buildRegistry() {
     addF("rig.idleScale", &l->rig.idleScale);
     addF("rig.hop", &l->rig.hop);
     addF("rig.widen", &l->rig.widen);
-    addF("rig.impactGain", &l->rig.impactGain);
-    addF("rig.impactMax", &l->rig.impactMax);
-    addF("rig.impactK", &l->rig.impactK);
-    addF("rig.impactDamp", &l->rig.impactDamp);
-    addF("rig.impactWiden", &l->rig.impactWiden);
-    addF("rig.impactLift", &l->rig.impactLift);
     addB("hands.ik", &l->hands.ik);
     addF("hands.reach", &l->hands.reach);
     addF("hands.reachScale", &l->hands.reachScale);
@@ -205,6 +199,17 @@ void CtlServer::buildRegistry() {
     addF("handpose.punchDur", &l->handPose.punchDur);
     addF("handpose.fistRadius", &l->handPose.fistRadius);
     addF("handpose.cutSpeed", &l->handPose.cutSpeed);
+    // R20/R21: what a landing strike does to the clay. Renderer-side, hence
+    // `impact.*` rather than `phys.*` (which is the sim's).
+    addF("impact.dentDepth", &l->impact.dentDepth);
+    addF("impact.dentRadius", &l->impact.dentRadius);
+    addF("impact.dentLength", &l->impact.dentLength);
+    addF("impact.punchCarve", &l->impact.punchCarve);
+    addF("impact.bruise", &l->impact.bruise);
+    addF("impact.bruiseRadius", &l->impact.bruiseRadius);
+    addF("impact.bruiseColor", l->impact.bruiseColor, 3);
+    addF("impact.smear", &l->impact.smear);
+    addF("impact.smearRadius", &l->impact.smearRadius);
     if (refs_.ai) {
         AiParams* a = refs_.ai;
         addB("ai.enabled", &a->enabled);

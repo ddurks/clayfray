@@ -35,12 +35,30 @@ struct BrickStore {
     bool init(Gpu& gpu);
 };
 
+// R19: capsules ONE edit's brush may union together.
+//
+// This — not BrickSystem::kOpsPerFrame — is what bounds how far a weapon may
+// travel in a frame, which is the whole point of the change: kOpsPerFrame is a
+// queue-drain budget and it had no business setting how fast a sword swings.
+// 16 capsules at the sword's ~0.013 m substep spacing covers ~0.21 m of tip
+// travel per frame (~12.7 m/s), against 0.079 m (~4.7 m/s) at the old cap of 6.
+//
+// It costs uniform bytes and nothing else: EditParams grows by
+// (kMaxBrushCaps-1) * 32 B, and the shader loop runs `capCount` iterations, not
+// this many.
+inline constexpr int kMaxBrushCaps = 16;
+
 // Sparse brickmap for one carveable character body: a slice of a BrickStore
 // (indirection grid + brick pool partition) plus this fighter's own freelist
 // and the bake/edit/JFA passes. Up to kOpsPerFrame edits are consumed per
 // frame (uniform buffer contents are per-submit).
 struct BrickEdit {
-    int mode = 1; // 0 bake, 1 carve, 2 add
+    // 0 bake, 1 carve, 2 add, 3 dent (volume-conserving displacement),
+    // 4 paint (albedo only). See edit.wgsl for what each one does to the field;
+    // what matters up here is that 3 and 4 are the two CHEAP modes — 3 never
+    // allocates a brick and 4 skips classify, the JFA and the redistance pass
+    // outright.
+    int mode = 1;
     // WHICH fighter's volume this cuts. Explicit, and defaulting to the hero,
     // because `pos` below is REST space: the same coordinates name different
     // clay in every fighter's slice, so an edit without an owner is ambiguous
@@ -59,6 +77,29 @@ struct BrickEdit {
     // hollows the interior without ever breaking the surface.
     bool segment = false;
     float posB[3] = {0, 0, 0};
+    // R19: the brush is the UNION of `capCount` capsules, all sharing `radius`.
+    // pos/posB are capsule 0; these are 1..capCount-1. capCount == 1 leaves the
+    // brush bit-identical to the single-capsule one, which is what every call
+    // site but the sword means.
+    //
+    // This exists because a swing used to emit one EDIT per substep and
+    // kOpsPerFrame (a queue-drain budget) therefore capped how fast a sword was
+    // allowed to move. Six sequential soft-carves also scalloped along their
+    // union, because each one smin'd against a field the previous one had
+    // already moved. A min over the capsule array is the true swept union,
+    // evaluated once, and it is measured by ONE readback instead of six.
+    //
+    // For mode 3 the pair pos/posB means something else entirely — see
+    // `dentAmp` — and capCount is ignored.
+    int capCount = 1;
+    float capA[kMaxBrushCaps - 1][3] = {};
+    float capB[kMaxBrushCaps - 1][3] = {};
+    // Mode 3 only: metres of inward displacement at the dent's core. The
+    // profile is authored to cancel (edit.wgsl dentDelta), so this scales a
+    // shape whose net volume change is ~0 rather than an amount of clay.
+    float dentAmp = 0.f;
+    // Mode 4 only: 0..1 opacity of the albedo stamp at the brush core.
+    float paint = 1.f;
     float color[3] = {0.8f, 0.5f, 0.5f};
     // Conservation metadata (rides along; the GPU op ignores it). outDir and
     // srcColor snapshot the pick normal/albedo at queue time so gobs fly
@@ -364,8 +405,12 @@ class BrickSystem {
     // renders as corruption).
     void queueEdit(const BrickEdit& e);
     // Same clip test queueEdit applies, without queueing: lets gob landings
-    // pick "stick" vs "deflect" before committing.
+    // pick "stick" vs "deflect" before committing. Every capsule of a fused
+    // brush has to clear the boundary, so a caller building one is better off
+    // filtering with capsuleInBounds as it goes — dropping a whole swing
+    // because its last substep strayed would lose the part that was fine.
     bool editInBounds(const BrickEdit& e) const;
+    bool capsuleInBounds(const float a[3], const float b[3], float radius) const;
     // Rebuild the volume from its source. With an imported character the
     // mesh buffers persist on the GPU, so re-run the import passes; the
     // analytic bake would silently replace the fighter with the blob.
@@ -432,10 +477,15 @@ class BrickSystem {
     bool load(SnapReader& r);
 
   public:
-    // Ops drained per frame. A sword sweep is substepped into several capsule
-    // carves, and at one op per frame the wound would unzip over half a second
-    // after the swing. They share one JFA/redistance at the end of the frame,
-    // so the extra cost is the carve dispatches, not the refresh.
+    // Ops drained per frame, sharing one JFA/redistance at the end of the
+    // frame. A QUEUE-DRAIN BUDGET and nothing more.
+    //
+    // It used to be more than that: a sword sweep was substepped into one edit
+    // per capsule, so this number silently capped how fast a blade could move
+    // before its wound came out as disconnected slices (R19). The sweep is one
+    // multi-capsule op now — kMaxBrushCaps is that bound — and what drains
+    // through here is genuinely independent ops: gob deposits, UI/ctl carves,
+    // and the two or three a strike emits (dent + carve + bruise).
     static constexpr int kOpsPerFrame = 6;
 
   private:

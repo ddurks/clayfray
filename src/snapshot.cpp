@@ -32,7 +32,10 @@ constexpr char kMagic[4] = {'C', 'F', 'S', 'N'};
 // 7: fighters became SLICES of a shared BrickStore. kMaxBricks fell from
 // 16384 to 12288 (BMET carries it, so a v6 file would be refused anyway) and
 // the RRIG spring section grew from 2 fighters to kMaxPlayers.
-constexpr uint32_t kVersion = 7;
+// 8: BrickEdit grew the R19 fused brush (capCount + kMaxBrushCaps-1 capsule
+// pairs) and the two mode parameters R20/R21 added (dentAmp, paint). "BPND"
+// stores BrickEdit raw, so its stride moved again.
+constexpr uint32_t kVersion = 8;
 
 uint32_t tagWord(const char tag[4]) {
     uint32_t w;

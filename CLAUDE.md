@@ -5,6 +5,12 @@ per-milestone "do not regress" notes (M2 look recovery, M4.6 conservation).
 This file is the short list of traps that have actually bitten and the commands
 to verify a change.
 
+`AUDIT.md` is the third one, and it is the one to read BEFORE proposing an
+optimisation or a refactor: it carries the live status of the multi-agent engine
+review (what shipped, what is still open, and the ranked order to do it in), and
+its "do not do" list plus `docs/engine-review.md`'s table of measured NEGATIVE
+results will save you from re-proposing something already tried and dead here.
+
 ## Build & run
 
 ```sh
@@ -346,8 +352,10 @@ construction, invisible at 60 Hz.
   exactly when resistance should be highest. Each has its own drag coefficient,
   so they never have to be the same quantity.
 - **Contact is reported per (attacker, target, weapon), deepest wins.** A blade
-  emits up to `kOpsPerFrame` capsule carves as it sweeps, and six separate
-  shoves off one swing would multiply knockback by the substep count.
+  tests up to `kMaxBrushCaps` instants of its sweep, and one shove per substep
+  would multiply knockback by the substep count. (Those instants are capsules
+  of ONE fused edit now — see R19 — but the hit test still runs per substep,
+  so the dedupe still earns its keep.)
 - **Reported BEFORE the bounds test**, in both paths. The weapon is physically
   inside the body whether or not the carve was accepted, and an edit dropped at
   the volume boundary (trap 5) must not silently drop the knockback too.
@@ -378,12 +386,18 @@ construction, invisible at 60 Hz.
   sells it is the shove — which lives in `knock`, which steering cannot cancel
   at all. Hitstun only has to stop you WALKING the shove off, and 0.45
   authority (~0.5 m/s of push-back) does that without ever dropping an input.
-- **The shove is a NUDGE now, not the hit** (M-BAG). `knockForce` 26 -> 7 and
-  `knockMax` 2.2 -> 0.8 m/s, because the reaction moved into the body: a body
-  made of clay answers a punch by DEFORMING, and a fighter sliding cleanly away
-  from a fist was the read of a rigid body on ice. What is left is enough to
-  rock the stance so a hit body is not bolted to the floor. `set
-  phys.knockForce 0` gives the pure punching bag.
+- **The shove is a NUDGE now, not the hit.** `knockForce` 26 -> 7 and
+  `knockMax` 2.2 -> 0.8 m/s, because a fighter sliding cleanly away from a fist
+  was the read of a rigid body on ice, and this one is made of clay. What
+  answers a punch instead is the CLAY deforming where it was hit — the R20 dent
+  below, which is a real displacement of the field rather than a pose. What is
+  left of the shove is enough to rock the stance so a hit body is not bolted to
+  the floor. `set phys.knockForce 0` gives the pure bag; 26 / 2.2 restores the
+  old slide.
+
+  (A whole-body squash spring — `RigParams::impact*`, `Renderer::ImpactWobble`,
+  the `RBAG` snapshot section — briefly did this job as a POSE that moved no
+  clay. It is deleted. Anything referring to M-BAG predates that.)
 
 **Bodies do not interpenetrate** — a pairwise xz position constraint, run after
 every fighter has integrated. That ordering is why `stepWorld` exists: bodies
@@ -395,72 +409,92 @@ while each fighter's velocity is private to whatever drives it — which is why
 Correction is symmetric (half each); pushing only the "second" body would make
 collision depend on player index and let the hero bulldoze.
 
-## The punching bag (M-BAG) — a hit deforms the body
+## Edit modes: the fused brush, the dent, the stamp (R19–R21)
 
-A punch used to be answered by MOVING the target. That is what a rigid body
-does, and this one is made of clay: the reaction is now a dent that springs
-back, and the shove is the small remainder that keeps the body from reading as
-bolted down.
+`edit.wgsl` has five modes now — `0` bake, `1` carve, `2` add, `3` dent,
+`4` paint — and the two new ones are the CHEAP ones. Neither creates surface
+where there was none, so neither runs `classify` at all (`encodeOp` skips the
+dispatch, the shader early-returns as a backstop), and paint additionally moves
+no field, so a batch of nothing but paint skips the JFA and the redistance pass
+too.
 
-**THE DEFORMATION IS NOT THE DAMAGE.** The wound is still the swept-capsule
-carve `updatePunchCut` makes, still permanent, still billed to the conservation
-ledger. The wobble is a POSE — one more factor in the body affine — and it
-moves no clay at all, which is why nothing in it touches `sploot_` and why the
-`--carve-test` / journal gates are unaffected by it. A body can be visibly
-dented and owe nothing, and a body can be missing a litre and be perfectly
-round.
+**A brush is a UNION OF CAPSULES, not one capsule** (`BrickEdit::capCount`,
+`capA`/`capB`, cap `kMaxBrushCaps` = 16). A sword swing used to emit one EDIT
+per substep, which meant `kOpsPerFrame` — a queue-drain budget — was silently
+deciding **how fast a sword may swing**: past ~4.7 m/s of tip travel the
+substeps ran out and the wound came out as disconnected slices. It also
+scalloped, because six sequential soft-carves each `smin` against a field the
+last one had already moved. One `min` over the capsule array is the exact swept
+union, evaluated once, dispatched once over the union AABB, and measured by ONE
+readback instead of six. `capCount == 1` is bit-identical to the old brush.
 
-**It is a second spring** (`RigParams::impact*`, `Renderer::ImpactWobble`), and
-it is directional where the gait spring is not: the gait spring squashes about
-the vertical and knows only walking speed, this one squashes about the axis the
-weapon arrived on. Two springs, not one, because they are driven by unrelated
-things and are meant to be visible together — a walking fighter that takes a
-punch should keep bouncing while it wobbles.
+The cap is now `kMaxBrushCaps` (~12.7 m/s of tip travel), and it is a uniform-
+bytes number: `EditParams` grows by `(kMaxBrushCaps-1) * 32 B`, the shader loop
+runs `capCount` iterations rather than that many. **Bounds-test PER CAPSULE**
+(`capsuleInBounds`) as you build one — dropping a whole swing because its last
+substep strayed past the volume edge (trap 5) loses the part that was fine, and
+it desynchronises `slicePending_` from the ops that will actually be measured.
 
-- **The dent is applied in WORLD xz, outside the yaw**:
-  `T(pos+hop) . Dent . Yaw . Shear . Scale`. Where a punch came from has
-  nothing to do with which way the victim happens to be facing, and inside the
-  yaw a body turning to face its attacker would drag its own dent around with
-  it. Written as an outer-product `fa*aa^T + fb*bb^T` rather than
-  rotate-scale-rotate-back — same matrix, two fewer multiplies, and the
-  translation column is deliberately untouched so the squash is about the FEET
-  like everything else in that matrix.
-- **The spring is DRIVEN, not kicked.** The target squash tracks how deep the
-  weapon is *right now*, so the dent deepens while the fist buries and only
-  springs back — through zero, several times — when the fist leaves. An impulse
-  at contact would have fired and finished before the punch had.
-- **`hitPeak` is banked EVERY FRAME in `reportContact`, and drained on the pose
-  step.** Reading `contacts_` at 12 Hz instead looks equivalent and is not: a
-  jab's contact can begin and end entirely between two pose steps, so the
-  fastest punches — the ones that should wobble hardest — would produce nothing
-  at all.
-- **Stepped on the 12 Hz pose grid** with the gait spring (trap 4), and PARKED
-  at exactly zero when it rings out. A `q` of 1e-7 drifting toward zero is a
-  traced uniform that never settles, which quietly costs the idle frame rate
-  reuse buys — `CLAYFRAY_DEBUG_REUSE=1` is what names that class of bug.
-- **Everything rides it for free** because it goes into `pieces[0].xform`: the
-  eye beads, the shadow proxy capsules, the strike hit capsules, and the
-  unarmed mitts (which hang off the body affine). No new uniform, no new
-  binding, no shader change — the tracer has always been sent a matrix.
-- **That includes a feedback path, and it is deliberate**: a dented body moves
-  its own hit capsules, so a fist has to reach further into a dent to keep
-  biting. It is bounded (`impactMax` 0.34), damped, and stepped on a fixed
-  grid, so it stays replay-deterministic.
+**A dent (mode 3) is volume-conserving BY CONSTRUCTION, and the window is what
+makes that true.** The profile is `delta(rho) = amp * (1-u^2)^2 * (1-4u^2)`,
+`u = rho/R`, `rho` measured from the punch AXIS: the core dents in, the rim
+bulges back out, and `integral(delta*rho, 0..R) == 0` — which is the single
+condition that makes the surface integral vanish for a plane at ANY tilt and
+ANY offset. `(1-u^2)^2*(1-k*u^2)` satisfies it at exactly `k = 4`.
 
-The mitts follow the dent only while UNARMED. A sword grip is placed off world
-blade geometry rather than off the body affine, so a hero holding a sword
-wobbles from the waist while its hands stay on the hilt — which is what hands
-gripping something should do.
+The displacement has to fade out somewhere or it runs an infinite cylinder and
+dents the far side of the body. **Fade it on `dOld`, never on the axial
+coordinate.** An axial window varies across a tilted or off-centre contact
+patch so it stops factoring out of the integral; a field window is identically
+1 everywhere ON the surface, which is exactly where the volume integral lives.
+Measured by replaying the shader's own occupancy sum on a voxel grid:
 
-Snapshots carry it in an additive `RBAG` section (four floats per fighter: the
-spring pair plus the axis, which is state — nothing after the hit remembers
-where the hit came from). An older snapshot has no `RBAG` and restores at rest,
-so no `kVersion` bump.
+| window | 25 mm offset | 45 deg tilt | curved body |
+|---|---|---|---|
+| axial | **-7%** | **-30%** | — |
+| field, 16 vox | +0.9% | +1.0% | +3% |
 
-Tuning is all ctl, and by eye:
+**Negative is the bad sign** — it means the punch created clay and healed its
+target. The field window is positive in every case tested, so the residual
+bills as damage. Its width is set by a second-order effect worth knowing: the
+window is evaluated at `dOld` while the surface ends up at `dOld = -shift`, so
+a narrow window damps the deep core more than the shallow rim (3% at 8 voxels,
+0.9% at 16). `DENT_MAX` keeps the shift under `DENT_WIN/1.54`, past which the
+field folds back on itself and grows a second zero crossing — a shell floating
+off the skin.
+
+**The dent bills its SIGNED residual to both sides of the ledger at once**
+(`carved += v; debt += v`), which keeps `carved == deposited + inFlight + debt`
+exact whatever the residual turns out to be, in either direction. The shader
+accumulates two's complement into the same `counters[3]` u32 — `atomicAdd`
+wraps, which IS signed addition — and only the CPU read has to know. Carve and
+add stay UNSIGNED on purpose: one op big enough to swallow ~6.3k solid cells
+passes 2^31 in fixed point, and reading that as negative would credit the
+ledger for clay it just removed.
+
+**A punch is a dent plus a smaller rupture**, and it has to be: damage in
+M-DEATH is the carved ledger and nothing else, so a fist that ONLY dented could
+never kill. `impact.punchCarve` (0.70) is the dial, and it moves the
+punches-to-a-kill count by roughly its inverse square — 1.0 is the old pellety
+behaviour at ~20 punches, 0.70 is ~40, 0.4 is ~125.
+
+**Paint (mode 4) blends albedo and touches nothing else** — no allocation, no
+distance write, no brick free, no `IND_DIRTY`, no ledger. That is what makes it
+affordable to stamp one on every landing hit: `impact.bruise` marks an impact,
+`impact.smear` drags the same stain along a blade's capsules (it rides the
+fused brush for free — the capsules are already in the target's rest space and
+already bounds-checked). One colour for both, because they are the same
+judgement call; feeding the smear the wound's own colour is a one-line change
+to `BrickEdit::srcColor`, it just reads as nothing on a uniformly coloured body.
+
+All of it is `impact.*` in ctl rather than `phys.*`, and the line is ownership:
+`PhysicsParams` is read by the 60 Hz sim (forces, constraints, rate
+multipliers), `ImpactParams` by the renderer, which is what resolves where a
+weapon is and what shape it cuts.
 
 ```sh
-tools/ctl.sh "set rig.impactGain 4" "set rig.impactDamp 3" "set phys.knockForce 0"
+tools/ctl.sh "set impact.dentDepth 0.016" "set impact.punchCarve 0.4"
+tools/ctl.sh "set impact.bruise 0.8" "set impact.smear 0"
 ```
 
 ## Death and respawn (M-DEATH)
@@ -567,9 +601,10 @@ procedural spring (there are no clips), and the orbit target follows it. `SPACE`
 swings. The sword rests in a VERTICAL guard with a slight bob (quantized to
 the 12 Hz pose grid, trap 4); the swing is a three-beat flourish over 0.80 s —
 wind up high, flatten to horizontal and sweep across the front at chest
-height, then recover to guard. The slow flourish is deliberate: it keeps the
-per-frame blade sweep inside what `BrickSystem::kOpsPerFrame` (6) cut substeps
-can bridge, so a faster swing would need that budget raised.
+height, then recover to guard. The flourish used to be slow because it HAD to
+be — the per-frame blade sweep had to fit inside six cut substeps, one edit
+each. R19 fused them into a single multi-capsule op, so the ceiling moved from
+~4.7 to ~12.7 m/s of tip travel and swing timing is a look decision again.
 `1/2/3` still switch orbit/carve/add.
 
 **`SPACE` throws a JAB instead when the sword is away** (`set sword.enabled 0`).
@@ -649,7 +684,9 @@ tools/ctl.sh quit
 Commands: `get NAME|*`, `set NAME V..` (any LookParams/sword/cam/brush field,
 names = struct paths like `sword.pitch`; plus `handpose.*` for the unarmed mitt
 placement and its bob, `ai.*` for opponent behaviour, `phys.*` for knockback /
-resistance / body collision, `death.*` for the collapse threshold and how the
+resistance / body collision, `impact.*` for what a landing strike does to the
+CLAY (dent depth, rupture size, bruise and smear — R20/R21),
+`death.*` for the collapse threshold and how the
 mass leaves, `motion.arenaRadius` for the invisible wall, and `p1.*`… per
 opponent, now including `guard`/`punch`/`punchSide`),
 `edit carve|add x y z r [rgb [dir srcRGB [player]]]`, `bake`, `shot PATH`,
@@ -838,12 +875,20 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    `updateConservation` read the same constants. Adding an array to the uniform
    block means adding its capacity there — never a literal in the WGSL.
 
+   `EditParams.caps` (R19) is another one: sized
+   `array<vec4f, (MAX_BRUSH_CAPS - 1u) * 2u>` off the same generated block, and
+   `edit.wgsl` grew a `//#constants` line above ITS struct for the same reason.
+   Its C++ side has a `static_assert` on `sizeof(EditParamsCpu)`, which catches
+   a CPU-side change but cannot see the shader — so it is a backstop, not the
+   check.
+
    **This is an EXIT CODE now, not a grep.** It used to be a manual check a
    human had to remember to run, which sat badly next to the iteration rule
    telling agents not to render to verify their own work. Every headless mode
    returns through `gpuHealthExit()`: **4** if any pipeline was rejected or the
    device reported an uncaptured error, distinct from 3 (conservation) and 1
-   (I/O). So after ANY change to the uniform block or to `kMaxFighters`:
+   (I/O). So after ANY change to the uniform block, to `kMaxFighters`, or to
+   `kMaxBrushCaps`:
 
    ```sh
    ./build/clayfray --screenshot /tmp/x.png --frames 4 --size 320x180 --aa 1

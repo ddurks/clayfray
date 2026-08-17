@@ -280,16 +280,6 @@ class Renderer {
     };
     float springPoseTime_ = -1.f;
 
-    // M-BAG: the punching-bag wobble. Same integrator, same 12 Hz grid, but the
-    // squash is about a HORIZONTAL axis the hit chose rather than about the
-    // vertical, so it needs that axis carried with it. The axis is latched on
-    // contact and then held for the whole ring-out: recomputing it as the dent
-    // springs back would swing the deformation around while it is recovering.
-    struct ImpactWobble {
-        float q = 0.f, v = 0.f;   // q < 0 = dented along the axis
-        float ax = 0.f, az = 1.f; // world xz, unit
-    };
-
   public:
     // ---- ONE FIGHTER ----
     // Every field here used to exist twice, as a `foo_`/`foeFoo_` pair, and
@@ -306,17 +296,6 @@ class Renderer {
         // What is actually DRAWN: the sim pose latched onto the 12 Hz grid.
         FighterPose disp;
         BodySpring spring;
-        ImpactWobble wobble;
-        // M-BAG: the deepest bite anything has taken out of this body SINCE THE
-        // LAST POSE STEP, with the direction it came in on. Accumulated every
-        // frame in reportContact and drained by stepImpact.
-        //
-        // The peak is kept per frame rather than sampled on the pose step
-        // because a jab's contact can begin and end BETWEEN two steps: sampling
-        // at 12 Hz would miss the fastest punches entirely, which are precisely
-        // the ones that should wobble hardest.
-        float hitPeak = 0.f;
-        float hitDir[3] = {0.f, 0.f, 0.f};
         // Posed skin matrices; empty under the brush rig (there is no skeleton).
         std::vector<float> skinMats;
         // Posed brush pieces — body affine + one rigid transform per mitt.
@@ -364,23 +343,19 @@ class Renderer {
         return bones_.empty() && !fighters_[0].pieces.empty();
     }
     static void stepSpring(BodySpring& s, const RigParams& r, bool moving, float dt);
-    // M-BAG: one pose step of the impact wobble. Consumes the fighter's
-    // accumulated hit peak, so it must run exactly once per pose step.
-    static void stepImpact(Fighter& f, const RigParams& r, float dt);
     // Shadow-proxy capsule fitted to a brush's rest AABB (there are no bones
     // left for deriveCapsules to fit to).
     static void capsuleFromBox(const float lo[3], const float hi[3], float a[3],
                                float b[3], float& r);
     void bodyAffine(const FighterPose& disp, const BodySpring& s,
-                    const ImpactWobble& w, const RigParams& r,
-                    float out[16]) const;
+                    const RigParams& r, float out[16]) const;
     // Recomputes one fighter's three piece transforms and brush boxes for the
     // current pose. `grip` is the world-space sword geometry to hold, or null
     // to place the mitts from look.handPose (idle / guard / punch).
     // `poseTime` is the 12 Hz clock the hand bob steps on.
     void updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
                         const FighterPose& disp, const BodySpring& s,
-                        const ImpactWobble& w, const LookParams& look,
+                        const LookParams& look,
                         const SwordParams* grip, float poseTime) const;
     // Palm position and orientation for ONE unarmed mitt, in CHARACTER space
     // (before the body affine and the per-side mirror). Split out because the
@@ -521,7 +496,7 @@ class Renderer {
     // M5: a MOVING blade that overlaps fighter 1 carves a channel along its
     // sweep. Gated on blade speed so a sword merely resting against the
     // opponent doesn't eat it.
-    void updateBladeCut();
+    void updateBladeCut(const LookParams& look);
     float prevTip_[3] = {0, 0, 0}, prevHilt_[3] = {0, 0, 0};
     bool haveBlade_ = false;
     // M-FIST: the same idea one weapon down. A closed fist travelling fast

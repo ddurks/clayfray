@@ -669,11 +669,11 @@ void Renderer::unarmedHand(const FighterPose& disp, const LookParams& look, int 
 
 void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
                               const FighterPose& disp, const BodySpring& s,
-                              const ImpactWobble& w, const LookParams& look,
+                              const LookParams& look,
                               const SwordParams* grip, float poseTime) const {
     if (!brush_.valid || pieces.size() < 3) return;
     float A[16];
-    bodyAffine(disp, s, w, look.rig, A);
+    bodyAffine(disp, s, look.rig, A);
     std::memcpy(pieces[0].xform, A, sizeof(A));
     for (int k = 0; k < 3; k++) {
         pieces[0].lo[k] = brush_.bodyLo[k];
@@ -849,15 +849,8 @@ void Renderer::stepSpring(BodySpring& s, const RigParams& r, bool moving, float 
 // sanity check that the sign convention below matches the old root transform:
 // positive lean tips the head toward +Z, the fighter's forward.
 //
-// M-BAG appends ONE factor on the world side:
-//   world = T(pos + hop) . Dent(hit axis) . Yaw . Shear . Scale(squish)
-// Dent is in WORLD xz because the axis it squashes about is where the punch
-// came from, which has nothing to do with which way the victim happens to be
-// facing — and putting it outside the yaw is what keeps a body spinning to
-// face its attacker from dragging its own dent around with it.
 void Renderer::bodyAffine(const FighterPose& disp, const BodySpring& s,
-                          const ImpactWobble& w, const RigParams& r,
-                          float out[16]) const {
+                          const RigParams& r, float out[16]) const {
     const float ky = std::min(std::max(1.f + s.q, 0.55f), 1.45f);
     // sideways bulge: squashing down pushes clay out. Not strictly volume
     // preserving — `widen` is a taste knob, and clay is not water.
@@ -874,74 +867,6 @@ void Renderer::bodyAffine(const FighterPose& disp, const BodySpring& s,
     out[13] = disp.pos[1] + hop;
     out[14] = disp.pos[2];
     out[15] = 1.f;
-    if (w.q == 0.f) return;
-
-    // Dent: scale by `fa` along the hit axis a, by `fb` across it, by `fy` up.
-    // Written as the outer-product form fa*aa^T + fb*bb^T with b = perp(a),
-    // which is the same thing as rotating into the axis and back, minus the two
-    // matrix multiplies. Like the squish it is about the FEET (y = 0), so the
-    // dent never lifts the fighter off the floor — only the linear part is
-    // touched below and the translation column is left exactly as it was.
-    const float fa = std::min(std::max(1.f + w.q, 0.4f), 1.6f);
-    const float fb = std::min(std::max(1.f - r.impactWiden * w.q, 0.4f), 1.6f);
-    const float fy = std::min(std::max(1.f - r.impactLift * w.q, 0.4f), 1.6f);
-    const float ax = w.ax, az = w.az;
-    const float d00 = fa * ax * ax + fb * az * az;
-    const float d02 = (fa - fb) * ax * az;
-    const float d22 = fa * az * az + fb * ax * ax;
-    for (int c = 0; c < 3; c++) { // column-major: D * out, column by column
-        float* col = out + c * 4;
-        const float x = col[0], y = col[1], z = col[2];
-        col[0] = d00 * x + d02 * z;
-        col[1] = fy * y;
-        col[2] = d02 * x + d22 * z;
-    }
-}
-
-// One 12 Hz step of the punching-bag wobble, for ONE fighter.
-//
-// The spring is DRIVEN toward a target set by however deep a weapon currently
-// is (RigParams::impactGain), not kicked by an impulse at contact: a fist is
-// inside a body for a tenth of a second or more, and the dent has to deepen
-// with it and then let go, which an impulse cannot express.
-//
-// `hitPeak` is consumed here and refilled by reportContact over the frames that
-// follow, so a contact that has ENDED reads as target 0 on the next step and
-// the body springs back through zero — the ring-out is the spring's own, with
-// no separate release state to get stuck in.
-void Renderer::stepImpact(Fighter& f, const RigParams& r, float dt) {
-    if (dt <= 0.f) return;
-    ImpactWobble& w = f.wobble;
-    if (f.hitPeak > 0.f) {
-        // Latch the axis on a fresh hit only. Held through the recovery, so a
-        // dent finishes wobbling along the line it was made on.
-        const float l = std::sqrt(f.hitDir[0] * f.hitDir[0] +
-                                  f.hitDir[2] * f.hitDir[2]);
-        if (l > 1e-4f) {
-            w.ax = f.hitDir[0] / l;
-            w.az = f.hitDir[2] / l;
-        }
-    }
-    const float target = -std::min(r.impactGain * f.hitPeak, r.impactMax);
-    f.hitPeak = 0.f;
-    // Same substepped semi-implicit Euler as the gait spring, and for the same
-    // reason: dt is a whole ~83 ms pose step against a ~0.64 s period, so one
-    // step per frame integrates visibly lumpily. Fixed count, no wall clock.
-    const int kSub = 4;
-    const float h = dt / (float)kSub;
-    for (int i = 0; i < kSub; i++) {
-        w.v += (-r.impactK * (w.q - target) - r.impactDamp * w.v) * h;
-        w.q += w.v * h;
-    }
-    w.q = std::min(std::max(w.q, -r.impactMax), r.impactMax);
-    // Park it exactly at rest once the ring-out is inaudible. The wobble is a
-    // TRACED uniform, so a q of 1e-7 drifting toward zero would re-trace a
-    // standing fighter every pose step forever and quietly cost the idle frame
-    // rate that reuse buys (trap: CLAYFRAY_DEBUG_REUSE names inputs like this).
-    if (std::fabs(w.q) < 1e-4f && std::fabs(w.v) < 1e-3f && target == 0.f) {
-        w.q = 0.f;
-        w.v = 0.f;
-    }
 }
 
 int Renderer::packAffinePieces(float out[kUniformSlots][4], int idx,
@@ -1951,6 +1876,31 @@ void Renderer::absorbMeasured() {
                 sliceVol_ += m.volume;
                 sliceOpen_ = true;
             }
+        } else if (m.edit.mode == 3) {
+            // R20: a dent moves clay around inside one body; the profile is
+            // authored so the core and the rim cancel, and this measurement is
+            // the SIGNED residual curvature leaves behind — measured at ~3% of
+            // the displaced volume on a body this round, so a millilitre or two
+            // per punch against the ~48 ml it moved, and positive (the dent
+            // nets a little clay OFF) in every case tested.
+            //
+            // Billing it to BOTH sides of the ledger is what makes that exact
+            // rather than approximately-zero: carved and debt move together, so
+            // `carved == deposited + inFlight + debt` survives whatever the
+            // residual turns out to be, in either direction. A negative one
+            // (the dent net-created clay) reads as the body borrowing from what
+            // it already owed the arena, which is the same bookkeeping a
+            // re-stuck gob does.
+            //
+            // No wound, no gob, no fromWeapon: the dribble spawner needs debt
+            // ABOVE its minimum gob to fire, so a residual this small simply
+            // waits for real damage to carry it out.
+            sploot_.carved += m.volume;
+            sploot_.debt += m.volume;
+            if (m.edit.player >= 0 && m.edit.player < kMaxPlayers) {
+                Fighter& f = fighters_[m.edit.player];
+                f.carved = std::max(0.f, f.carved + m.volume);
+            }
         } else if (m.edit.mode == 2 && m.edit.fromGob) {
             // a landed gob became body clay; smin over/under-fill goes back
             // on the ledger so nothing is created or destroyed
@@ -1971,16 +1921,6 @@ void Renderer::absorbMeasured() {
 void Renderer::reportContact(int attacker, int target, int side, float bite,
                              const float dir[3], float speed) {
     if (!(bite > 0.f)) return;
-    // M-BAG: bank the deepest bite of the moment for the wobble. Kept on the
-    // FIGHTER rather than read off contacts_ at the pose step, because
-    // contacts_ is rebuilt per frame and a fast jab can come and go entirely
-    // between two 12 Hz steps — the wobble would then miss the hardest hits.
-    // Also deliberately independent of the deepest-wins dedup below: this is
-    // "how hard was this body hit", summed over nobody, maxed over everybody.
-    if (target >= 0 && target < kMaxPlayers && bite > fighters_[target].hitPeak) {
-        fighters_[target].hitPeak = bite;
-        for (int k = 0; k < 3; k++) fighters_[target].hitDir[k] = dir[k];
-    }
     for (StrikeContact& c : contacts_) {
         if (c.attacker != attacker || c.target != target || c.side != side) continue;
         // Deepest wins. Keeping the deepest sample's direction with it matters:
@@ -2146,6 +2086,11 @@ void Renderer::updatePunchCut(const LookParams& look) {
                 // fist pressing slowly into a body is near zero exactly when
                 // the resistance should be highest.
                 float maxPen = 0.f;
+                // Where the fist was when it was deepest. R20 puts the dent on
+                // the SURFACE, and the surface under the fist is exactly this
+                // point walked back along the contact normal by however much of
+                // the fist is not buried.
+                float deepP[3] = {0.f, 0.f, 0.f};
                 const int kSamples = 16;
                 for (int i = 0; i <= kSamples; i++) {
                     const float t = (float)i / (float)kSamples;
@@ -2170,7 +2115,10 @@ void Renderer::updatePunchCut(const LookParams& look) {
                             std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
                         // inflate by the fist: two solids, not a point
                         if (dist >= cr + fistR) continue;
-                        maxPen = std::max(maxPen, (cr + fistR) - dist);
+                        if ((cr + fistR) - dist > maxPen) {
+                            maxPen = (cr + fistR) - dist;
+                            std::memcpy(deepP, p, sizeof(deepP));
+                        }
                         tIn = std::min(tIn, t);
                         tOut = std::max(tOut, t);
                         if (hitPiece < 0) hitPiece = c.bone;
@@ -2198,10 +2146,6 @@ void Renderer::updatePunchCut(const LookParams& look) {
                     reportContact(atk, ti, side, maxPen, d, sweep * 60.f);
                 }
 
-                BrickEdit e;
-                e.mode = 1; // carve
-                e.radius = fistR;
-                e.segment = true;
                 float wA[3], wB[3];
                 for (int k = 0; k < 3; k++) {
                     const float d = cur[side][k] - pv[k];
@@ -2215,6 +2159,65 @@ void Renderer::updatePunchCut(const LookParams& look) {
                 if (hitPiece >= 0 && (size_t)hitPiece < tgt.pieces.size()) {
                     matInvAffine(tgt.pieces[hitPiece].xform, invPiece);
                 }
+                // The point on the SKIN under the deepest part of the fist: the
+                // fist centre, walked back along the outward normal by the part
+                // of it that is still outside.
+                const ImpactParams& imp = look.impact;
+                float contactW[3];
+                for (int k = 0; k < 3; k++) {
+                    contactW[k] = deepP[k] - nrm[k] * (fistR - maxPen);
+                }
+
+                // ---- R20: the dent ----
+                // Most of a punch is displacement, and displacement is free on
+                // the ledger by construction — no gob, no debt, no dribble. It
+                // goes in FIRST so the rupture below cuts a surface that has
+                // already moved, which is the order the two happen physically.
+                //
+                // The axis is the inward SURFACE NORMAL, not the punch
+                // direction: the profile's volume cancels exactly for a surface
+                // perpendicular to the axis, and a glancing blow displacing
+                // along its own travel would mostly shove clay sideways.
+                if (imp.dentDepth > 0.f) {
+                    BrickEdit d;
+                    d.mode = 3;
+                    d.player = tgt.vol.slot();
+                    d.radius = std::max(fistR * imp.dentRadius, 1e-4f);
+                    const float halfLen =
+                        std::max(d.radius * imp.dentLength, 1e-4f);
+                    float aW[3], bW[3];
+                    for (int k = 0; k < 3; k++) {
+                        aW[k] = contactW[k] + nrm[k] * halfLen; // outside the skin
+                        bW[k] = contactW[k] - nrm[k] * halfLen; // into the body
+                    }
+                    matTransformPoint(invPiece, aW, d.pos);
+                    matTransformPoint(invPiece, bW, d.posB);
+                    // The amplitude is authored in world metres but applied to a
+                    // rest-space field, and the body affine carries a squish.
+                    // The axis segment went through the same transform, so its
+                    // length ratio is that scale along the direction that
+                    // matters.
+                    float restLen = 0.f;
+                    for (int k = 0; k < 3; k++) {
+                        const float dd = d.posB[k] - d.pos[k];
+                        restLen += dd * dd;
+                    }
+                    restLen = std::sqrt(restLen);
+                    const float scale = halfLen > 1e-6f ? restLen / (2.f * halfLen) : 1.f;
+                    d.dentAmp = imp.dentDepth * scale;
+                    std::memcpy(d.worldPos, contactW, sizeof(d.worldPos));
+                    std::memcpy(d.outDir, nrm, sizeof(d.outDir));
+                    if (tgt.vol.editInBounds(d)) tgt.vol.queueEdit(d);
+                }
+
+                // ---- the rupture ----
+                // What is left of the punch after the dent took the bulk of it:
+                // a smaller carve that does eject a chunk, and therefore is what
+                // M-DEATH counts as damage. impact.punchCarve is the dial.
+                BrickEdit e;
+                e.mode = 1; // carve
+                e.radius = fistR * std::max(imp.punchCarve, 0.f);
+                e.segment = true;
                 matTransformPoint(invPiece, wA, e.pos);
                 matTransformPoint(invPiece, wB, e.posB);
                 for (int k = 0; k < 3; k++) e.worldPos[k] = (wA[k] + wB[k]) * 0.5f;
@@ -2222,7 +2225,24 @@ void Renderer::updatePunchCut(const LookParams& look) {
                 e.player = tgt.vol.slot();
                 e.fromWeapon = true; // one chunk, not a dribble
 
-                if (!tgt.vol.editInBounds(e)) continue;
+                // ---- R21: the bruise ----
+                // Queued whether or not the rupture lands, because a punch that
+                // was too glancing to break the skin still leaves a mark — and
+                // an albedo stamp costs no allocation, no JFA and no ledger.
+                if (imp.bruise > 0.f) {
+                    BrickEdit b;
+                    b.mode = 4;
+                    b.player = tgt.vol.slot();
+                    b.radius = std::max(fistR * imp.bruiseRadius, 1e-4f);
+                    b.paint = imp.bruise;
+                    matTransformPoint(invPiece, contactW, b.pos);
+                    std::memcpy(b.posB, b.pos, sizeof(b.posB));
+                    std::memcpy(b.color, imp.bruiseColor, sizeof(b.color));
+                    std::memcpy(b.worldPos, contactW, sizeof(b.worldPos));
+                    if (tgt.vol.editInBounds(b)) tgt.vol.queueEdit(b);
+                }
+
+                if (e.radius <= 0.f || !tgt.vol.editInBounds(e)) continue;
                 tgt.vol.queueEdit(e);
                 // the chunk leaves from where the fist was DEEPEST, along the
                 // punch — clay knocked off the far side of the impact
@@ -2242,7 +2262,7 @@ void Renderer::updatePunchCut(const LookParams& look) {
     }
 }
 
-void Renderer::updateBladeCut() {
+void Renderer::updateBladeCut(const LookParams& look) {
     // Player 0 wields the sword; anyone else on the field is a target.
     if (!swordWorld_.enabled || capsules_.empty()) {
         haveBlade_ = false;
@@ -2297,8 +2317,9 @@ void Renderer::updateBladeCut() {
 
     // ONE TARGET. Called for every fighter but the wielder, so a four-way
     // brawl cuts whoever the blade actually passes through instead of only
-    // ever player 1. Each target drains its own kOpsPerFrame substep budget
-    // (separate BrickSystems), so they do not compete for edit slots.
+    // ever player 1. Each one costs a single fused op now (R19), so a brawl
+    // cannot exhaust the frame's edit budget the way six-substeps-per-target
+    // could.
     auto cut = [&](Fighter& tgt) {
     // Sweep in TIME as well as along the blade, and emit ONE CAPSULE PER
     // SUBSTEP rather than collapsing the whole sweep into a single capsule.
@@ -2311,7 +2332,23 @@ void Renderer::updateBladeCut() {
     // union scallops along its edge, at ~0.6 it reads as one clean slot
     const float step = std::max(swordWorld_.radius * 1.8f, 0.022f) * 0.6f;
     int subs = (int)std::ceil(sweep / step);
-    subs = std::min(std::max(subs, 1), BrickSystem::kOpsPerFrame);
+    // R19: bounded by how many capsules ONE brush may union, which is a memory
+    // number. It used to be bounded by kOpsPerFrame — a queue-drain budget —
+    // and that made a rendering constant decide how fast a sword may swing.
+    subs = std::min(std::max(subs, 1), kMaxBrushCaps);
+
+    // R19: every substep that connects becomes a capsule of ONE edit, unioned
+    // by a min in the shader. Six separate soft-carves scalloped along their
+    // seams (each smin'd against a field the last had already moved), cost six
+    // dispatches and six ledger readbacks, and the substep count was capped by
+    // an unrelated budget. This is the true swept union, measured once.
+    BrickEdit e;
+    e.mode = 1; // carve
+    e.radius = std::max(swordWorld_.radius * 1.8f, 0.022f);
+    e.segment = true;
+    e.capCount = 0;
+    float exitW[3] = {0.f, 0.f, 0.f};   // world, where the blade last left clay
+    float lastNrm[3] = {0.f, 1.f, 0.f};
     for (int si = 1; si <= subs; si++) {
         float a = (float)si / (float)subs;
         float h0[3], t0s[3];
@@ -2357,10 +2394,6 @@ void Renderer::updateBladeCut() {
         }
         if (tOut < tIn) continue; // this instant misses
 
-        BrickEdit e;
-        e.mode = 1; // carve
-        e.radius = std::max(swordWorld_.radius * 1.8f, 0.022f);
-        e.segment = true;
         float dirW[3] = {t0s[0] - h0[0], t0s[1] - h0[1], t0s[2] - h0[2]};
         float bladeLen =
             std::sqrt(dirW[0] * dirW[0] + dirW[1] * dirW[1] + dirW[2] * dirW[2]);
@@ -2394,34 +2427,66 @@ void Renderer::updateBladeCut() {
         } else if (hitBone >= 0 && (size_t)(hitBone * 16 + 16) <= tgt.skinMats.size()) {
             matInvAffine(&tgt.skinMats[hitBone * 16], invBone);
         }
-        matTransformPoint(invBone, wA, e.pos);
-        matTransformPoint(invBone, wB, e.posB);
+        float rA[3], rB[3];
+        matTransformPoint(invBone, wA, rA);
+        matTransformPoint(invBone, wB, rB);
+        // Bounds-tested PER CAPSULE rather than on the finished brush: an
+        // edit dropped at the volume boundary (trap 5) must cost only the
+        // substep that strayed, not the rest of the swing that was fine.
+        // Every capsule passing here is what makes the queueEdit below
+        // unconditional, which is what keeps slicePending_ counting exactly
+        // the ops that will be measured.
+        if (!tgt.vol.capsuleInBounds(rA, rB, e.radius)) continue;
+        if (e.capCount == 0) {
+            std::memcpy(e.pos, rA, sizeof(rA));
+            std::memcpy(e.posB, rB, sizeof(rB));
+            e.capCount = 1;
+        } else if (e.capCount < kMaxBrushCaps) {
+            std::memcpy(e.capA[e.capCount - 1], rA, sizeof(rA));
+            std::memcpy(e.capB[e.capCount - 1], rB, sizeof(rB));
+            e.capCount++;
+        }
+        // Each substep overwrites these, so after the loop they name the LAST
+        // place the blade was still cutting — which is the exit, and where the
+        // slice gob comes from. worldPos is the wound the dribble path spawns
+        // at, and it is the same per-substep midpoint it always was.
         for (int k = 0; k < 3; k++) e.worldPos[k] = (wA[k] + wB[k]) * 0.5f;
         std::memcpy(e.outDir, nrm, sizeof(e.outDir)); // gobs spray off the cut
-        e.player = tgt.vol.slot(); // whose clay this is, for the ledger/snapshot
-        e.fromWeapon = true; // pool this into the slice gob, don't dribble it
-        // editInBounds is what queueEdit re-checks, so testing it here keeps
-        // slicePending_ counting exactly the edits that will be measured — an
-        // edit silently dropped at the volume boundary (trap 5) must not leave
-        // the slice waiting forever for a measurement that never comes.
-        if (tgt.vol.editInBounds(e)) {
-            tgt.vol.queueEdit(e);
-            // The gob spawns where the blade LEAVES the body, so latch wB —
-            // the tip-side end of the span inside the opponent — rather than
-            // the midpoint the edit carries for the dribble path. Overwritten
-            // by each later substep, so at flush time this is the last place
-            // the blade was still cutting: the exit.
-            std::memcpy(sliceExit_, wB, sizeof(sliceExit_));
-            std::memcpy(sliceNrm_, nrm, sizeof(sliceNrm_));
-            std::memcpy(sliceCol_, e.srcColor, sizeof(sliceCol_));
-            // blade travel this frame, unit — `sweep` is exactly |tip - pT|
-            float inv = sweep > 1e-6f ? 1.f / sweep : 0.f;
-            for (int k = 0; k < 3; k++) sliceSweep_[k] = (tip[k] - pT[k]) * inv;
-            sliceOpen_ = true;
-            sliceCutStep_ = true;
-            slicePending_++;
-            sliceWait_ = 0;
-        }
+        std::memcpy(exitW, wB, sizeof(exitW));
+        std::memcpy(lastNrm, nrm, sizeof(lastNrm));
+    }
+
+    if (e.capCount == 0) return; // the whole sweep missed, or fell out of bounds
+    e.player = tgt.vol.slot(); // whose clay this is, for the ledger/snapshot
+    e.fromWeapon = true; // pool this into the slice gob, don't dribble it
+    tgt.vol.queueEdit(e);
+    // The gob spawns where the blade LEAVES the body, so latch the tip-side end
+    // of the last span inside the opponent rather than the midpoint the edit
+    // carries for the dribble path.
+    std::memcpy(sliceExit_, exitW, sizeof(sliceExit_));
+    std::memcpy(sliceNrm_, lastNrm, sizeof(sliceNrm_));
+    std::memcpy(sliceCol_, e.srcColor, sizeof(sliceCol_));
+    // blade travel this frame, unit — `sweep` is exactly |tip - pT|
+    const float invSweep = sweep > 1e-6f ? 1.f / sweep : 0.f;
+    for (int k = 0; k < 3; k++) sliceSweep_[k] = (tip[k] - pT[k]) * invSweep;
+    sliceOpen_ = true;
+    sliceCutStep_ = true;
+    slicePending_++;
+    sliceWait_ = 0;
+
+    // R21: the smear. The same capsules one size up, stamped as albedo only —
+    // no allocation, no JFA, no ledger — so the cut's lips carry the mark of
+    // having been cut. It rides the fused brush for free: the capsules are
+    // already in the target's rest space and already bounds-checked, and the
+    // wider radius only reaches further into clay that is certainly there.
+    if (look.impact.smear > 0.f) {
+        BrickEdit s = e;
+        s.mode = 4;
+        s.fromWeapon = false; // paint is not clay; it must not pool into a gob
+        s.radius = e.radius * std::max(look.impact.smearRadius, 1.f);
+        s.paint = look.impact.smear;
+        std::memcpy(s.color, look.impact.bruiseColor, sizeof(s.color));
+        if (tgt.vol.editInBounds(s)) tgt.vol.queueEdit(s);
     }
     };
 
@@ -2593,11 +2658,6 @@ void Renderer::respawnFighter(int i, const LookParams& look) {
     f.pose.punch = 0.f;
     f.disp = f.pose;
     f.spring = BodySpring{};
-    // A fresh body is not still wobbling from the punch that killed the last
-    // one — and hitPeak has to go with it, or the first pose step after the
-    // respawn dents a whole body with the fatal blow's bite.
-    f.wobble = ImpactWobble{};
-    f.hitPeak = 0.f;
     // The mitts are somewhere else entirely now; a stale "where the fist was"
     // would read that teleport as a strike (updatePunchCut's own guard would
     // catch it, but relying on a magnitude threshold for a known discontinuity
@@ -3000,10 +3060,6 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         springPoseTime_ = frame.poseTime;
         for (Fighter& f : fighters_) {
             stepSpring(f.spring, look.rig, f.pose.moving, dt);
-            // M-BAG rides the same grid and the same guard: both springs feed
-            // one matrix, and stepping them on different clocks would give a
-            // fighter two rates of stop-motion at once.
-            stepImpact(f, look.rig, dt);
         }
     }
 
@@ -3043,7 +3099,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             const SwordParams* grip =
                 (i == 0 && swordWorld_.enabled && look.hands.ik) ? &swordWorld_
                                                                  : nullptr;
-            updateBrushRig(f.pieces, f.handPose, f.disp, f.spring, f.wobble, look,
+            updateBrushRig(f.pieces, f.handPose, f.disp, f.spring, look,
                            grip, frame.poseTime);
         }
     }
@@ -3064,7 +3120,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             // reproduces procedurally, at three pieces instead of thirteen.
             evalPose(bones_, nullptr, 0.f, fighters_[0].skinMats);
             float A[16];
-            bodyAffine(fighters_[0].disp, fighters_[0].spring, fighters_[0].wobble,
+            bodyAffine(fighters_[0].disp, fighters_[0].spring,
                        look.rig, A);
             for (size_t b = 0; b * 16 + 16 <= fighters_[0].skinMats.size(); b++) {
                 float tmp[16];
@@ -3181,7 +3237,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             // same collapse as the hero, driven by ITS pose and ITS spring
             evalPose(bones_, nullptr, 0.f, f.skinMats);
             float A[16];
-            bodyAffine(f.disp, f.spring, f.wobble, look.rig, A);
+            bodyAffine(f.disp, f.spring, look.rig, A);
             for (size_t b = 0; b * 16 + 16 <= f.skinMats.size(); b++) {
                 float tmp[16];
                 matMul(A, &f.skinMats[b * 16], tmp);
@@ -3226,7 +3282,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     // surviving one frame is a shove that keeps pushing after the fist has
     // withdrawn, which reads as the target being magnetically repelled.
     contacts_.clear();
-    updateBladeCut();
+    updateBladeCut(look);
     updatePunchCut(look);
 
     // conservation runs before packing so this frame's uniforms carry fresh
@@ -3568,20 +3624,6 @@ bool Renderer::saveSnapshot(const std::string& path, double simT,
         }
         w.section("RRIG", rig, sizeof(rig));
     }
-    // M-BAG wobble, its own additive section: an older snapshot simply has no
-    // RBAG and restores at rest, which is a valid body. Four floats per fighter
-    // — the spring pair plus the axis it is ringing along, which is state, not
-    // a derivable: nothing after the hit remembers where the hit came from.
-    {
-        float bag[4 * kMaxPlayers];
-        for (int i = 0; i < kMaxPlayers; i++) {
-            bag[i * 4 + 0] = fighters_[i].wobble.q;
-            bag[i * 4 + 1] = fighters_[i].wobble.v;
-            bag[i * 4 + 2] = fighters_[i].wobble.ax;
-            bag[i * 4 + 3] = fighters_[i].wobble.az;
-        }
-        w.section("RBAG", bag, sizeof(bag));
-    }
     w.section("RGOB", gobs_.data(), gobs_.size() * sizeof(Gob));
     w.section("CHRP", charPath.data(), charPath.size());
     bool ok = w.close();
@@ -3647,20 +3689,6 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
         r.read("RRIG", rig, sizeof(rig));
         for (int i = 0; i < kMaxPlayers; i++)
             fighters_[i].spring = BodySpring{rig[i * 3], rig[i * 3 + 1], rig[i * 3 + 2]};
-    }
-    // Same deal for the impact wobble — absent in any snapshot older than
-    // M-BAG, and a body at rest is the right thing to restore to. The axis
-    // default is +z rather than zero: a zero axis would make the dent matrix
-    // scale by fb in every horizontal direction if q were ever non-zero.
-    {
-        float bag[4 * kMaxPlayers] = {};
-        for (int i = 0; i < kMaxPlayers; i++) bag[i * 4 + 3] = 1.f;
-        r.read("RBAG", bag, sizeof(bag));
-        for (int i = 0; i < kMaxPlayers; i++) {
-            fighters_[i].wobble =
-                ImpactWobble{bag[i * 4], bag[i * 4 + 1], bag[i * 4 + 2], bag[i * 4 + 3]};
-            fighters_[i].hitPeak = 0.f;
-        }
     }
     // fresh dt baseline: the restored clock may sit anywhere on the timeline
     lastSimTime_ = -1.f;

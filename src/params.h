@@ -202,12 +202,13 @@ struct PhysicsParams {
     // ploughs through, so this integrates over the strike; firing an impulse
     // per frame instead would scale knockback with the frame rate.
     //
-    // M-BAG CUT IT TO A NUDGE. It was 26 m/s^2 / 2.2 m/s, i.e. the hit was
-    // ENTIRELY a displacement — the whole read was a rigid body sliding away,
-    // and clay does not do that. The deformation (RigParams::impact*) is the
-    // reaction now, and the shove is what stops a punching bag reading as
-    // bolted to the floor: enough to rock the stance, not enough to move the
-    // fight. `set phys.knockForce 0` gives the pure bag.
+    // CUT TO A NUDGE. It was 26 m/s^2 / 2.2 m/s, i.e. the hit was ENTIRELY a
+    // displacement — the whole read was a rigid body sliding away, and clay
+    // does not do that. What deforms now is the CLAY ITSELF, at the point of
+    // impact (the R20 dent, edit.wgsl mode 3), and the shove is what stops a
+    // struck body reading as bolted to the floor: enough to rock the stance,
+    // not enough to move the fight. `set phys.knockForce 0` gives the pure bag;
+    // 26 / 2.2 restores the old slide.
     float knockForce = 7.0f;  // m/s^2 per metre of bite
     float knockMax = 0.8f;    // m/s ceiling
     float knockDamp = 10.0f;  // m/s^2 linear bleed-off; 0.8 m/s stops in 0.08 s
@@ -228,6 +229,67 @@ struct PhysicsParams {
     float stagger = 0.20f;        // s of reduced steering on a full-strength hit
     float staggerBite = 0.05f;    // m of bite that earns all of it
     float staggerControl = 0.45f; // authority kept while staggered; never 0
+};
+
+// R20/R21: what a landing strike does to the CLAY, as opposed to what it does
+// to the body's motion.
+//
+// It sits in LookParams rather than next to PhysicsParams above, and the line
+// between them is ownership: everything in PhysicsParams is read by the 60 Hz
+// sim in main.cpp (forces, constraints, a rate multiplier), and every field
+// here is read by the renderer, which is what resolves where a weapon is and
+// what shape it cuts. Pushing these through the sim would mean pushing a copy
+// into the renderer every frame to get them back where they are used.
+struct ImpactParams {
+    // ---- the dent ----
+    // A fist mostly DISPLACES. edit.wgsl mode 3 is volume-conserving by
+    // construction, so most of a punch costs the ledger nothing at all — no
+    // gob, no debt, no dribble — and what is left is a much smaller rupture
+    // that does eject a chunk.
+    //
+    // The split matters for more than looks: damage in M-DEATH is the carved
+    // ledger and nothing else, so a fist that ONLY dented could never kill.
+    // punchCarve is the dial between "reads as a thud" and "reads as a wound",
+    // and it moves the punches-to-a-kill count by roughly its inverse square:
+    //   1.0 -> ~20 punches (the old, pellety behaviour)
+    //   0.7 -> ~40         (default: a dent you can see, a fight you can win)
+    //   0.4 -> ~125
+    //
+    // dentDepth is metres of inward push at the core. Two ceilings sit above
+    // it, neither of which corrupts anything if you cross them: the allocated
+    // narrow band (a dent never allocates, so one deeper than the shell clips),
+    // and edit.wgsl's DENT_MAX, which caps the shift at ~19 mm to keep the
+    // field monotonic along the normal.
+    //
+    // dentLength is the region the dent occupies along its own axis, and it is
+    // 1.2 rather than something tighter because a SHORT region clips the rim of
+    // the profile off a tilted contact patch — and the rim is the half that
+    // puts the displaced clay back. Measured residual with these values: <=1.1%
+    // of the displaced volume across +-30 deg of tilt and +-20 mm of offset,
+    // ~3% against a body of this curvature, positive in every case (see
+    // edit.wgsl dentShift for what "positive" buys).
+    float dentDepth = 0.010f;  // 0 disables the dent entirely
+    float dentRadius = 1.7f;   // x the fist radius, across the impact
+    float dentLength = 1.2f;   // x the dent radius, along the punch
+    float punchCarve = 0.70f;  // x the fist radius, for the rupture that ejects
+
+    // ---- the marks ----
+    // Albedo-only edits (mode 4): no allocation, no JFA, no redistance, no
+    // ledger. They cost a fraction of a carve, which is what makes it
+    // affordable to stamp one on every landing hit.
+    //
+    // One colour, two strengths, on purpose: a punch's bruise and a blade's
+    // smear are the same damage stain at different opacities, and splitting the
+    // colour would mean tuning the same judgement call twice. Feeding the
+    // smear the wound's OWN colour instead is a one-line change
+    // (BrickEdit::srcColor) — it just reads as nothing on a uniformly coloured
+    // body, which is what this asset is.
+    float bruise = 0.5f;       // 0..1 opacity at the impact core; 0 = off
+    float bruiseRadius = 1.5f; // x the weapon radius
+    // Linear RGB, dark and slightly warm against the body's cyan.
+    float bruiseColor[3] = {0.030f, 0.012f, 0.020f};
+    float smear = 0.35f;       // 0..1 opacity of a blade's contamination trail
+    float smearRadius = 1.6f;  // x the cut radius: the slot, plus its lips
 };
 
 // M-FIST: the opponent's behaviour. Deterministic by the house rules — fixed
@@ -372,36 +434,6 @@ struct RigParams {
     // so 0.45 is a ~2 cm hop on a 0.69 m body — a skip, not a leap.
     float hop = 0.45f;
     float widen = 0.5f;       // sideways bulge per unit of squish
-
-    // ---- M-BAG: the punching-bag wobble ----
-    //
-    // A SECOND spring, and a DIRECTIONAL one. The gait spring squashes about
-    // the vertical and knows only how fast the fighter is walking; this one
-    // squashes about the axis the weapon came in on, so a body hit in the ribs
-    // dents sideways and one hit head-on dents front-to-back. They are separate
-    // because they are driven by unrelated things and are meant to be visible
-    // at once — a walking fighter that takes a punch should keep bouncing while
-    // it wobbles.
-    //
-    // DRIVEN, not kicked: the target squash tracks how deep the weapon is right
-    // now, so the dent deepens while the fist buries and springs back — through
-    // zero, several times — only once the fist leaves. An impulse at contact
-    // would have fired and finished before the punch had.
-    //
-    // Stepped on the 12 Hz pose grid with the gait spring, for the same two
-    // reasons (trap 4, and a traced uniform must not move at 60 Hz).
-    // Squash per metre of bite. Set so a CONNECTING JAB lands mid-range rather
-    // than on the clamp: the AI's standoff puts a fist ~0.13 m into a body
-    // (see AiParams::standoff), so 1.8 gives -0.23 and leaves the top of the
-    // range for a sword buried to the hilt. Gain high enough to clamp a jab
-    // makes every punch produce the identical dent.
-    float impactGain = 1.8f;
-    float impactMax = 0.34f;  // clamp on |q|, target and ring-out alike
-    float impactK = 95.f;     // stiffness (rad/s)^2; period ~0.64 s, ~8 steps
-    float impactDamp = 5.0f;  // zeta ~0.26 — three or four visible wobbles
-    float impactWiden = 0.7f; // bulge ACROSS the hit axis per unit of squash
-    float impactLift = 0.45f; // ... and upward, which is what reads as clay
-                              // displaced rather than as a body scaled down
 };
 
 // M-DEATH: a fighter that has lost half its clay stops being a fighter.
@@ -544,6 +576,7 @@ struct LookParams {
     SwordParams sword;
     HandParams hands;
     HandPoseParams handPose;
+    ImpactParams impact;
     GazeParams gaze;
     MotionParams motion;
     RigParams rig;
