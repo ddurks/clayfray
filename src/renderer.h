@@ -208,6 +208,13 @@ class Renderer {
     BodyCom bodyCom_;
     int playerCount_ = 1;   // the hero always exists
     float autoReach_ = 0.f; // rest COM->wrist distance; hands.reach 0 uses it
+    // M-SPRING: the body brush's rest height, measured off the asset next to
+    // autoReach_ and constant after. It is the LEVER that turns the hopper's
+    // metres of compression into the fraction bodyAffine scales by, so it is
+    // read off the mesh rather than written down: a taller asset squashes by a
+    // smaller fraction for the same weight, which is what should happen. The
+    // fallback is this asset's own height, for the no-asset paths.
+    float bodyHeight_ = 0.69f;
     // Rest-space bounding sphere of the character, measured off the asset at
     // import. Every fighter re-derives its POSED reject sphere from this each
     // frame (packUniforms); these two are only the un-rigged fallback.
@@ -272,12 +279,14 @@ class Renderer {
     BrushRig brush_{};
     float handPoseTime_ = -1.f;
 
-    // Procedural squish: one scalar per fighter. q < 0 is compressed, q > 0
-    // stretched; the overshoot back through zero IS the bounce. Stepped on the
-    // 12 Hz pose grid only (trap 4 + frame reuse), fixed substeps, no RNG.
-    struct BodySpring {
-        float q = 0.f, v = 0.f, gait = 0.f;
-    };
+    // M-SPRING: the renderer no longer OWNS the hopper — the 60 Hz sim does
+    // (Body::stepHop, main.cpp), because travel depends on it and 12 Hz was too
+    // coarse to time a flight with. What is left here is the DISPLAY LATCH:
+    // `FighterPose::hopU` arrives at 60 Hz and is sampled onto the pose grid
+    // before anything draws with it, which is trap 4 and also what keeps a
+    // breathing fighter's uniforms still between pose steps. Squish and lift
+    // are then derived from the latched value (springSquish / springLift);
+    // neither is stored, because a stored copy is a second version of the truth.
     float springPoseTime_ = -1.f;
 
   public:
@@ -295,7 +304,12 @@ class Renderer {
         FighterPose pose;
         // What is actually DRAWN: the sim pose latched onto the 12 Hz grid.
         FighterPose disp;
-        BodySpring spring;
+        // M-SPRING: the hopper's contact coordinate, sampled off `pose` on each
+        // pose step and written back into `disp` every frame. It needs its own
+        // slot because `disp` is overwritten wholesale at 60 Hz whenever
+        // motion.stepRoot is off, which would otherwise drag the height along
+        // with the xz slide and lose the 12 Hz cadence.
+        float hopLatch = 0.f;
         // Posed skin matrices; empty under the brush rig (there is no skeleton).
         std::vector<float> skinMats;
         // Posed brush pieces — body affine + one rigid transform per mitt.
@@ -342,20 +356,23 @@ class Renderer {
     bool skeletonFree() const {
         return bones_.empty() && !fighters_[0].pieces.empty();
     }
-    static void stepSpring(BodySpring& s, const RigParams& r, bool moving, float dt);
+    // The hopper's three readouts. The integrator itself is Body::stepHop in
+    // main.cpp; these only turn its `u` into something to draw.
+    static float springSag(const RigParams& r);
+    static float springSquish(float u, const RigParams& r, float bodyHeight);
+    static float springLift(float u);
     // Shadow-proxy capsule fitted to a brush's rest AABB (there are no bones
     // left for deriveCapsules to fit to).
     static void capsuleFromBox(const float lo[3], const float hi[3], float a[3],
                                float b[3], float& r);
-    void bodyAffine(const FighterPose& disp, const BodySpring& s,
-                    const RigParams& r, float out[16]) const;
+    void bodyAffine(const FighterPose& disp, const RigParams& r,
+                    float out[16]) const;
     // Recomputes one fighter's three piece transforms and brush boxes for the
     // current pose. `grip` is the world-space sword geometry to hold, or null
     // to place the mitts from look.handPose (idle / guard / punch).
     // `poseTime` is the 12 Hz clock the hand bob steps on.
     void updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
-                        const FighterPose& disp, const BodySpring& s,
-                        const LookParams& look,
+                        const FighterPose& disp, const LookParams& look,
                         const SwordParams* grip, float poseTime) const;
     // Palm position and orientation for ONE unarmed mitt, in CHARACTER space
     // (before the body affine and the per-side mirror). Split out because the

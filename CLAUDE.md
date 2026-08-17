@@ -180,10 +180,135 @@ the frame — to articulate a rig that is 10/15 finger bones holding a static
 grip.
 
 - **The body is one matrix**: non-uniform scale (squish) + shear (lean) + yaw +
-  hop, all about the feet. `Renderer::bodyAffine`. The squish comes from a
-  spring in `RigParams`, integrated **on the 12 Hz pose grid** — not the frame
-  clock, because the squish is a traced uniform and a 60 Hz one would make a
-  standing fighter re-trace every frame.
+  hop, all about the feet. `Renderer::bodyAffine`. The squish and the hop both
+  come from the spring in `RigParams`, integrated **on the 12 Hz pose grid** —
+  not the frame clock, because the squish is a traced uniform and a 60 Hz one
+  would make a standing fighter re-trace every frame.
+
+### M-SPRING: the fighter BOUNCES, and it is a real hopper
+
+The walk used to be a slide with a bob on top — a spring kicked once per
+`gaitHz` and a "hop" that was `max(stretch,0) * hop`, i.e. a lift scaled off
+the spring's shape rather than produced by it. It is now the textbook vertical
+SLIP hopper, and it is **ONE variable, `BodySpring::u`, in METRES**:
+
+    u <  0   grounded, the body compressed by -u against the floor
+    u >= 0   airborne, the FEET at height u
+
+so the whole simulation is `vu -= g*h; if (u<0) vu += (-K*u - C*vu)*h; u += vu*h`
+and there is **no landing or takeoff event to detect**, therefore no way to miss
+one. Hop arc, landing squash and cadence are all consequences of that one line,
+not curves — they cannot be dialled independently, which is the point.
+
+Three things that are load-bearing and non-obvious:
+
+- **The authored rest shape is the LOADED one.** A blob standing on the floor
+  is already squashed by its own weight (`u* = -gravity/legK`, 4.4 cm here), and
+  the artist sculpted it standing — so that sag is where the squish reads ZERO.
+  A fighter at rest therefore looks exactly as authored (this changed no idle
+  silhouette), and a fighter in the AIR relaxes to its unloaded length and reads
+  as **stretched by exactly the sag it was carrying**, +6.3%. Squash-and-stretch
+  arrived at from the weight rather than keyed. It is also why `rig.hop` is gone:
+  the lift is in metres because `u` is.
+- **Walking PUMPS the spring.** `hopThrust` is one velocity impulse at MAXIMUM
+  COMPRESSION — where a push-off goes, and where pumping a swing goes — so the
+  gait is a limit cycle. Below a threshold thrust the body never leaves the
+  floor at all and hunkers in place; that is not a dead zone to tune out. More
+  thrust makes the cadence SLOWER (a bigger hop is a longer flight): 1.0 gives
+  2.33 Hz, 1.1 gives 2.00. Stopping needs no code — no push-off, damping wins,
+  and it is one last landing then a ring-down (9.6% squish to 2.3% in two
+  seconds, 0.3% by four).
+- **`legK` is bounded above by the 12 Hz DISPLAY**, even though the sim runs at
+  60: a spring ringing past ~3 Hz aliases into hash once it is sampled onto the
+  pose grid. 225 sits at 2.39 Hz.
+
+### TRAVEL IS BALLISTIC — the hop IS the walk
+
+**A planted foot does not slide.** While `hopU < 0` a fighter's own locomotion
+moves it nowhere; the push-off that throws it up also throws it forward along
+whatever heading it is steering, and it coasts on that until it lands, where the
+clay absorbs the horizontal along with the vertical. Leap, land, leap.
+`Body::stepHop` and `Body::integrate` in main.cpp are the whole of it.
+
+Measured at the shipped defaults: **0.47 m of ground per hop, 2.33 Hz, 48% of
+the time airborne, 1.10 m/s average** — a half-metre bound twice a second on a
+0.69 m body, at exactly the speed `kMaxSpeed` has always meant.
+
+- **This is why the hopper MOVED into the 60 Hz sim.** While the bounce was
+  cosmetic the pose grid was the right home. Once distance-per-hop is
+  locomotion, an airborne flag updating 12 times a second quantises every
+  flight to ±83 ms of a ~220 ms arc and hop length visibly lurches. The sim
+  owns it; the RENDERER latches it back onto the pose grid for display
+  (`Fighter::hopLatch`), which is what keeps trap 4 and idle frame reuse — a
+  breath rings the spring for ~3 s, so a 60 Hz *display* would leave a standing
+  fighter's uniforms moving every frame. Height therefore steps at 12 Hz while
+  xz slides at 60. That is not the jumpiness MotionParams argues against: the
+  camera chases a subject horizontally, nothing chases it vertically.
+- **The write-back sits OUTSIDE the pose-step guard.** `f.disp` is overwritten
+  wholesale every frame while `motion.stepRoot` is off, so a latch applied only
+  on pose steps gets clobbered on the next four frames and the height slides at
+  60 Hz after all.
+- **`hopLaunch` keeps this from silently rebalancing the fight.** Airborne 48%
+  of the time, travelling only in flight at 1.1 m/s would have HALVED real
+  speed and changed every distance the AI is tuned around without touching one
+  of them. 2.1 is 1/0.48, so the average lands back on 1.10 and the AI's own
+  numbers arrive intact (a 0.92 chase measures 0.92). Tune `hopThrust` and that
+  stops being exact — bigger push-off, longer flight, more of the cycle spent
+  travelling, genuinely faster (0.8/1.0/1.3 → 0.83/1.10/1.35 m/s). That
+  coupling is the point; only the defaults are calibrated.
+- **THE LAUNCH IS SPENT IN THE AIR, NOT EARNED THERE.** The push-off fires at
+  maximum COMPRESSION — mid-stance, foot still planted — so translating on
+  `air` the moment it is set slides the body through the back half of every
+  stance. That is 26% of the cycle, and it measured 1.59 m/s against the 1.10
+  it was calibrated for. `Body::integrate` gates translation on `airborne()`.
+  This shipped once; do not "simplify" the gate away.
+- **Knockback is NOT gated on contact, steering is not withheld.** A shove is
+  someone else's force rather than your legs, and a punch that could not move a
+  standing body would be a worse bug than a slide. Steering keeps updating
+  while planted too, so `moving`, the facing turn and the lean behave exactly as
+  before — stance withholds only the translation. The cost is that a change of
+  direction waits for the next push-off, up to a stance (~0.21 s) away; that is
+  what committing to a hop means, and `rig.airControl` (default 0) is the dial
+  if it plays badly.
+- **The arc lean is read off `vu`, so there is no curve to keep in sync.**
+  Forward going up, back coming down (`rig.hopLeanFwd` / `hopLeanBack`,
+  asymmetric on purpose — a body throws itself forward off a push-off and only
+  tips back a little as it drops). `vu` passes smoothly through zero at the
+  apex, so the ease from front to back is timed by the hop itself. Measured
+  through one cycle: **−6.7 deg to +17.0 deg**, and what the 12 Hz display
+  shows is +16, +6, −2, −6, −4, then a SNAP back to +17 at the next push-off.
+  That snap is the impulse leaving the ground and reads as stop-motion, not as
+  a glitch; `hopLeanFwd` is the dial if it is too much. It is added to the
+  travel lean rather than replacing it, is deliberately NOT filtered (a 6/s
+  filter has a 0.17 s time constant against a 0.22 s flight and would damp the
+  pose to nothing), and is scaled by speed so a standing fighter does not rock
+  on its breath — `vu` swings ±0.8 m/s while breathing, which ungated would tip
+  an idle body about 10 degrees. `Body::leanBase` holds the travel lean
+  separately because it is a filter's state: summing into `FighterPose::lean`
+  and filtering that would feed the arc into its own input.
+- The visible cost of the 12 Hz display: a weapon swung mid-bound jumps up to
+  ~11 cm with the body on a pose step. R19's fused brush covers it (~6.6 m/s of
+  tip travel against a ~12.7 m/s ceiling) and the cut is honest — the sword
+  really did travel that far — but it is the first thing to look at if a swing
+  thrown while bounding carves a longer arc than it should.
+
+Shipping walk: 5.9 cm hop, -10.1% squash, +6.3% stretch, **2.33 Hz, within
+noise of the old `gaitHz` 2.2**, so the rhythm survived the mechanism changing
+under it. The idle breath is -6.9% with the feet DOWN. Defaults were measured by
+simulating this integrator at the 60 Hz tick and 4 substeps it actually runs at
+— a bare 16.7 ms step loses ~7% of the hop, and 4 substeps track a 200-substep
+reference to 0.3 cm.
+
+`set rig.hopThrust 0` is the A/B you want: the body keeps its weight, its sag and
+its landing absorption and simply never pushes off — so it never leaves the floor
+and, since travel is ballistic now, **never goes anywhere**. `set rig.gravity 0`
+removes the weight itself.
+
+Strike contact is resolved against the posed capsules, which ride the body
+affine, so a fighter mid-hop is genuinely harder to hit low — that falls out for
+free rather than being arranged. **A player-driven JUMP still belongs in the
+tick**, not here: the hopper is autonomous, and an input that chooses when to
+leave the floor is a different mechanic sharing the same variable.
 - **There are no clips to sample.** The asset ships none; the walk/idle shape
   is entirely procedural (the spring above). `animPlay`/`evalPose`/`animSpeed`
   survive only for a hypothetical rigged asset and no-op on this one.
@@ -596,8 +721,9 @@ exists.
 ## Windowed test harness (M5)
 
 `WASD` walks the fighter (camera-relative — forward is always away from the
-camera), it turns to face travel and leans into it, squishes and hops on its
-procedural spring (there are no clips), and the orbit target follows it. `SPACE`
+camera), it turns to face travel and leans into it, and BOUNDS along on a real
+spring under real gravity rather than sliding (M-SPRING above; there are no
+clips), and the orbit target follows it. `SPACE`
 swings. The sword rests in a VERTICAL guard with a slight bob (quantized to
 the 12 Hz pose grid, trap 4); the swing is a three-beat flourish over 0.80 s —
 wind up high, flatten to horizontal and sweep across the front at chest
@@ -683,7 +809,12 @@ tools/ctl.sh quit
 
 Commands: `get NAME|*`, `set NAME V..` (any LookParams/sword/cam/brush field,
 names = struct paths like `sword.pitch`; plus `handpose.*` for the unarmed mitt
-placement and its bob, `ai.*` for opponent behaviour, `phys.*` for knockback /
+placement and its bob, `rig.gravity`/`legK`/`legDamp`/`hopThrust`/`idleKick`
+for the bounce and `rig.hopLaunch`/`airControl`/`hopLeanFwd`/`hopLeanBack` for
+how far a hop CARRIES you and the arc pose it strikes (M-SPRING — the old
+`squishK`/`squishKick`/`gaitHz`/`hop` are GONE, not renamed, so a stale `set`
+self-diagnoses as "err unknown param"),
+`ai.*` for opponent behaviour, `phys.*` for knockback /
 resistance / body collision, `impact.*` for what a landing strike does to the
 CLAY (dent depth, rupture size, bruise and smear — R20/R21),
 `death.*` for the collapse threshold and how the
@@ -711,10 +842,14 @@ Iteration rules of thumb:
   over.** A `--screenshot`/`--replay` pass costs a startup plus the frame
   run, and a verification sweep of several burns minutes of the user's time
   waiting on you. Finish at `cmake --build build` and say what to look at.
-  Render only when asked, or for a gate with no manual equivalent (the
-  `--carve-test` conservation exit code, replay determinism) — and say why
-  first. For perf work, quote benchmark numbers instead of re-rendering to
-  eyeball.
+  **This includes `--carve-test`**, which reads like a cheap gate and is not:
+  300 frames plus a startup, on a change that in most cases cannot move clay.
+  It is a tool to reach for when you have a REASON to suspect the ledger (see
+  "Verifying a conservation change"), not a box to tick — and `break ledger`
+  catches the same class of bug while you play, without the wait. Render only
+  when asked, or for something with no manual equivalent at all (replay
+  determinism) — and say why first. For perf work, quote benchmark numbers
+  instead of re-rendering to eyeball.
 - **A pixel diff cannot see SHAPE.** imgdiff answers "did values move", not
   "does it still look right", and the difference has already shipped a
   regression: a skin-gather change measured 133 changed pixels — inside
@@ -1098,14 +1233,27 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
 
 ## Verifying a conservation (M4.6) change
 
-`--carve-test` now self-checks and **exits nonzero (3) on a conservation
-violation** — carved clay must equal landed + in-flight + owed at exit:
+**`--carve-test` is a TOOL YOU REACH FOR, not a gate you are expected to
+clear.** It self-checks and exits nonzero (3) on a conservation violation —
+carved clay must equal landed + in-flight + owed at exit:
 
 ```sh
 CLAYFRAY_DEBUG_LEDGER=1 ./build/clayfray --carve-test \
   --screenshot out.png --frames 300 --size 960x540 --aa 2
 echo $?    # 0 = balanced, 3 = clay leaked
 ```
+
+It used to be listed as a thing to run after any change that could touch the
+ledger, and it was demoted deliberately: a 300-frame headless pass plus startup
+is minutes of a person's time waiting, and paying that on every change — most
+of which cannot move clay at all — is a bad trade. **Conservation is checked by
+playing** now, and by `break ledger TOL_ML`, which pauses the running app the
+moment the books do not balance and lets you inspect the scene that did it.
+
+Run it when you have a REASON to: you changed `edit.wgsl`, the gob/dribble
+spawner, the ledger arithmetic in `updateConservation`, `absorbMeasured`, the
+death collapse, or anything else that moves measured volume around. Not because
+you touched a file that happens to live in the renderer.
 
 The `[sploot] final:` line prints the ledger. `lookdev/sploot_*.png` are the
 reference renders — diff against them by eye after a lighting/shading change.

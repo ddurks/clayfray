@@ -166,14 +166,26 @@ void CtlServer::buildRegistry() {
     // M-PERF: affine body + two rigid mitts vs the 13-piece inverse-LBS warp.
     // CLAYFRAY_NO_AFFINE=1 pins it off for a benchmark run.
     addB("look.affineRig", &l->affineRig);
-    addF("rig.squishK", &l->rig.squishK);
-    addF("rig.squishDamp", &l->rig.squishDamp);
-    addF("rig.squishKick", &l->rig.squishKick);
-    addF("rig.gaitHz", &l->rig.gaitHz);
+    // M-SPRING: the hopper. `rig.squishK`/`squishDamp`/`squishKick`/`gaitHz`/
+    // `idleScale`/`hop` are GONE rather than renamed — their values meant a
+    // metronome's period and a lift scale, and nothing here would have caught
+    // a stale `set rig.squishK 60` landing on a stiffness in different units.
+    // "err unknown param" is the diagnosis you want.
+    addF("rig.gravity", &l->rig.gravity);
+    addF("rig.legK", &l->rig.legK);
+    addF("rig.legDamp", &l->rig.legDamp);
+    addF("rig.hopThrust", &l->rig.hopThrust);
     addF("rig.idleHz", &l->rig.idleHz);
-    addF("rig.idleScale", &l->rig.idleScale);
-    addF("rig.hop", &l->rig.hop);
+    addF("rig.idleKick", &l->rig.idleKick);
     addF("rig.widen", &l->rig.widen);
+    // The hop CARRIES the fighter now, so these are locomotion knobs even
+    // though they live on the rig: hopLaunch is how much of the push-off goes
+    // forward, airControl is how much you may steer once you have left, and the
+    // two lean gains are the arc pose.
+    addF("rig.hopLaunch", &l->rig.hopLaunch);
+    addF("rig.airControl", &l->rig.airControl);
+    addF("rig.hopLeanFwd", &l->rig.hopLeanFwd);
+    addF("rig.hopLeanBack", &l->rig.hopLeanBack);
     addB("hands.ik", &l->hands.ik);
     addF("hands.reach", &l->hands.reach);
     addF("hands.reachScale", &l->hands.reachScale);

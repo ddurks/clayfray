@@ -35,7 +35,15 @@ constexpr char kMagic[4] = {'C', 'F', 'S', 'N'};
 // 8: BrickEdit grew the R19 fused brush (capCount + kMaxBrushCaps-1 capsule
 // pairs) and the two mode parameters R20/R21 added (dentAmp, paint). "BPND"
 // stores BrickEdit raw, so its stride moved again.
-constexpr uint32_t kVersion = 8;
+// 9: M-SPRING. "RRIG" is GONE, and so is "RBAG" — the first carried the affine
+// body's squish spring while the renderer owned one, the second the M-BAG
+// wobble that v8 deleted outright. The hopper that replaced the spring is SIM
+// state (Body::stepHop), and this file has never serialised the sim: no
+// snapshot carries `vel` or `knock` either. A v8 file would otherwise still
+// LOAD, since every remaining section keeps its name and size and the reader
+// simply skips sections it no longer knows — silently correct here, but the
+// version is cheap and a stale file refusing beats one that half-restores.
+constexpr uint32_t kVersion = 9;
 
 uint32_t tagWord(const char tag[4]) {
     uint32_t w;

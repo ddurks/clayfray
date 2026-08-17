@@ -81,16 +81,110 @@ struct FpsMeter {
 // knock is cancelled by the victim's own steering in under a third of a second,
 // so a solid hit reads as nothing happening. Kept apart, the shove decays on
 // its own schedule and a fighter can walk while it is still sliding.
+// M-SPRING puts a THIRD velocity here, and the split is the whole mechanic:
+// `vel` is what the fighter WANTS (steering, updated every tick, planted or
+// not), `air` is what its last push-off actually GAVE it, and only `air` and
+// `knock` ever move it. A planted foot does not slide.
 struct Body {
-    float vel[3] = {0.f, 0.f, 0.f};   // locomotion: input or AI
+    float vel[3] = {0.f, 0.f, 0.f};   // locomotion DEMAND: input or AI
+    float air[3] = {0.f, 0.f, 0.f};   // the launch we are riding; 0 on the floor
     float knock[3] = {0.f, 0.f, 0.f}; // knockback: contact only
     float force[3] = {0.f, 0.f, 0.f}; // THIS FRAME's contact force, m/s^2
     float stagger = 0.f;              // s of no steering left
     float rate = 1.f;                 // strike-clock multiplier, minRate..1
+    // ---- the hopper (M-SPRING; the model is documented on RigParams) ----
+    // u < 0 compressed against the floor, u >= 0 feet off it. It lives HERE
+    // rather than in the renderer because travel depends on it: see the
+    // "TRAVEL IS BALLISTIC" note in params.h for why 12 Hz was not good enough
+    // once distance-per-hop became locomotion.
+    float u = 0.f, vu = 0.f;
+    float gait = 0.f;                 // idle breath phase
+    // The TRAVEL lean, before the arc lean is added. It needs its own slot
+    // because it is the state of a first-order filter: writing the sum back
+    // into FighterPose::lean and filtering that would feed the arc into its own
+    // input and smear it across the next several ticks.
+    float leanBase = 0.f;
+    bool airborne() const { return u > 0.f; }
 
-    // Both velocities, one tick. Everything is xz — nothing here leaves the
-    // floor, and the visual hop is the rig's spring, not a physical one.
-    void integrate(FighterPose& f, const PhysicsParams& p, float dt) {
+    // Pitch forward on the way up, back on the way down (RigParams::hopLean*).
+    // `speedFrac` is how fast the fighter is travelling against its own top
+    // speed, which fades the whole effect out as it slows and keeps a standing
+    // body from rocking on its breath.
+    float hopLean(const RigParams& r, float speedFrac) const {
+        const float g = vu >= 0.f ? r.hopLeanFwd : r.hopLeanBack;
+        const float s = std::min(std::max(speedFrac, 0.f), 1.f);
+        return std::min(std::max(vu * g, -0.6f), 0.6f) * s;
+    }
+
+    // One tick of the leg spring, and the two events that matter hang off it:
+    // the push-off at maximum compression (which is where the forward launch
+    // comes from) and the landing (which absorbs it again).
+    //
+    // Substepped FOUR ways against the 60 Hz tick, giving the same ~4.2 ms step
+    // the defaults were measured at — a bare 16.7 ms step costs ~7% of the hop
+    // and would make every number on RigParams a lie. Fixed count, fixed dt, no
+    // RNG, no wall clock, so --replay reproduces a whole brawl exactly.
+    void stepHop(const RigParams& r, bool moving, float dt) {
+        if (!moving) {   // breathing is still a metronome; walking pumps instead
+            const float next = gait + dt * r.idleHz;
+            if (next >= 1.f) vu -= r.idleKick;
+            gait = next - std::floor(next);
+        }
+        const int kSub = 4;
+        const float h = dt / (float)kSub;
+        for (int i = 0; i < kSub; i++) {
+            const float was = vu;
+            const bool wasAir = u > 0.f;
+            vu -= r.gravity * h;
+            if (u < 0.f) {
+                vu += (-r.legK * u - r.legDamp * vu) * h;
+                if (moving && was < 0.f && vu >= 0.f) {
+                    // THE PUSH-OFF. Up, and forward along whatever we are
+                    // steering right now — this is the only moment a heading is
+                    // chosen, which is what makes a hop a commitment.
+                    vu += r.hopThrust;
+                    air[0] = vel[0] * r.hopLaunch;
+                    air[2] = vel[2] * r.hopLaunch;
+                }
+            }
+            u += vu * h;
+            if (wasAir && u <= 0.f) {
+                // Landing. The clay takes the horizontal with the vertical —
+                // it is the same compression absorbing both — so the next hop
+                // starts from nothing and has to be pushed for.
+                air[0] = 0.f;
+                air[2] = 0.f;
+            }
+            // Mid-flight steering, off by default: a body in the air is a
+            // projectile. See RigParams::airControl.
+            if (r.airControl > 0.f && u > 0.f) {
+                const float k = std::min(1.f, r.airControl * h);
+                air[0] += (vel[0] * r.hopLaunch - air[0]) * k;
+                air[2] += (vel[2] * r.hopLaunch - air[2]) * k;
+            }
+        }
+        // A floor on the COMPRESSION, not on the lift: clay squashed this far
+        // has left the model behind (a linear spring stops being one), but a
+        // body flying high is just a body flying high.
+        if (u < -0.45f) {
+            u = -0.45f;
+            vu = std::max(vu, 0.f);
+        }
+    }
+
+    // Every velocity, one tick. Still xz for travel — the hopper owns the one
+    // vertical degree of freedom and writes it to the pose, and nothing else
+    // here reads a height (knockback, the arena wall and body collision are all
+    // ground-plane relations).
+    //
+    // KNOCKBACK IS NOT GATED ON CONTACT, and that is deliberate: it is someone
+    // else's force rather than your legs, so it moves a planted body. A punch
+    // that could not shove a standing fighter would be a worse bug than a
+    // slide. Only `vel` — your own locomotion — waits for the air.
+    void integrate(FighterPose& f, const PhysicsParams& p, const RigParams& r,
+                   float dt) {
+        stepHop(r, f.moving, dt);
+        f.hopU = u;
         for (int a = 0; a < 3; a += 2) knock[a] += force[a] * dt;
         float ks = std::sqrt(knock[0] * knock[0] + knock[2] * knock[2]);
         if (ks > p.knockMax && ks > 1e-6f) {
@@ -99,8 +193,16 @@ struct Body {
             knock[2] *= s;
             ks = p.knockMax;
         }
-        f.pos[0] += (vel[0] + knock[0]) * dt;
-        f.pos[2] += (vel[2] + knock[2]) * dt;
+        // ONLY WHILE AIRBORNE. `air` is set at the push-off, which happens at
+        // maximum compression — mid-stance, with the foot still planted — so
+        // translating on it the moment it exists would have the body slide
+        // forward through the back half of every stance. Measured: that is 26%
+        // of the cycle and it put travel at 1.59 m/s against the 1.10 the
+        // launch was calibrated for. The launch is EARNED at the push-off and
+        // SPENT in the air.
+        const float carry = airborne() ? 1.f : 0.f;
+        f.pos[0] += (air[0] * carry + knock[0]) * dt;
+        f.pos[2] += (air[2] * carry + knock[2]) * dt;
         // LINEAR bleed-off, not exponential. An exponential shove asymptotes
         // and never quite stops, and "still drifting a minute later" is how a
         // fighter ends up slowly leaving the arena with nothing touching it.
@@ -116,12 +218,18 @@ struct Body {
         if (stagger > 0.f) stagger = std::max(0.f, stagger - dt);
     }
 
-    // Remove the component of both velocities heading along -`out`, i.e. INTO
+    // Remove the component of every velocity heading along -`out`, i.e. INTO
     // whatever just stopped us. Only the approaching part: zeroing the whole
     // vector freezes a fighter sliding ALONG a surface, which is how bodies get
     // stuck on each other and on the arena edge.
+    //
+    // `air` is in here too, and has to be: it is the one that actually carries
+    // the body now, so leaving it out would let a fighter hop straight into the
+    // arena wall and keep its launch, grinding against it for the rest of the
+    // flight. Killing it mid-air is also the right read — that is what hitting
+    // something while airborne does.
     void killApproach(float outX, float outZ) {
-        float* vs[2] = {vel, knock};
+        float* vs[3] = {vel, air, knock};
         for (float* v : vs) {
             const float into = -(v[0] * outX + v[2] * outZ);
             if (into > 0.f) {
@@ -205,7 +313,8 @@ struct OpponentAi {
     }
 
     void tick(FighterPose& me, const FighterPose& hero, const AiParams& ai,
-              Body& body, const PhysicsParams& phys, float punchDur, float dt) {
+              Body& body, const PhysicsParams& phys, const RigParams& rig,
+              float punchDur, float dt) {
         // ---- lock on, with hysteresis, once we have a reason to ----
         //
         // The reason is `provoked` (AiParams::retaliatory): being near the hero
@@ -266,10 +375,12 @@ struct OpponentAi {
             const float m = ai.accel * dt;
             body.vel[a] += std::max(-m, std::min(d, m));
         }
-        body.integrate(me, phys, dt);
+        body.integrate(me, phys, rig, dt);
         // LOCOMOTION speed only, deliberately: a fighter sliding backwards off
-        // a punch is not walking, and driving the gait spring off the shove
-        // would make it break into a jog while being knocked over.
+        // a punch is not walking, and driving the hopper off the shove would
+        // have it break into a bound while being knocked over. `moving` is the
+        // only thing gating the push-off, so this flag decides whether a body
+        // bounds or slides.
         const float sp = std::sqrt(body.vel[0] * body.vel[0] +
                                    body.vel[2] * body.vel[2]);
         me.moving = sp > 0.10f;
@@ -287,9 +398,12 @@ struct OpponentAi {
             float d = face - me.yaw;
             while (d > 3.14159265f) d -= 6.28318531f;
             while (d < -3.14159265f) d += 6.28318531f;
-            const float aim = 0.30f * (sp / std::max(ai.chaseSpeed, 1e-3f)) *
+            const float top = std::max(ai.chaseSpeed, 1e-3f);
+            const float aim = 0.30f * (sp / top) *
                               (1.f - std::min(std::fabs(d), 1.f));
-            me.lean += (aim - me.lean) * std::min(1.f, 6.f * dt);
+            body.leanBase += (aim - body.leanBase) * std::min(1.f, 6.f * dt);
+            // The arc rides ON the travel lean, unfiltered — see Body::hopLean.
+            me.lean = body.leanBase + body.hopLean(rig, sp / top);
         }
 
         // ---- fists ----
@@ -321,7 +435,17 @@ struct OpponentAi {
 // resynced to the restored sim time.)
 struct GameState {
     GameState() {
-        for (int i = 0; i < Renderer::kMaxPlayers; i++) foes[i].seed(i);
+        for (int i = 0; i < Renderer::kMaxPlayers; i++) {
+            foes[i].seed(i);
+            // Stagger the hopper so identical bodies don't breathe — or bound —
+            // in lockstep, which reads as one puppet duplicated rather than as
+            // N actors. Both halves matter: `gait` desyncs the idle breath, and
+            // the nudge to `vu` desyncs the WALK, because a limit cycle keeps
+            // the phase it starts with and two bodies that begin walking from
+            // identical states hop in step forever.
+            bodies[i].gait = 0.37f * (float)i;
+            bodies[i].vu = -0.21f * (float)i;
+        }
     }
 
     uint64_t tickCount = 0;
@@ -373,7 +497,7 @@ struct GameState {
         return (float)((rng >> 8) & 0xFFFFFFu) / 16777216.f;
     }
 
-    void tick(float punchDur = 0.30f) {
+    void tick(const RigParams& rig, float punchDur = 0.30f) {
         tickCount++;
         const float dt = (float)kTickDt;
 
@@ -400,7 +524,7 @@ struct GameState {
             float m = kAccel * dt;
             body.vel[a] += std::max(-m, std::min(d, m));
         }
-        body.integrate(fighter, phys, dt);
+        body.integrate(fighter, phys, rig, dt);
 
         // LOCOMOTION speed only — see the same note in OpponentAi::tick.
         float sp = std::sqrt(body.vel[0] * body.vel[0] + body.vel[2] * body.vel[2]);
@@ -416,10 +540,16 @@ struct GameState {
             // lean scales with speed, and eases off while still turning hard
             // so a pivot doesn't throw the body sideways
             float aim = kMaxLean * (sp / kMaxSpeed) * (1.f - std::min(std::fabs(d), 1.f));
-            fighter.lean += (aim - fighter.lean) * std::min(1.f, 6.f * dt);
+            body.leanBase += (aim - body.leanBase) * std::min(1.f, 6.f * dt);
         } else {
-            fighter.lean += (0.f - fighter.lean) * std::min(1.f, 6.f * dt);
+            body.leanBase += (0.f - body.leanBase) * std::min(1.f, 6.f * dt);
         }
+        // The arc lean rides ON the travel lean and is NOT filtered: `vu` is
+        // already smooth, and a 6/s filter has a 0.17 s time constant against a
+        // 0.22 s flight, which would damp the pose to nothing. Applied outside
+        // the moving/standing branch so that a fighter that stops mid-hop
+        // finishes its arc instead of snapping upright in the air.
+        fighter.lean = body.leanBase + body.hopLean(rig, sp / kMaxSpeed);
 
         // ---- unarmed: SPACE is a jab, not a swing ----
         // Same request flag, so the key binding does not have to know which it
@@ -642,6 +772,15 @@ struct GameState {
         for (int i = 0; i < Renderer::kMaxPlayers; i++) {
             if (!r.takeRespawn(i)) continue;
             bodies[i] = Body{};
+            // Re-stagger, or a body that comes back bounds in lockstep with
+            // whoever is already out there — the constructor's reasoning, and
+            // a wholesale Body{} throws it away. Starting the hopper at its
+            // UNLOADED length (u = 0, not the sag) is deliberate too: the first
+            // thing a new body does is settle onto its own weight, ~4 cm over a
+            // fifth of a second, which reads as arriving rather than as popping
+            // into existence already standing.
+            bodies[i].gait = 0.37f * (float)i;
+            bodies[i].vu = -0.21f * (float)i;
             if (i == 0) {
                 fighter = r.player(0);
                 swinging = false;
@@ -662,9 +801,9 @@ struct GameState {
             // something to frame while it waits to come back.
             const bool heroAlive = r.playerAlive(0);
             if (driveHero && heroAlive) {
-                tick(look.handPose.punchDur);
+                tick(look.rig, look.handPose.punchDur);
             } else if (heroAlive) {
-                bodies[0].integrate(fighter, phys, dt);
+                bodies[0].integrate(fighter, phys, look.rig, dt);
             }
             if (ai.enabled) {
                 for (int i = 1; i < Renderer::kMaxPlayers; i++) {
@@ -672,7 +811,7 @@ struct GameState {
                     // A dead hero is not a target. Steering at a corpse would
                     // park every opponent on the respawn point, waiting.
                     foes[i].tick(r.player(i), fighter, ai, bodies[i], phys,
-                                 look.handPose.punchDur, dt);
+                                 look.rig, look.handPose.punchDur, dt);
                     if (!heroAlive) foes[i].locked = false;
                 }
             }

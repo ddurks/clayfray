@@ -668,12 +668,11 @@ void Renderer::unarmedHand(const FighterPose& disp, const LookParams& look, int 
 }
 
 void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
-                              const FighterPose& disp, const BodySpring& s,
-                              const LookParams& look,
+                              const FighterPose& disp, const LookParams& look,
                               const SwordParams* grip, float poseTime) const {
     if (!brush_.valid || pieces.size() < 3) return;
     float A[16];
-    bodyAffine(disp, s, look.rig, A);
+    bodyAffine(disp, look.rig, A);
     std::memcpy(pieces[0].xform, A, sizeof(A));
     for (int k = 0; k < 3; k++) {
         pieces[0].lo[k] = brush_.bodyLo[k];
@@ -814,27 +813,37 @@ void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPo
     }
 }
 
-void Renderer::stepSpring(BodySpring& s, const RigParams& r, bool moving, float dt) {
-    if (dt <= 0.f) return;
-    // Metronome: one impulse per footfall while walking, one slower and
-    // gentler per breath at rest. The phase is the only clock — no wall
-    // clock, no rand() — so replay reproduces the squish exactly.
-    const float hz = moving ? r.gaitHz : r.idleHz;
-    const float kick = r.squishKick * (moving ? 1.f : r.idleScale);
-    const float next = s.gait + dt * hz;
-    if (next >= 1.f) s.v -= kick;      // land / inhale: compress
-    s.gait = next - std::floor(next);
-    // Semi-implicit Euler, substepped. dt is a whole 12 Hz pose step (~83 ms)
-    // and the spring's period is ~0.8 s, so one step per frame would be a
-    // visibly lumpy integration; four is stable and still fixed-count, which
-    // is what keeps it deterministic.
-    const int kSub = 4;
-    const float h = dt / (float)kSub;
-    for (int i = 0; i < kSub; i++) {
-        s.v += (-r.squishK * s.q - r.squishDamp * s.v) * h;
-        s.q += s.v * h;
-    }
-    s.q = std::min(std::max(s.q, -0.45f), 0.45f);
+// ---- what the eye gets out of `u` ----
+//
+// The integrator that produces it is Body::stepHop in main.cpp — the hopper is
+// SIM state now, because travel depends on it (see RigParams). Everything below
+// is display.
+//
+// The rest position of the spring under the body's own weight: gravity balances
+// the spring force at legK * u == -gravity. This is where a standing fighter
+// sits, and it is the ZERO of the squish because the artist authored the blob
+// standing — see RigParams.
+float Renderer::springSag(const RigParams& r) {
+    return r.legK > 1e-3f ? -r.gravity / r.legK : 0.f;
+}
+
+// Squish, as a fraction of the body's height: metres of compression over the
+// lever. Grounded it is the compression relative to the sag; AIRBORNE the leg
+// is at its unloaded length, so it saturates at +|sag|/height — the body
+// relaxes to full size the moment it is off the floor, and holds there for the
+// whole flight. That plateau is the stretch, and it is why min(u, 0) rather
+// than u: past takeoff the shape stops tracking the height.
+float Renderer::springSquish(float u, const RigParams& r, float bodyHeight) {
+    const float lever = std::max(bodyHeight, 1e-3f);
+    return std::min(
+        std::max((std::min(u, 0.f) - springSag(r)) / lever, -0.45f), 0.45f);
+}
+
+// Feet off the floor, metres. No scale factor and no `moving` gate: this is a
+// distance the simulation produced, and an idle fighter stays down because its
+// breath is too weak to launch it, not because a flag says so.
+float Renderer::springLift(float u) {
+    return std::max(u, 0.f);
 }
 
 // The body's whole articulation, as one matrix:
@@ -849,16 +858,19 @@ void Renderer::stepSpring(BodySpring& s, const RigParams& r, bool moving, float 
 // sanity check that the sign convention below matches the old root transform:
 // positive lean tips the head toward +Z, the fighter's forward.
 //
-void Renderer::bodyAffine(const FighterPose& disp, const BodySpring& s,
-                          const RigParams& r, float out[16]) const {
-    const float ky = std::min(std::max(1.f + s.q, 0.55f), 1.45f);
+void Renderer::bodyAffine(const FighterPose& disp, const RigParams& r,
+                          float out[16]) const {
+    // M-SPRING: both of these come out of the ONE hopper coordinate, which the
+    // sim wrote and render() has already latched onto the pose grid. Squashed
+    // while the body is on the floor, relaxed to full length the moment it is
+    // off it, lifted by however far off it is.
+    const float q = springSquish(disp.hopU, r, bodyHeight_);
+    const float ky = std::min(std::max(1.f + q, 0.55f), 1.45f);
     // sideways bulge: squashing down pushes clay out. Not strictly volume
     // preserving — `widen` is a taste knob, and clay is not water.
-    const float kxz = std::min(std::max(1.f - r.widen * s.q, 0.55f), 1.65f);
+    const float kxz = std::min(std::max(1.f - r.widen * q, 0.55f), 1.65f);
     const float t = std::tan(disp.lean);
-    // the hop rides the RELEASE half of the spring only, and only when
-    // travelling: an idle breath must not lift the feet off the floor
-    const float hop = disp.moving ? std::max(s.q, 0.f) * r.hop : 0.f;
+    const float hop = springLift(disp.hopU);
     const float cy = std::cos(disp.yaw), sy = std::sin(disp.yaw);
     out[0] = kxz * cy;      out[1] = 0.f;  out[2] = -kxz * sy;    out[3] = 0.f;
     out[4] = t * ky * sy;   out[5] = ky;   out[6] = t * ky * cy;  out[7] = 0.f;
@@ -1427,6 +1439,17 @@ void Renderer::setCharacter(CharacterAsset asset) {
         }
         autoReach_ = std::sqrt(autoReach_);
 
+        // M-SPRING's lever: the hopper works in metres of compression and
+        // bodyAffine scales by a fraction, so the body's own height is what
+        // converts one to the other. Off the MESH part, not off `brush_.body*`
+        // — those are the padded clip box (0.715 m against the clay's 0.691),
+        // and the padding is a shader-clip artifact with nothing to say about
+        // how tall the fighter is. Guarded because a degenerate box would
+        // divide a 4 cm sag by nothing and fold the fighter flat.
+        const MeshPart& bodyPart = asset.parts[asset.partBody];
+        const float bh = bodyPart.hi[1] - bodyPart.lo[1];
+        if (bh > 1e-3f) bodyHeight_ = bh;
+
         // M-DEATH's denominator: the clay one fighter IS, as drawn — the body
         // plus TWO mitts (the rig mirrors one hand into two pieces, so the
         // brush is paid for twice). The other hand poses are alternates of the
@@ -1437,14 +1460,15 @@ void Renderer::setCharacter(CharacterAsset asset) {
 
         std::printf("rig: brush rig — body (%.3f %.3f %.3f)..(%.3f %.3f %.3f), "
                     "hands rest/grab/idle/fist x[%.3f %.3f]/[%.3f %.3f]/"
-                    "[%.3f %.3f]/[%.3f %.3f], reach %.3f m, %zu marbles\n",
+                    "[%.3f %.3f]/[%.3f %.3f], reach %.3f m, "
+                    "stand %.3f m, %zu marbles\n",
                     brush_.bodyLo[0], brush_.bodyLo[1], brush_.bodyLo[2],
                     brush_.bodyHi[0], brush_.bodyHi[1], brush_.bodyHi[2],
                     brush_.handLo[kHandRest][0], brush_.handHi[kHandRest][0],
                     brush_.handLo[kHandGrab][0], brush_.handHi[kHandGrab][0],
                     brush_.handLo[kHandIdle][0], brush_.handHi[kHandIdle][0],
                     brush_.handLo[kHandFist][0], brush_.handHi[kHandFist][0],
-                    autoReach_, marbles_.size());
+                    autoReach_, bodyHeight_, marbles_.size());
         // Fail LOUDLY rather than rendering a silently clipped fighter: a brush
         // that pokes outside the volume box, or two brushes whose padded boxes
         // touch, both break the clip's exactness (CLAUDE.md trap 5 drops edits
@@ -2657,7 +2681,13 @@ void Renderer::respawnFighter(int i, const LookParams& look) {
     f.pose.guard = false;
     f.pose.punch = 0.f;
     f.disp = f.pose;
-    f.spring = BodySpring{};
+    // The hopper itself is the sim's (Body::stepHop) and is reset there with
+    // the rest of the body's velocities; all that resets here is the DISPLAY
+    // latch, so a corpse's last squash does not draw for one pose step on the
+    // fighter that replaces it.
+    f.hopLatch = 0.f;
+    f.pose.hopU = 0.f;
+    f.disp.hopU = 0.f;
     // The mitts are somewhere else entirely now; a stale "where the fist was"
     // would read that teleport as a strike (updatePunchCut's own guard would
     // catch it, but relying on a magnitude threshold for a known discontinuity
@@ -3046,22 +3076,24 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         for (Fighter& f : fighters_) f.disp = f.pose;
     }
 
-    // M-PERF: advance the affine body's squish spring. ON THE POSE GRID, not
-    // the frame clock (trap 4): the squish is a traced uniform input, so
-    // integrating it at 60 Hz would make a STANDING fighter re-trace every
-    // frame and hand back the idle frame rate that reuse buys. Fixed substeps,
-    // no wall clock, no RNG, so --replay reproduces it exactly.
+    // M-SPRING: LATCH the hopper onto the pose grid (trap 4). The sim already
+    // integrated it this tick — it has to, since travel depends on it — so
+    // there is nothing to advance here, only a sample to take. Taking it is
+    // what keeps a traced uniform from moving at 60 Hz: a breath rings the
+    // spring for ~3 s, and drawing that ring at frame rate would make a
+    // STANDING fighter re-trace every frame and hand back the idle frame rate
+    // reuse buys.
+    //
+    // The write-back is OUTSIDE the pose-step guard on purpose. `f.disp` is
+    // overwritten wholesale every frame while motion.stepRoot is off (just
+    // above), so a latch applied only on pose steps would be clobbered on the
+    // next four frames and the height would slide at 60 Hz after all.
     const bool affine = affineOn(look);
     if (affine && frame.poseTime != springPoseTime_) {
-        const float dt =
-            (springPoseTime_ >= 0.f)
-                ? std::min(std::max(frame.poseTime - springPoseTime_, 0.f), 0.25f)
-                : 0.f;
         springPoseTime_ = frame.poseTime;
-        for (Fighter& f : fighters_) {
-            stepSpring(f.spring, look.rig, f.pose.moving, dt);
-        }
+        for (Fighter& f : fighters_) f.hopLatch = f.pose.hopU;
     }
+    for (Fighter& f : fighters_) f.disp.hopU = f.hopLatch;
 
     // pose the skeleton at the quantized clock; paused = rest pose
     resolveSword(look);
@@ -3099,7 +3131,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             const SwordParams* grip =
                 (i == 0 && swordWorld_.enabled && look.hands.ik) ? &swordWorld_
                                                                  : nullptr;
-            updateBrushRig(f.pieces, f.handPose, f.disp, f.spring, look,
+            updateBrushRig(f.pieces, f.handPose, f.disp, look,
                            grip, frame.poseTime);
         }
     }
@@ -3120,8 +3152,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             // reproduces procedurally, at three pieces instead of thirteen.
             evalPose(bones_, nullptr, 0.f, fighters_[0].skinMats);
             float A[16];
-            bodyAffine(fighters_[0].disp, fighters_[0].spring,
-                       look.rig, A);
+            bodyAffine(fighters_[0].disp, look.rig, A);
             for (size_t b = 0; b * 16 + 16 <= fighters_[0].skinMats.size(); b++) {
                 float tmp[16];
                 matMul(A, &fighters_[0].skinMats[b * 16], tmp);
@@ -3234,10 +3265,10 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         Fighter& f = fighters_[i];
         if (!f.enabled) continue;
         if (affine) {
-            // same collapse as the hero, driven by ITS pose and ITS spring
+            // same collapse as the hero, driven by ITS pose and ITS hopper
             evalPose(bones_, nullptr, 0.f, f.skinMats);
             float A[16];
-            bodyAffine(f.disp, f.spring, look.rig, A);
+            bodyAffine(f.disp, look.rig, A);
             for (size_t b = 0; b * 16 + 16 <= f.skinMats.size(); b++) {
                 float tmp[16];
                 matMul(A, &f.skinMats[b * 16], tmp);
@@ -3611,19 +3642,15 @@ bool Renderer::saveSnapshot(const std::string& path, double simT,
     rc.animT = fighters_[0].animT;
     rc.simT = simT;
     w.section("RCPU", &rc, sizeof(rc));
-    // M-PERF spring state, as its OWN section rather than fields on
-    // RenderSnapCpu. Three floats per fighter, so its SIZE tracks kMaxPlayers
-    // — which is why snapshot.cpp's kVersion is bumped: a 2-player file would
-    // otherwise short-read here and silently leave two springs at neutral.
-    {
-        float rig[3 * kMaxPlayers];
-        for (int i = 0; i < kMaxPlayers; i++) {
-            rig[i * 3 + 0] = fighters_[i].spring.q;
-            rig[i * 3 + 1] = fighters_[i].spring.v;
-            rig[i * 3 + 2] = fighters_[i].spring.gait;
-        }
-        w.section("RRIG", rig, sizeof(rig));
-    }
+    // NEITHER "RRIG" NOR "RBAG" is written any more, and v9 is where both went.
+    // RRIG held the affine body's squish spring while the RENDERER owned one;
+    // M-SPRING moved that state into the sim (Body::stepHop), which this file
+    // does not serialise at all — no snapshot has ever carried `vel` or `knock`
+    // either, and the hopper is the same kind of thing. RBAG held the M-BAG
+    // wobble, which v8 deleted outright in favour of the R20 dent (a real
+    // displacement of the field, so it lives in the VOLUME and is saved with
+    // it). A restore therefore lands a fighter standing with its bounce
+    // starting fresh, exactly as it already landed one not walking.
     w.section("RGOB", gobs_.data(), gobs_.size() * sizeof(Gob));
     w.section("CHRP", charPath.data(), charPath.size());
     bool ok = w.close();
@@ -3679,16 +3706,14 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
     sliceCutStep_ = false;
     slicePending_ = 0;
     sliceWait_ = 0;
-    // Spring state is optional: a snapshot taken before the affine rig landed
-    // has no RRIG, and starting from neutral is a valid pose. The gait phase
-    // defaults are staggered per fighter so a restore that misses RRIG still
-    // does not put identical bodies in lockstep.
-    {
-        float rig[3 * kMaxPlayers] = {};
-        for (int i = 0; i < kMaxPlayers; i++) rig[i * 3 + 2] = 0.37f * (float)i;
-        r.read("RRIG", rig, sizeof(rig));
-        for (int i = 0; i < kMaxPlayers; i++)
-            fighters_[i].spring = BodySpring{rig[i * 3], rig[i * 3 + 1], rig[i * 3 + 2]};
+    // No "RRIG" to read any more (see saveSnapshot): the hopper is sim state.
+    // Only the display latch is cleared, so the first drawn frame after a
+    // restore takes its height from the sim rather than from whatever body was
+    // on screen before the load.
+    for (Fighter& f : fighters_) {
+        f.hopLatch = 0.f;
+        f.pose.hopU = 0.f;
+        f.disp.hopU = 0.f;
     }
     // fresh dt baseline: the restored clock may sit anywhere on the timeline
     lastSimTime_ = -1.f;
@@ -3723,8 +3748,7 @@ int Renderer::addPlayer(const FighterPose& at) {
     fighters_[idx].pose = at;
     fighters_[idx].disp = at;
     fighters_[idx].enabled = true;
-    // Stagger the squish phase so identical bodies don't breathe in lockstep —
-    // that reads as one puppet duplicated, not N actors.
-    fighters_[idx].spring.gait = 0.37f * (float)idx;
+    // (The breath/bounce phase stagger that used to be set here moved to
+    // GameState's constructor with the hopper — it is Body state now.)
     return idx;
 }

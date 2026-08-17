@@ -4,10 +4,21 @@
 // whole skeleton is premultiplied by this, so pose clips stay authored in
 // character space and the sword/hands follow for free.
 struct FighterPose {
-    float pos[3] = {0.f, 0.f, 0.f}; // world, feet on the arena floor
+    float pos[3] = {0.f, 0.f, 0.f}; // world, FEET, on the arena floor
     float yaw = 0.f;                // facing, radians about +Y
     float lean = 0.f;               // radians tilted INTO the direction of travel
-    bool moving = false;            // picks the bounce clip over idle
+    bool moving = false;            // steering DEMAND, not actual travel
+    // ---- M-SPRING: the hopper's contact coordinate, metres ----
+    //
+    // Below zero the body is compressed by -hopU against the floor; at or above
+    // zero its feet are off the floor by hopU. Written by the 60 Hz sim
+    // (Body::stepHop in main.cpp) and read by the renderer, which derives both
+    // the squish and the lift from it.
+    //
+    // It is on the POSE rather than private to the sim because it stopped being
+    // decoration: a fighter only travels while this is positive, so it is the
+    // single fact both halves of the game have to agree on.
+    float hopU = 0.f;
     // ---- M-FIST: what the mitts are doing ----
     // `guard` raises them into the fighting pose (closed fists, up in front of
     // the face); otherwise they hang loose in the idle pose. `punch` drives
@@ -419,21 +430,184 @@ struct GazeParams {
 // So --replay reproduces it exactly, and — the reason it is on the pose grid
 // rather than the frame clock — a standing fighter's uniforms stop changing
 // between pose steps, which is what lets frame reuse keep firing (trap 4).
-// Defaults tuned by simulating the integrator at the 12 Hz step it actually
-// runs at (an impulse response at 60 Hz would be a different curve): they land
-// the walk at about -19% squish / +4% stretch and the idle breath at about
-// -9%, which is a claymation range rather than a jelly one.
+//
+// ---- M-SPRING: the bounce is a REAL HOPPER, not a bob on a metronome ----
+//
+// What was here before: a harmonic oscillator kicked once per `gaitHz`, and a
+// hop that was `max(stretch, 0) * hop` — a lift scaled off the spring's shape
+// rather than produced by it. Nothing about it was a body leaving the floor.
+// It could not be, because the fighter had no vertical dynamics at all: the
+// 60 Hz sim is xz-only, and this was the ONLY vertical channel there was. So
+// walking read as a slide with a 2 cm bob riding on top.
+//
+// It is now the textbook vertical SLIP hopper (spring-loaded inverted
+// pendulum) and it is ONE variable, `u`, in METRES — the contact coordinate:
+//
+//   u <  0   grounded, the body compressed by -u against the floor
+//   u >= 0   airborne, the FEET at height u
+//
+// which makes the whole simulation three lines, with no landing or takeoff
+// event to detect and therefore no way to miss one (Body::stepHop, main.cpp):
+//
+//   vu -= g*h;                                   // gravity, always
+//   if (u < 0) vu += (-K*u - C*vu) * h;          // the floor, only in contact
+//   u += vu*h;
+//
+// Everything the eye reads is a CONSEQUENCE of that, not a curve: the arc of a
+// hop is ballistic because nothing else is acting; the squash on landing is
+// deep exactly in proportion to how fast the body arrived; the body springs
+// back up because the clay it compressed gave the energy back, minus what `C`
+// took. Hop height, cadence and squash cannot be dialled independently, which
+// is the point — they are the same event seen three ways.
+//
+// THE AUTHORED REST SHAPE IS THE *LOADED* ONE. A blob standing on the floor is
+// already squashed by its own weight — `u* = -gravity/legK`, about 4.4 cm here
+// — and the artist sculpted it standing, so that sag is where the squish reads
+// zero. Two things fall out, both wanted. A fighter at rest looks exactly as
+// authored (this change does not resculpt the idle silhouette). And a fighter
+// in the AIR is off its floor, so the clay relaxes to its unloaded length and
+// the body reads as STRETCHED by exactly the sag it was carrying — +6.3%, the
+// squash-and-stretch of the animation books, arrived at from the weight rather
+// than keyed. It is also why there is no `hop` scale any more: the lift is in
+// metres because `u` is in metres.
+//
+// WALKING PUMPS THE SPRING, it does not schedule a hop. `hopThrust` is one
+// velocity impulse at MAXIMUM COMPRESSION — the bottom of the stance, which is
+// where a push-off goes and where pumping a swing goes. So the gait is a limit
+// cycle: the hop grows until damping eats exactly what the push-off adds, and
+// then it holds there. Consequences worth knowing before you turn the knob:
+//
+//   - Below a threshold thrust the body never leaves the floor at all. It
+//     hunkers and pulses in place. That is not a bug and not a dead zone to
+//     tune out; it is what a push too weak to lift you does.
+//   - MORE thrust makes the cadence SLOWER, not faster (a bigger hop is a
+//     longer flight): 1.0 measures 2.33 Hz and 1.1 measures 2.00 Hz. It also
+//     makes the fighter FASTER, because more of the cycle is spent airborne
+//     and airborne is the only time it travels — 0.8/1.0/1.3 give 0.83/1.10/
+//     1.35 m/s. One knob, three coupled effects, which is the point.
+//   - Stopping needs no code. With no push-off damping simply wins: ONE last
+//     landing, then the squish rings down from 9.6% to 2.3% within two seconds
+//     and 0.3% by four. Damping this light (zeta 0.067) is what makes the
+//     bounce lively, and the long quiet tail is the price — it is also the
+//     right read, clay absorbing the last of it rather than snapping to a stop.
+//
+// `legK` has a CEILING that has nothing to do with taste: this is displayed on
+// a 12 Hz grid, so a spring ringing above ~3 Hz aliases into hash. 225 puts it
+// at 2.39 Hz with the stance at 0.21 s, close enough to the ceiling to be
+// worth re-checking if you raise it.
+//
+// ---- TRAVEL IS BALLISTIC: you only move while you are in the air ----
+//
+// The hop stopped being a decoration on a walk and became the walk. A planted
+// foot does not slide, so while `hopU < 0` the fighter's own locomotion moves
+// it NOWHERE; the push-off that throws it upward also throws it forward along
+// whatever heading it is steering, and it coasts on that until it lands, where
+// the clay absorbs the horizontal velocity along with the vertical one. Leap,
+// land, leap. `Body::stepHop` in main.cpp is the whole of it.
+//
+// This is why the hopper moved OUT of the renderer and into the 60 Hz sim.
+// While the bounce was cosmetic, the pose grid was the right home for it. Once
+// distance-per-hop is locomotion, an airborne flag that only updates 12 times
+// a second quantises every flight to +-83 ms of a ~220 ms arc, and hop length
+// visibly lurches. The sim owns it now, substepped four ways per tick so the
+// numbers above still hold; the RENDERER latches it back onto the pose grid
+// for display, which is what keeps trap 4 and the idle frame reuse intact (a
+// breath rings this spring for ~3 s, so a 60 Hz DISPLAY would leave a standing
+// fighter's uniforms moving every frame). Height therefore steps at 12 Hz
+// while xz slides at 60, which is not the jumpiness MotionParams argues
+// against — the camera chases a subject horizontally, nothing chases it
+// vertically.
+//
+// `hopLaunch` exists to keep this from silently rebalancing the fight. A
+// fighter is airborne 48% of the time at the defaults, so travelling only in
+// flight at the old 1.1 m/s would have halved its real speed and changed every
+// distance the AI is tuned around (standoff, strikeRange, breakRange) without
+// touching one of them. 2.1 is 1/0.48: the flight is that much faster than the
+// demand, so the AVERAGE lands back on 1.10 m/s exactly, and the AI's own
+// numbers arrive intact too — a 0.92 chase measures 0.92, a 0.45 wander 0.45.
+// `kMaxSpeed` still means what it says.
+//
+// THE LAUNCH IS SPENT IN THE AIR, NOT EARNED THERE, and the difference is a
+// bug I shipped once. The push-off fires at maximum COMPRESSION, which is
+// mid-stance with the foot still planted, so translating on `air` the moment
+// it is set slides the body through the back half of every stance: 26% of the
+// cycle, and travel measured 1.59 m/s against the 1.10 it was calibrated for.
+// Body::integrate gates the translation on `airborne()` for that reason.
+//
+// Tune `hopThrust` and the calibration stops being exact — a bigger push-off
+// is a longer flight is more of the cycle spent travelling, so the fighter
+// genuinely gets faster (0.8/1.0/1.3 give 0.83/1.10/1.35 m/s). That coupling
+// is real and it is the point; only the shipped defaults are calibrated.
+//
+// Two things deliberately NOT gated on contact. KNOCKBACK still shoves a
+// planted fighter — it is someone else's force, not your legs, and a punch
+// that could not move a standing body would be a worse bug than a slide. And
+// STEERING keeps updating while planted, so `moving`, the facing turn and the
+// lean all behave exactly as before; what stance withholds is only the
+// translation. The cost is that a change of direction waits for the next
+// push-off, up to a stance (~0.21 s) away. That is what committing to a hop
+// means, and `airControl` is the escape hatch if it plays badly.
+//
+// Two A/Bs, and they answer different questions. `hopThrust 0` is the one to
+// reach for: the body still has weight, still sags onto it, still absorbs a
+// landing — it just never pushes off, so it slides, which is the closest thing
+// to what this replaced. `gravity 0` removes the weight itself: no sag, no
+// stance, nothing for the breath to compress against while walking.
+//
+// Defaults measured by simulating this integrator at the 60 Hz tick and 4
+// substeps it actually runs at (a 16.7 ms step without them loses ~7% of the
+// hop; 4 substeps tracks a 200-substep reference to 0.3 cm). The walk lands at
+//
+//   5.9 cm hop, -10.1% squash, +6.3% stretch, 2.33 Hz, 48% of the time
+//   airborne, 0.47 m of ground per hop, 1.10 m/s average
+//
+// — a half-metre bound twice a second on a 0.69 m body, at exactly the walking
+// speed `kMaxSpeed` has always meant, and at a cadence within noise of the old
+// `gaitHz` 2.2. The rhythm survived the mechanism changing underneath it.
+//
+// The idle breath sits at -6.9% with the feet DOWN (peak lift -0.43 cm, i.e.
+// still compressed) and travels exactly zero; past `idleKick` ~1.0 a breath
+// starts lifting them, which reads as fidgeting rather than breathing.
 struct RigParams {
-    float squishK = 60.f;     // spring stiffness (rad/s)^2; period ~0.81 s
-    float squishDamp = 4.5f;  // velocity damping; lower = more overshoot/bounce
-    float squishKick = 2.4f;  // impulse per footfall
-    float gaitHz = 2.2f;      // footfalls per second while moving
+    // ---- M-SPRING: the leg spring ----
+    float gravity = 9.81f;    // m/s^2. 0 = no weight, no sag, no bounce
+    float legK = 225.f;       // stiffness, 1/s^2 per metre; omega 15.0 (2.39 Hz)
+    float legDamp = 2.0f;     // contact damping, 1/s; zeta ~0.067, ~3 hops to rest
+    float hopThrust = 1.f;    // m/s of push-off at max compression, walking only
     float idleHz = 0.5f;      // breaths per second at rest
-    float idleScale = 0.45f;  // idle impulse as a fraction of the walk's
-    // Metres of lift per unit of STRETCH, walk only. Stretch peaks near +0.04,
-    // so 0.45 is a ~2 cm hop on a 0.69 m body — a skip, not a leap.
-    float hop = 0.45f;
+    float idleKick = 0.8f;    // m/s per breath; past ~1.0 the feet leave the floor
     float widen = 0.5f;       // sideways bulge per unit of squish
+    // ---- the hop CARRIES you ----
+    // The same push-off that throws the body up throws it FORWARD, along
+    // whatever direction the fighter is steering at that instant, and that
+    // launch is the only thing that ever moves it: planted feet do not slide.
+    // See the "TRAVEL IS BALLISTIC" note above for what this multiplies and
+    // why 2.1 is the number that keeps the average at the old walking speed.
+    float hopLaunch = 2.1f;
+    // ---- the arc lean: pitch forward going up, back coming down ----
+    //
+    // Radians of lean per m/s of VERTICAL velocity, and the two halves are
+    // separate because the pose is not symmetric: a body throws itself forward
+    // off the push-off and only tips back a little as it drops. At the shipped
+    // hop (takeoff ~1.08 m/s) that is about +13.6 deg at the launch easing to
+    // -6.2 deg at the landing.
+    //
+    // There is no lerp to write. `vu` passes smoothly through zero at the apex,
+    // so reading the lean off it IS the ease from forward to back, timed by the
+    // arc itself and free of any curve to keep in sync with the hop. It is
+    // added to the travel lean rather than replacing it, and scaled by speed so
+    // that a STANDING fighter does not rock: the idle breath swings `vu` by
+    // +-0.8 m/s, which ungated would tip a breathing body about 10 degrees.
+    float hopLeanFwd = 0.22f;
+    float hopLeanBack = 0.10f;
+    // Steering authority in mid-air, per second, as a fraction of the gap
+    // between the launch you got and the one you now want. 0 is the honest
+    // answer and the default — a body in the air is a projectile, and the
+    // moment to choose a direction is the push-off. It exists because "no air
+    // control" is a feel decision, not a physics one: if committing to a
+    // heading for a whole hop plays badly, this is the dial, and anything
+    // above ~4 effectively restores steering mid-flight.
+    float airControl = 0.f;
 };
 
 // M-DEATH: a fighter that has lost half its clay stops being a fighter.

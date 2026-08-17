@@ -90,14 +90,28 @@ void uiNewFrame(LookParams& look, BrushState& brush, float fps,
         ImGui::Checkbox("affine rig (off = unposed rest volume)", &look.affineRig);
         if (look.affineRig) {
             RigParams& r = look.rig;
-            ImGui::SliderFloat("squish stiffness", &r.squishK, 10.f, 200.f);
-            ImGui::SliderFloat("squish damping", &r.squishDamp, 0.5f, 20.f);
-            ImGui::SliderFloat("squish kick", &r.squishKick, 0.f, 4.f);
-            ImGui::SliderFloat("gait Hz (walk)", &r.gaitHz, 0.2f, 6.f);
+            // M-SPRING. Hop height, cadence and squash are not knobs — they
+            // are what these produce TOGETHER, so this is a group you
+            // tune by walking around and watching, which is what earns a
+            // slider a place here at all. The upper bound on stiffness is the
+            // 12 Hz display, not taste: much past 400 the spring rings faster
+            // than the pose grid can show and it aliases into hash.
+            ImGui::SliderFloat("leg stiffness", &r.legK, 40.f, 400.f);
+            ImGui::SliderFloat("leg damping", &r.legDamp, 0.f, 8.f);
+            ImGui::SliderFloat("push-off (m/s)", &r.hopThrust, 0.f, 2.f);
+            ImGui::SliderFloat("gravity (m/s2)", &r.gravity, 0.f, 20.f);
             ImGui::SliderFloat("idle Hz", &r.idleHz, 0.05f, 2.f);
-            ImGui::SliderFloat("idle scale", &r.idleScale, 0.f, 1.f);
-            ImGui::SliderFloat("hop (m per stretch)", &r.hop, 0.f, 2.f);
+            ImGui::SliderFloat("breath (m/s)", &r.idleKick, 0.f, 2.f);
             ImGui::SliderFloat("widen", &r.widen, 0.f, 1.5f);
+            // Locomotion, not decoration: the fighter only travels while it is
+            // airborne, so these two are how far a hop carries and whether you
+            // may change your mind once you have left the floor.
+            ImGui::SliderFloat("hop launch (x demand)", &r.hopLaunch, 0.f, 5.f);
+            ImGui::SliderFloat("air control (/s)", &r.airControl, 0.f, 8.f);
+            // The arc pose: forward off the push-off, tipping back as it drops.
+            // Asymmetric on purpose, so the two are separate sliders.
+            ImGui::SliderFloat("lean fwd (rad per m/s up)", &r.hopLeanFwd, 0.f, 0.6f);
+            ImGui::SliderFloat("lean back (rad per m/s down)", &r.hopLeanBack, 0.f, 0.6f);
         }
     }
 
