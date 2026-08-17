@@ -71,16 +71,266 @@ struct FpsMeter {
     }
 };
 
+// ---- M-PHYS: one fighter's physical state ----
+//
+// Locomotion velocity and knockback velocity are kept SEPARATE and summed only
+// at integration, and that single decision is what makes the rest of this
+// simple. Folding a shove into `vel` puts it directly in the path of the
+// accel-toward-desired model that drives walking: at kAccel 7 m/s^2 a 2 m/s
+// knock is cancelled by the victim's own steering in under a third of a second,
+// so a solid hit reads as nothing happening. Kept apart, the shove decays on
+// its own schedule and a fighter can walk while it is still sliding.
+struct Body {
+    float vel[3] = {0.f, 0.f, 0.f};   // locomotion: input or AI
+    float knock[3] = {0.f, 0.f, 0.f}; // knockback: contact only
+    float force[3] = {0.f, 0.f, 0.f}; // THIS FRAME's contact force, m/s^2
+    float stagger = 0.f;              // s of no steering left
+    float rate = 1.f;                 // strike-clock multiplier, minRate..1
+
+    // Both velocities, one tick. Everything is xz — nothing here leaves the
+    // floor, and the visual hop is the rig's spring, not a physical one.
+    void integrate(FighterPose& f, const PhysicsParams& p, float dt) {
+        for (int a = 0; a < 3; a += 2) knock[a] += force[a] * dt;
+        float ks = std::sqrt(knock[0] * knock[0] + knock[2] * knock[2]);
+        if (ks > p.knockMax && ks > 1e-6f) {
+            const float s = p.knockMax / ks;
+            knock[0] *= s;
+            knock[2] *= s;
+            ks = p.knockMax;
+        }
+        f.pos[0] += (vel[0] + knock[0]) * dt;
+        f.pos[2] += (vel[2] + knock[2]) * dt;
+        // LINEAR bleed-off, not exponential. An exponential shove asymptotes
+        // and never quite stops, and "still drifting a minute later" is how a
+        // fighter ends up slowly leaving the arena with nothing touching it.
+        const float drop = p.knockDamp * dt;
+        if (ks <= drop) {
+            knock[0] = 0.f;
+            knock[2] = 0.f;
+        } else if (ks > 1e-6f) {
+            const float s = (ks - drop) / ks;
+            knock[0] *= s;
+            knock[2] *= s;
+        }
+        if (stagger > 0.f) stagger = std::max(0.f, stagger - dt);
+    }
+
+    // Remove the component of both velocities heading along -`out`, i.e. INTO
+    // whatever just stopped us. Only the approaching part: zeroing the whole
+    // vector freezes a fighter sliding ALONG a surface, which is how bodies get
+    // stuck on each other and on the arena edge.
+    void killApproach(float outX, float outZ) {
+        float* vs[2] = {vel, knock};
+        for (float* v : vs) {
+            const float into = -(v[0] * outX + v[2] * outZ);
+            if (into > 0.f) {
+                v[0] += outX * into;
+                v[2] += outZ * into;
+            }
+        }
+    }
+};
+
+// The invisible wall (MotionParams::arenaRadius). Clamps a fighter to the lit
+// disc and kills the outward part of its velocity, so it SLIDES along the
+// boundary instead of grinding into it — walking straight at the edge and
+// stopping dead reads as a bug, sliding reads as a wall you cannot see.
+//
+// Applied to the hero and to every opponent through the same function, because
+// a boundary that only some bodies obey is worse than none.
+void confineToArena(FighterPose& f, Body& b, float radius) {
+    if (radius <= 0.f) return;
+    const float r = std::sqrt(f.pos[0] * f.pos[0] + f.pos[2] * f.pos[2]);
+    if (r <= radius || r < 1e-5f) return;
+    const float nx = f.pos[0] / r, nz = f.pos[2] / r;
+    f.pos[0] = nx * radius;
+    f.pos[2] = nz * radius;
+    b.killApproach(-nx, -nz); // inward is the free direction
+}
+
+// The punch's extension curve: 0 at the guard, 1 fully extended. Out fast,
+// back slower — the speed is in the strike, and the slower recover is what lets
+// the fist leave the wound behind it instead of dragging it back.
+//
+// Advanced at the 60 Hz SIM rate, deliberately NOT quantised to the pose grid.
+// The sword's swing arc is the same (only its idle bob steps at 12 Hz) and for
+// the same reason: a strike is carved as a swept capsule between consecutive
+// frames, so a fist that jumped 12 times a second would cut in stripes.
+float punchExtension(float u) {
+    u = std::min(std::max(u, 0.f), 1.f);
+    const float kOut = 0.40f;
+    if (u < kOut) {
+        const float a = u / kOut;
+        return a * a * (3.f - 2.f * a);
+    }
+    const float a = (u - kOut) / (1.f - kOut);
+    return 1.f - a * a * (3.f - 2.f * a);
+}
+
+// ---- M-FIST: one opponent's behaviour ----
+//
+// Wander -> lock on -> close -> jab, and back out again when the hero leaves.
+// Deterministic by the house rules (fixed dt, seeded RNG, no wall clock), which
+// is why it can run in the headless paths too: a `--replay` of a brawl
+// reproduces it exactly. Journals that place opponents by hand turn it off with
+// `set ai.enabled 0` first.
+//
+// It writes a FighterPose and nothing else — no renderer state, no edits. The
+// punch's damage is a consequence of where the fist ends up, resolved by
+// Renderer::updatePunchCut against whatever it passes through, so this has no
+// idea whether a swing connected and does not need one.
+struct OpponentAi {
+    uint32_t rng = 0;
+    bool locked = false;
+    float wanderT = 0.f;      // s until a new heading is chosen
+    float heading = 0.f;      // where we are wandering, radians
+    float cooldown = 0.f;     // s until the next punch is allowed
+    float punchT = -1.f;      // s into the current punch, <0 = not punching
+    int side = 0;             // which mitt is throwing it
+
+    void seed(int index) {
+        // distinct per opponent, and distinct from the gob stream, so two
+        // bodies do not wander in lockstep
+        rng = 0x9E3779B9u ^ (0x85EBCA6Bu * (uint32_t)(index + 1));
+        heading = 0.7f * (float)index;
+    }
+    float rand01() {
+        rng = rng * 1664525u + 1013904223u;
+        return (float)((rng >> 8) & 0xFFFFFFu) / 16777216.f;
+    }
+
+    void tick(FighterPose& me, const FighterPose& hero, const AiParams& ai,
+              Body& body, const PhysicsParams& phys, float punchDur, float dt) {
+        // ---- lock on, with hysteresis ----
+        const float dx = hero.pos[0] - me.pos[0], dz = hero.pos[2] - me.pos[2];
+        const float dist = std::sqrt(dx * dx + dz * dz);
+        if (!locked && dist < ai.lockRange) locked = true;
+        if (locked && dist > ai.breakRange) locked = false;
+
+        float want[3] = {0.f, 0.f, 0.f};
+        float face = me.yaw;
+        // Hitstun: a staggered opponent stops steering and just takes the ride.
+        // It still TURNS (below) — a body that cannot even face you while being
+        // knocked about reads as switched off rather than as staggered.
+        const bool stunned = body.stagger > 0.f;
+        if (stunned) {
+            // fall through with want = 0 and face unchanged
+        } else if (locked) {
+            // close to punching distance and hold there. Walking THROUGH the
+            // hero would look like a bug even though the bodies do not collide,
+            // and standing off is what gives the jab something to reach for.
+            face = std::atan2(dx, dz);
+            if (dist > ai.standoff) {
+                const float inv = dist > 1e-4f ? 1.f / dist : 0.f;
+                want[0] = dx * inv * ai.chaseSpeed;
+                want[2] = dz * inv * ai.chaseSpeed;
+            }
+        } else {
+            // wander: hold a heading for a while, then pick another. Steered
+            // back toward the middle when it strays, so an opponent left alone
+            // does not walk off into the dark and never come back.
+            wanderT -= dt;
+            const float r = std::sqrt(me.pos[0] * me.pos[0] + me.pos[2] * me.pos[2]);
+            if (wanderT <= 0.f) {
+                wanderT = ai.wanderHold * (0.6f + rand01() * 0.8f);
+                heading = rand01() * 6.28318531f;
+            }
+            if (r > ai.wanderRadius) {
+                // turn back toward the centre rather than snapping to it
+                heading = std::atan2(-me.pos[0], -me.pos[2]);
+                wanderT = ai.wanderHold;
+            }
+            want[0] = std::sin(heading) * ai.wanderSpeed;
+            want[2] = std::cos(heading) * ai.wanderSpeed;
+            face = std::atan2(want[0], want[2]);
+        }
+
+        for (int a = 0; a < 3; a += 2) {
+            const float d = want[a] - body.vel[a];
+            const float m = ai.accel * dt;
+            body.vel[a] += std::max(-m, std::min(d, m));
+        }
+        body.integrate(me, phys, dt);
+        // LOCOMOTION speed only, deliberately: a fighter sliding backwards off
+        // a punch is not walking, and driving the gait spring off the shove
+        // would make it break into a jog while being knocked over.
+        const float sp = std::sqrt(body.vel[0] * body.vel[0] +
+                                   body.vel[2] * body.vel[2]);
+        me.moving = sp > 0.10f;
+
+        // shortest-arc turn toward `face`
+        {
+            float d = face - me.yaw;
+            while (d > 3.14159265f) d -= 6.28318531f;
+            while (d < -3.14159265f) d += 6.28318531f;
+            const float m = ai.turnRate * dt;
+            me.yaw += std::max(-m, std::min(d, m));
+        }
+        // lean into the run, eased off while turning hard (the hero's rule)
+        {
+            float d = face - me.yaw;
+            while (d > 3.14159265f) d -= 6.28318531f;
+            while (d < -3.14159265f) d += 6.28318531f;
+            const float aim = 0.30f * (sp / std::max(ai.chaseSpeed, 1e-3f)) *
+                              (1.f - std::min(std::fabs(d), 1.f));
+            me.lean += (aim - me.lean) * std::min(1.f, 6.f * dt);
+        }
+
+        // ---- fists ----
+        me.guard = locked;
+        if (cooldown > 0.f) cooldown -= dt;
+        const float dur = std::max(punchDur, 1e-3f);
+        if (punchT >= 0.f) {
+            // M-PHYS: the punch's own clock, slowed by whatever it is buried
+            // in. The whole extension curve reads off punchT, so resistance is
+            // visible as the fist ploughing rather than as a number somewhere.
+            punchT += dt * body.rate;
+            if (punchT >= dur) {
+                punchT = -1.f;
+                cooldown = ai.punchCooldown;
+            }
+        } else if (!stunned && locked && dist < ai.strikeRange && cooldown <= 0.f) {
+            punchT = 0.f;
+            side = rand01() < 0.5f ? 0 : 1; // not predictably alternating
+        }
+        me.punchSide = side;
+        me.punch = punchT < 0.f ? 0.f : punchExtension(punchT / dur);
+    }
+};
+
 // Deterministic gameplay core. M5 test harness: one fighter walks the arena
 // under WASD and swings its sword on a keypress. Deterministic by the house
 // rules — fixed 60 Hz tick, seeded RNG, no wall clock in here — so a journal
 // replay reproduces a run exactly. (After a snapshot load the tick count is
 // resynced to the restored sim time.)
 struct GameState {
+    GameState() {
+        for (int i = 0; i < Renderer::kMaxPlayers; i++) foes[i].seed(i);
+    }
+
     uint64_t tickCount = 0;
 
     FighterPose fighter;
-    float vel[3] = {0.f, 0.f, 0.f};
+
+    // M-FIST: the opponents, and the knobs they share. One AI per player slot;
+    // slot 0 is the hero's and never ticks.
+    AiParams ai;
+    OpponentAi foes[Renderer::kMaxPlayers];
+    // M-PHYS: EVERY fighter's physical state in one array, hero at 0.
+    //
+    // It used to live in two places — a `vel` on GameState for the hero and one
+    // inside each OpponentAi — which was fine while nothing needed to look at
+    // two bodies at once. Body-body collision does: it is a constraint over
+    // PAIRS, and it cannot be written at all while each fighter's velocity is
+    // private to whatever happens to drive it.
+    PhysicsParams phys;
+    Body bodies[Renderer::kMaxPlayers];
+    // Set from look.sword.enabled before each tick. With the sword away the
+    // hero keeps its fists up and SPACE throws a jab instead of a swing —
+    // the punch is a generic mechanic, the opponent is just its first user.
+    bool unarmed = false;
+    float punchT = -1.f;
+    int punchSide = 0;
 
     // desired travel direction in WORLD space, latched from the keyboard each
     // frame (camera-relative, resolved by the caller). Zero = stand still.
@@ -107,7 +357,7 @@ struct GameState {
         return (float)((rng >> 8) & 0xFFFFFFu) / 16777216.f;
     }
 
-    void tick() {
+    void tick(float punchDur = 0.30f) {
         tickCount++;
         const float dt = (float)kTickDt;
 
@@ -117,19 +367,29 @@ struct GameState {
             want[0] = moveX / dl * kMaxSpeed;
             want[2] = moveZ / dl * kMaxSpeed;
         }
-        for (int a = 0; a < 3; a += 2) {
-            float d = want[a] - vel[a];
-            float m = kAccel * dt;
-            vel[a] += std::max(-m, std::min(d, m));
+        // Hitstun: while staggered the player's input is ignored and the
+        // fighter rides out the shove. This is the one place the game takes
+        // the controls away, so it is deliberately brief (PhysicsParams
+        // ::stagger, 0.20 s at full strength) — long enough to feel the hit,
+        // short enough that it never feels like a dropped input.
+        Body& body = bodies[0];
+        if (body.stagger > 0.f) {
+            want[0] = 0.f;
+            want[2] = 0.f;
         }
-        fighter.pos[0] += vel[0] * dt;
-        fighter.pos[2] += vel[2] * dt;
+        for (int a = 0; a < 3; a += 2) {
+            float d = want[a] - body.vel[a];
+            float m = kAccel * dt;
+            body.vel[a] += std::max(-m, std::min(d, m));
+        }
+        body.integrate(fighter, phys, dt);
 
-        float sp = std::sqrt(vel[0] * vel[0] + vel[2] * vel[2]);
+        // LOCOMOTION speed only — see the same note in OpponentAi::tick.
+        float sp = std::sqrt(body.vel[0] * body.vel[0] + body.vel[2] * body.vel[2]);
         fighter.moving = sp > 0.10f;
         if (fighter.moving) {
             // face the way we are going, then tip into it: shortest-arc turn
-            float target = std::atan2(vel[0], vel[2]);
+            float target = std::atan2(body.vel[0], body.vel[2]);
             float d = target - fighter.yaw;
             while (d > 3.14159265f) d -= 6.28318531f;
             while (d < -3.14159265f) d += 6.28318531f;
@@ -143,7 +403,28 @@ struct GameState {
             fighter.lean += (0.f - fighter.lean) * std::min(1.f, 6.f * dt);
         }
 
-        if (swingRequested && !swinging) {
+        // ---- unarmed: SPACE is a jab, not a swing ----
+        // Same request flag, so the key binding does not have to know which it
+        // is; the sword's own state decides. Guard stays up whenever the sword
+        // is away, which is what puts the fist brush on the hero's mitts.
+        fighter.guard = unarmed;
+        const float pdur = std::max(punchDur, 1e-3f);
+        if (unarmed) {
+            if (punchT >= 0.f) {
+                punchT += dt * body.rate; // M-PHYS: clay slows the jab
+                if (punchT >= pdur) punchT = -1.f;
+            } else if (swingRequested) {
+                punchT = 0.f;
+                punchSide = (punchSide + 1) & 1; // alternate hands
+            }
+            fighter.punchSide = punchSide;
+            fighter.punch = punchT < 0.f ? 0.f : punchExtension(punchT / pdur);
+        } else {
+            punchT = -1.f;
+            fighter.punch = 0.f;
+        }
+
+        if (!unarmed && swingRequested && !swinging) {
             swinging = true;
             swingT = 0.f;
             // a random arc ACROSS the front: start on one side, finish on the
@@ -155,7 +436,11 @@ struct GameState {
         }
         swingRequested = false;
         if (swinging) {
-            swingT += dt;
+            // M-PHYS: the swing's own clock. Every beat of the flourish reads
+            // off swingT, so a blade buried in a body visibly labours through
+            // the cut and then snaps back up to speed as it exits — no separate
+            // animation, no state, just a slower clock.
+            swingT += dt * body.rate;
             if (swingT >= kSwingDur) swinging = false;
         }
     }
@@ -205,6 +490,172 @@ struct GameState {
             yaw = swingTo * (1.f - e) + swingTo * 0.35f * (1.f - e);
             pitch = -1.5708f * (1.f - e) + swingArc * 0.25f * std::sin(3.14159f * a);
             lift += 0.16f * (1.f - e);
+        }
+    }
+
+    // Where fighter `i` actually lives. The hero's pose is GameState's; every
+    // other one belongs to the renderer, because opponents are placed through
+    // it (ctl `p1.pos`, addPlayer). The constraint solver needs them addressed
+    // uniformly and does not care which is which.
+    FighterPose* posePtr(Renderer& r, int i) { return i == 0 ? &fighter : &r.player(i); }
+    // ALIVE, not merely enabled: a collapsed fighter has no body, so it
+    // neither collides nor gets confined — it is not there to be pushed.
+    bool liveBody(Renderer& r, int i) const { return r.playerAlive(i); }
+
+    // Fold the renderer's per-frame contact report into per-fighter physics.
+    //
+    // Runs ONCE per frame, before the tick loop, and the split is intentional:
+    // `force` and `rate` are held constant across that frame's ticks so
+    // knockback integrates over real elapsed time rather than being re-applied
+    // per tick (which would scale the shove with the tick count), while
+    // `stagger` is a timer those ticks drain.
+    void applyContacts(const std::vector<Renderer::StrikeContact>& cs) {
+        for (Body& b : bodies) {
+            b.force[0] = b.force[1] = b.force[2] = 0.f;
+            b.rate = 1.f;
+        }
+        if (!phys.enabled) return;
+        for (const Renderer::StrikeContact& c : cs) {
+            const int t = c.target, a = c.attacker;
+            if (t < 0 || t >= Renderer::kMaxPlayers) continue;
+            if (a < 0 || a >= Renderer::kMaxPlayers) continue;
+            // Shove along the weapon's TRAVEL, flattened to the floor. The
+            // wound normal is the other candidate and it is worse: it points
+            // out of the surface, so a blade entering at a glancing angle would
+            // shunt the target sideways out of a cut it is still making.
+            float d[3] = {c.dir[0], 0.f, c.dir[2]};
+            const float dl = std::sqrt(d[0] * d[0] + d[2] * d[2]);
+            if (dl < 1e-4f) continue; // a purely vertical strike shoves nobody
+            d[0] /= dl;
+            d[2] /= dl;
+
+            const float f = phys.knockForce * c.bite;
+            bodies[t].force[0] += d[0] * f;
+            bodies[t].force[2] += d[2] * f;
+            // Newton's third, scaled down. An even exchange would shove the
+            // attacker as far as the victim, which reads as both of them having
+            // been hit; the wielder is braced and the clay is not.
+            bodies[a].force[0] -= d[0] * f * phys.recoil;
+            bodies[a].force[2] -= d[2] * f * phys.recoil;
+
+            const float hit =
+                std::min(1.f, c.bite / std::max(phys.staggerBite, 1e-4f));
+            bodies[t].stagger = std::max(bodies[t].stagger, phys.stagger * hit);
+
+            // Resistance belongs to the ATTACKER — it is their strike that has
+            // to fight through. Minimum across contacts, so cutting two bodies
+            // at once is as slow as the worse of them rather than the average.
+            const float drag = (c.side < 0) ? phys.bladeDrag : phys.fistDrag;
+            const float rate = 1.f / (1.f + drag * c.bite);
+            bodies[a].rate = std::min(bodies[a].rate, std::max(phys.minRate, rate));
+        }
+    }
+
+    // Bodies do not interpenetrate: a pairwise position constraint in xz, run
+    // after every fighter has integrated. Integrate, then solve — nothing ends
+    // a tick overlapping.
+    //
+    // Symmetric by construction (each body takes half the correction), which
+    // matters more than it looks. Pushing only the "second" body would make
+    // collision depend on player index: the hero would bulldoze opponents and
+    // they could not return the favour.
+    void resolveBodies(Renderer& r) {
+        if (!phys.enabled || phys.bodyRadius <= 0.f) return;
+        const float minD = phys.bodyRadius * 2.f;
+        for (int i = 0; i < Renderer::kMaxPlayers; i++) {
+            if (!liveBody(r, i)) continue;
+            for (int j = i + 1; j < Renderer::kMaxPlayers; j++) {
+                if (!liveBody(r, j)) continue;
+                FighterPose& a = *posePtr(r, i);
+                FighterPose& b = *posePtr(r, j);
+                float dx = b.pos[0] - a.pos[0], dz = b.pos[2] - a.pos[2];
+                const float d2 = dx * dx + dz * dz;
+                if (d2 >= minD * minD) continue;
+                float d = std::sqrt(d2);
+                if (d < 1e-5f) {
+                    // Exactly coincident: there is no separating axis to
+                    // compute, so take an arbitrary one. Fixed, not random —
+                    // an RNG draw here would make a wall-clock-free sim depend
+                    // on how many times something else happened to roll.
+                    dx = 1.f;
+                    dz = 0.f;
+                    d = 1.f;
+                }
+                const float nx = dx / d, nz = dz / d; // points i -> j
+                const float push = (minD - d) * 0.5f * phys.pushOut;
+                a.pos[0] -= nx * push;
+                a.pos[2] -= nz * push;
+                b.pos[0] += nx * push;
+                b.pos[2] += nz * push;
+                bodies[i].killApproach(-nx, -nz);
+                bodies[j].killApproach(nx, nz);
+            }
+        }
+    }
+
+    // ONE tick of the whole world, in the order a constraint solver wants:
+    // every body decides and integrates, THEN the constraints run over all of
+    // them at once.
+    //
+    // Bodies used to integrate and confine themselves inside their own tick(),
+    // which cannot express a pairwise rule at all — collision is a relation,
+    // not a property, and in the old order there was no moment when every
+    // fighter had moved but none had yet been corrected.
+    //
+    // `driveHero` false = the hero's pose comes from ctl/replay (headless), so
+    // it does not THINK — but it is still a body: it integrates, so knockback
+    // moves it, and the constraints still run over it. An opponent able to
+    // stand inside a journal-placed hero would be a strange thing to ship.
+    // M-DEATH: adopt anything the renderer put back on the field. A respawn is
+    // a teleport decided over there (it owns the carved ledger that triggers
+    // it), and every fighter's DRIVER lives here — so the sim has to be told,
+    // or it would keep steering off the momentum and the intent it had when it
+    // died. The hero needs its pose copied back as well, because GameState's
+    // copy is the authoritative one and setFighter overwrites the renderer's
+    // every frame.
+    void adoptRespawns(Renderer& r) {
+        for (int i = 0; i < Renderer::kMaxPlayers; i++) {
+            if (!r.takeRespawn(i)) continue;
+            bodies[i] = Body{};
+            if (i == 0) {
+                fighter = r.player(0);
+                swinging = false;
+                punchT = -1.f;
+            } else {
+                foes[i] = OpponentAi{};
+                foes[i].seed(i);
+            }
+        }
+    }
+
+    void stepWorld(Renderer& r, const LookParams& look, int ticks, bool driveHero) {
+        const float dt = (float)kTickDt;
+        adoptRespawns(r);
+        for (int k = 0; k < ticks; k++) {
+            // A collapsed hero has nothing to drive: no body to move, no
+            // weapon to swing. It still holds its pose so the camera has
+            // something to frame while it waits to come back.
+            const bool heroAlive = r.playerAlive(0);
+            if (driveHero && heroAlive) {
+                tick(look.handPose.punchDur);
+            } else if (heroAlive) {
+                bodies[0].integrate(fighter, phys, dt);
+            }
+            if (ai.enabled) {
+                for (int i = 1; i < Renderer::kMaxPlayers; i++) {
+                    if (!r.playerAlive(i)) continue;
+                    // A dead hero is not a target. Steering at a corpse would
+                    // park every opponent on the respawn point, waiting.
+                    foes[i].tick(r.player(i), fighter, ai, bodies[i], phys,
+                                 look.handPose.punchDur, dt);
+                    if (!heroAlive) foes[i].locked = false;
+                }
+            }
+            resolveBodies(r);
+            for (int i = 0; i < Renderer::kMaxPlayers; i++) {
+                if (!liveBody(r, i)) continue;
+                confineToArena(*posePtr(r, i), bodies[i], look.motion.arenaRadius);
+            }
         }
     }
 
@@ -295,11 +746,19 @@ int wantedPlayers() {
 // Spreads `count - 1` opponents around the hero so none of them is hidden
 // behind another — an occluded body still costs march steps, but it would
 // make the number depend on where they happened to stand.
+//
+// EVERY SPOT IS OUTSIDE AiParams::lockRange (1.50 m) and inside
+// MotionParams::arenaRadius (2.60 m). Spawning inside the lock radius meant an
+// opponent was already locked on at frame zero: it walked straight at the hero
+// out of the dark and started throwing punches before the player had touched a
+// key, so nobody ever saw it wander, and the fight had no beginning. Starting
+// them out at ~2.3 m means they idle and roam until the player comes looking —
+// which is also the only way to see the idle hand pose at all.
 void addOpponents(Renderer& renderer, int count) {
     static const FighterPose kSpots[3] = {
-        {{1.15f, 0.f, 0.25f}, 3.14159f, 0.f, false},
-        {{-1.05f, 0.f, 0.35f}, 1.40f, 0.f, false},
-        {{0.10f, 0.f, -0.95f}, 0.20f, 0.f, false},
+        {{1.95f, 0.f, -1.20f}, 3.14159f, 0.f, false},
+        {{-2.05f, 0.f, 0.90f}, 1.40f, 0.f, false},
+        {{0.20f, 0.f, 2.25f}, 0.20f, 0.f, false},
     };
     for (int i = 1; i < count; i++) renderer.addPlayer(kSpots[(i - 1) % 3]);
 }
@@ -458,6 +917,8 @@ int runHeadless(const RunOpts& o) {
     refs.fps = &fps;
     refs.wantQuit = &quit;
     refs.fighter = &fighter;
+    refs.ai = &bobState.ai;
+    refs.phys = &bobState.phys;
     refs.charPath = gCharacterPath;
     ctl.init(o.serve ? "ctl" : "", refs);
 
@@ -491,6 +952,18 @@ int runHeadless(const RunOpts& o) {
                 if (warm > 0) warm--;
                 t += n * kTickDt;
                 auto t0 = std::chrono::steady_clock::now();
+                // Opponents think here too. The AI is deterministic (fixed dt,
+                // seeded RNG) so this costs replay nothing, and a headless
+                // render that showed a STATIONARY opponent would disagree with
+                // the game the same way the missing sword bob used to.
+                //
+                // The hero does NOT think — ctl/replay owns its pose — but it
+                // is still a body, so it is handed in, stepped for knockback
+                // and collision, and handed back.
+                bobState.fighter = fighter;
+                bobState.applyContacts(renderer.contacts());
+                bobState.stepWorld(renderer, look, n, /*driveHero=*/false);
+                fighter = bobState.fighter;
                 renderer.setFighter(fighter);
                 renderer.render(cam, swordBobbed(bobState, fighter, look, t),
                                 makeFrameInfo(t, o.aa), nullptr, nullptr);
@@ -536,6 +1009,10 @@ int runHeadless(const RunOpts& o) {
             }
             ji++;
         }
+        bobState.fighter = fighter;
+        bobState.applyContacts(renderer.contacts());
+        bobState.stepWorld(renderer, look, 1, /*driveHero=*/false);
+        fighter = bobState.fighter;
         renderer.setFighter(fighter);
         renderer.render(cam, swordBobbed(bobState, fighter, look, t),
                         makeFrameInfo(t, o.aa), nullptr, nullptr);
@@ -743,6 +1220,8 @@ bool appStartAfterGpu(AppState& s) {
     refs.cam = &s.cam;
     refs.brush = &s.brush;
     refs.fighter = &s.game.fighter;
+    refs.ai = &s.game.ai;
+    refs.phys = &s.game.phys;
     refs.renderer = &s.renderer;
     refs.clock = &s.clock;
     refs.simT = &s.simT;
@@ -884,7 +1363,16 @@ void frameOnce(AppState& s) {
         if (frameDt > 0.25) frameDt = 0.25; // debugger/stall clamp
         int ticks = clock.ticksToRun(frameDt);
         if (ticks > 15) ticks = 15;
-        for (int k = 0; k < ticks; k++) game.tick();
+        // The sword's own switch decides whether SPACE swings or jabs, so the
+        // hero's fists come up the moment `sword.enabled` goes off from ctl or
+        // the panel — no separate mode to keep in sync.
+        game.unarmed = !look.sword.enabled;
+        // M-PHYS: last frame's weapon contacts become this frame's forces,
+        // hitstun and strike resistance. One frame of lag by construction —
+        // contacts are resolved during render(), which is the only place the
+        // posed weapons exist — and it is invisible at 60 Hz.
+        game.applyContacts(renderer.contacts());
+        game.stepWorld(renderer, look, ticks, /*driveHero=*/true);
         renderer.setFighter(game.fighter);
         simT += ticks * kTickDt;
         // Keep the walker framed — but on the SAME clock the body is drawn on.

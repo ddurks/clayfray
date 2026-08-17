@@ -60,7 +60,7 @@ struct Uniforms {
 // it is in trace.wgsl: a wound has to be carved into the volume it landed on,
 // and until this loop existed only player 0 could be picked at all.
 fn mapPick(p: vec3f) -> vec2f {
-  var d = min(arenaFloor(p), arenaWall(p));
+  var d = arenaFloor(p);
   var m = 0.0;
   let fh = fightersNearest(p, d);
   if (fh.y >= 0.0) {

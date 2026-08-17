@@ -79,7 +79,10 @@ struct Uniforms {
 //#include ground_read.wgsl
 
 const MAT_FLOOR: f32 = 1.0;
-const MAT_WALL: f32 = 2.0;
+// 2.0 was MAT_WALL, the backdrop plane (scene_common.wgsl). The id is left
+// unused rather than reclaimed: every material test downstream is a `<`
+// against a threshold, so renumbering to close the gap would move the
+// boundaries the rest of shade() is written around.
 // Fighter f is MAT_BODY + 0.1*f, i.e. 3.0, 3.1, 3.2, 3.3 — all of them under
 // the 3.5 clay cutoff on purpose, so every `m < 3.5` predicate in this file
 // (grain, AO, rim scale, the marbles-only glint rule) keeps classifying every
@@ -108,11 +111,6 @@ fn marblesDist(p: vec3f) -> f32 {
 fn map(p: vec3f) -> vec2f {
   var d = arenaFloor(p);
   var m = MAT_FLOOR;
-  let wd = arenaWall(p);
-  if (wd < d) {
-    d = wd;
-    m = MAT_WALL;
-  }
   // every live fighter, nearest wins (brick_read.wgsl owns the loop)
   let fh = fightersNearest(p, d);
   if (fh.y >= 0.0) {
@@ -172,7 +170,7 @@ fn march(ro: vec3f, rd: vec3f) -> vec2f {
 // Shading variant of the scene: same arena, loose (mid-estimate) character
 // distance. Marching stays on the conservative map().
 fn mapLoose(p: vec3f) -> f32 {
-  var d = min(arenaFloor(p), arenaWall(p));
+  var d = arenaFloor(p);
   d = fightersDistLoose(p, d);
   d = min(d, marblesDist(p));
   d = min(d, groundClaySmooth(p)); // piles shade/occlude like set dressing
@@ -233,7 +231,7 @@ fn charProxy(p: vec3f) -> f32 {
 // void, reading as hollow) while the smooth proxy floors the field's
 // downward errors, which are what band under a penumbra term.
 fn mapPenumbra(p: vec3f) -> f32 {
-  var d = min(arenaFloor(p), arenaWall(p));
+  var d = arenaFloor(p);
   // The max() with the real field is NOT optional: the fitted capsules bulge
   // past the true surface, so using the proxy alone as the occluder buries
   // anything sitting proud of the body — the marble eyes render black. Speed
@@ -315,10 +313,6 @@ fn albedoFor(p: vec3f, m: f32) -> vec3f {
   if (m < 1.5) {
     let cid = pebbleCell(p, FLOOR_CELL, FLOOR_SEED, FLOOR_SQUASH);
     return stonePalette(hash12(cid * 3.3 + 11.0)) * (0.60 + 0.35 * fbm(p * 7.0)) *
-           (0.82 + 0.36 * fbm(p * 23.0));
-  } else if (m < 2.5) {
-    let cid = pebbleCell(vec3f(p.x, p.z - WALL_Z, p.y), WALL_CELL, WALL_SEED, WALL_SQUASH);
-    return stonePalette(hash12(cid * 5.1 + 4.0)) * (0.42 + 0.28 * fbm(p * 7.0)) *
            (0.82 + 0.36 * fbm(p * 23.0));
   } else if (m < 3.5) {
     // per-voxel color from the brickmap (carve reveals, add stamps), read out

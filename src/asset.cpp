@@ -260,19 +260,76 @@ bool CharacterAsset::load(const std::string& path) {
         }
         part.idxCount = (uint32_t)indices.size() - part.idxBegin;
         if (part.idxCount == 0) return -1;
+        // Signed volume: sum the tetrahedra each triangle forms with the
+        // origin. Translation-invariant, so the brush offsets above do not
+        // disturb it, and |sum| is right whichever way the winding runs.
+        {
+            double v6 = 0.0;
+            for (uint32_t t = part.idxBegin; t + 2 < part.idxBegin + part.idxCount;
+                 t += 3) {
+                const float* p0 = &positions[indices[t] * 3];
+                const float* p1 = &positions[indices[t + 1] * 3];
+                const float* p2 = &positions[indices[t + 2] * 3];
+                v6 += (double)p0[0] * ((double)p1[1] * p2[2] - (double)p1[2] * p2[1]) -
+                      (double)p0[1] * ((double)p1[0] * p2[2] - (double)p1[2] * p2[0]) +
+                      (double)p0[2] * ((double)p1[0] * p2[1] - (double)p1[1] * p2[0]);
+            }
+            part.volume = (float)std::fabs(v6 / 6.0);
+        }
         parts.push_back(std::move(part));
         return (int)parts.size() - 1;
     };
 
+    // A shape key's index, BY NAME. glTF carries them in the mesh's
+    // `extras.targetNames`, which is where Blender writes its shape-key names,
+    // and cgltf parses that into target_names. Keying on the name rather than
+    // on the target's position in the list means the artist can add, remove or
+    // reorder shape keys without silently swapping two hand poses — which
+    // would show up as a fighter gripping its sword with an open palm and
+    // nothing at all in the log.
+    auto morphIndex = [](const cgltf_node* node, const char* want) -> int {
+        if (!node || !node->mesh) return -1;
+        const cgltf_mesh* m = node->mesh;
+        for (cgltf_size i = 0; i < m->target_names_count; i++) {
+            if (m->target_names[i] && std::strcmp(m->target_names[i], want) == 0)
+                return (int)i;
+        }
+        return -1;
+    };
+
     static const float kNoOffset[3] = {0.f, 0.f, 0.f};
     if (namedBody || namedHand) {
-        // The three brushes, in voxelization order. The hand is imported TWICE
-        // from the SAME primitive: once as authored (rest) and once with the
-        // "grab" morph target at full weight, translated into the empty half of
-        // the volume. Discrete poses, never blended — see brick_read.wgsl.
+        // The brushes, in voxelization order. The hand is imported ONCE PER
+        // POSE from the SAME primitive: as authored (rest), then with each
+        // shape key at full weight, translated into a region of the volume the
+        // body never uses. Discrete poses, never blended — see brick_read.wgsl.
         partBody = addPart(namedBody, "body", -1, kNoOffset);
-        partHandRest = addPart(namedHand, "hand.rest", -1, kNoOffset);
-        partHandGrab = addPart(namedHand, "hand.grab", 0, kGrabBrushOffset);
+        partHand[kHandRest] = addPart(namedHand, "hand.rest", -1, kNoOffset);
+        static const struct {
+            int pose;
+            const char* part;
+            const char* morph;
+        } kMorphBrushes[] = {
+            {kHandGrab, "hand.grab", "grab"},
+            {kHandIdle, "hand.idle", "idle"},
+            {kHandFist, "hand.fist", "fist"},
+        };
+        for (const auto& mb : kMorphBrushes) {
+            const int mi = morphIndex(namedHand, mb.morph);
+            if (mi < 0) {
+                // Import NOTHING rather than the base shape: a base shape at
+                // this pose's offset would be a second identical mitt sitting
+                // in its own region, costing bricks and voxelization for a
+                // pose that looks exactly like rest. handPart() falls back.
+                std::fprintf(stderr,
+                             "asset: no '%s' shape key on the hand — pose '%s' "
+                             "will use the rest shape\n",
+                             mb.morph, mb.part);
+                continue;
+            }
+            partHand[mb.pose] =
+                addPart(namedHand, mb.part, mi, kHandBrushOffset[mb.pose]);
+        }
     } else {
         // Legacy/rigged assets: keep the old behaviour — every mesh bound to
         // the armature (or the lone unskinned mesh) merged into one body brush.
@@ -422,9 +479,9 @@ bool CharacterAsset::load(const std::string& path) {
     // part with no triangles, or two parts whose boxes touch all show up here
     // before anything is rendered.
     for (const MeshPart& mp : parts) {
-        std::printf("asset: brush '%s' %u tris, aabb (%.4f %.4f %.4f)..(%.4f %.4f %.4f)\n",
-                    mp.name.c_str(), mp.idxCount / 3, mp.lo[0], mp.lo[1], mp.lo[2],
-                    mp.hi[0], mp.hi[1], mp.hi[2]);
+        std::printf("asset: brush '%s' %u tris, %.0f ml, aabb (%.4f %.4f %.4f)..(%.4f %.4f %.4f)\n",
+                    mp.name.c_str(), mp.idxCount / 3, mp.volume * 1e6f, mp.lo[0],
+                    mp.lo[1], mp.lo[2], mp.hi[0], mp.hi[1], mp.hi[2]);
     }
     for (const AnimClip& c : clips) {
         std::printf("asset: clip '%s' %.2fs, %zu tracks\n", c.name.c_str(), c.duration,

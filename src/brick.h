@@ -70,11 +70,14 @@ struct BrickEdit {
     float srcColor[3] = {0.024f, 0.19f, 0.25f}; // linear body cyan fallback
     bool fromGob = false;  // deposit of a landed gob (ledger reconciles)
     float gobVol = 0.f;    // the landed gob's intended volume, m^3
-    // Cut by a swinging blade, not the brush. Rides the measurement back so
-    // the ledger can pool a whole slice into ONE gob instead of dribbling it
+    // Cut by a WEAPON — a swinging blade or a travelling fist — rather than by
+    // the brush. Rides the measurement back so the ledger can pool a whole
+    // strike into ONE gob instead of dribbling it
     // (Renderer::updateConservation). `segment` is NOT a stand-in for this —
     // that is the capsule brush shape, which the UI may want one day.
-    bool fromBlade = false;
+    // (Named `fromBlade` until the fist arrived; the pooling was never
+    // blade-specific, only the caller was.)
+    bool fromWeapon = false;
 };
 
 // One edit op's measured |volume change| (carve: removed, add: created),

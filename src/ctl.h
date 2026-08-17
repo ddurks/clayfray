@@ -50,6 +50,12 @@ struct CtlRefs {
     OrbitCamera* cam = nullptr;
     BrushState* brush = nullptr;    // null headless
     FighterPose* fighter = nullptr; // locomotion state, drivable from replay
+    // Opponent behaviour. A journal that places opponents by hand disables it
+    // first (`set ai.enabled 0`), or the AI walks them off the marks it set.
+    AiParams* ai = nullptr;
+    // M-PHYS: knockback, resistance and body collision. Gameplay, like
+    // ai above — LookParams stays about how the scene LOOKS.
+    PhysicsParams* phys = nullptr;
     Renderer* renderer = nullptr;
     SimClock* clock = nullptr;
     double* simT = nullptr;

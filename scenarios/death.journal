@@ -1,0 +1,21 @@
+# clayfray scenario: M-DEATH. Carve a fighter past its collapse threshold,
+# watch it come apart, and see it respawn on the far side of the arena.
+# Replay: ./build/clayfray --replay scenarios/death.journal
+#   --screenshot out.png --frames 300 --size 640x360 --aa 1
+#
+# The conservation gate (exit 3) is the point of this one. A collapse hands a
+# fighter's REMAINING mass to the ledger as debt in the same breath that it
+# adds it to `carved`, so `carved == deposited + inFlight + debt` has to stay
+# true straight through the body vanishing — and respawn then re-imports a
+# whole body, which must NOT show up as carved clay appearing from nowhere.
+#
+# The AI is off so the two bodies hold still and the only thing moving is the
+# collapse itself; the threshold is dropped to 3% because at the shipping 50%
+# a fighter is ~46 litres of clay and this would be a 30-second journal.
+0 set ai.enabled 0
+0 set death.threshold 0.03
+0 set death.respawn 1.2
+0 set p1.pos 0.95 0 0.10
+0 set p1.yaw 3.14159
+# one deep carve, ~14 litres, well past 3% of the fighter's ~91 litres
+6 edit carve 0.02 0.42 0.05 0.15 0.72 0.45 0.4 0 1 0 .15 .4 .45 1

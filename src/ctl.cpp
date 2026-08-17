@@ -161,6 +161,8 @@ void CtlServer::buildRegistry() {
     addF("sword.sliceLift", &l->sword.sliceLift);
     addF("sword.sliceOut", &l->sword.sliceOut);
     addB("motion.stepRoot", &l->motion.stepRoot);
+    // The invisible wall. 0 = no boundary, walk off into the dark.
+    addF("motion.arenaRadius", &l->motion.arenaRadius);
     // M-PERF: affine body + two rigid mitts vs the 13-piece inverse-LBS warp.
     // CLAYFRAY_NO_AFFINE=1 pins it off for a benchmark run.
     addB("look.affineRig", &l->affineRig);
@@ -180,6 +182,68 @@ void CtlServer::buildRegistry() {
     addI("hands.gripAxis", &l->hands.gripAxis);
         addF("hands.gripRoll", &l->hands.gripRoll);
     addF("hands.gripSpread", &l->hands.gripSpread);
+    // M-FIST: where the mitts go when they are NOT on a hilt. Every one of
+    // these is dialled by eye in the running app — that is what ctl is for.
+    addF("handpose.idlePos", l->handPose.idlePos, 3);
+    addF("handpose.idlePitch", &l->handPose.idlePitch);
+    addF("handpose.idleYaw", &l->handPose.idleYaw);
+    addF("handpose.fistPos", l->handPose.fistPos, 3);
+    addF("handpose.fistPitch", &l->handPose.fistPitch);
+    addF("handpose.fistYaw", &l->handPose.fistYaw);
+    addF("handpose.bobAmp", &l->handPose.bobAmp);
+    addF("handpose.bobTilt", &l->handPose.bobTilt);
+    addF("handpose.bobRate", &l->handPose.bobRate);
+    addF("handpose.bobRateMove", &l->handPose.bobRateMove);
+    addF("handpose.bobAmpMove", &l->handPose.bobAmpMove);
+    addF("handpose.punchReach", &l->handPose.punchReach);
+    addF("handpose.punchDur", &l->handPose.punchDur);
+    addF("handpose.fistRadius", &l->handPose.fistRadius);
+    addF("handpose.cutSpeed", &l->handPose.cutSpeed);
+    if (refs_.ai) {
+        AiParams* a = refs_.ai;
+        addB("ai.enabled", &a->enabled);
+        addF("ai.wanderSpeed", &a->wanderSpeed);
+        addF("ai.chaseSpeed", &a->chaseSpeed);
+        addF("ai.lockRange", &a->lockRange);
+        addF("ai.breakRange", &a->breakRange);
+        addF("ai.standoff", &a->standoff);
+        addF("ai.strikeRange", &a->strikeRange);
+        addF("ai.punchCooldown", &a->punchCooldown);
+        addF("ai.wanderRadius", &a->wanderRadius);
+        addF("ai.wanderHold", &a->wanderHold);
+        addF("ai.turnRate", &a->turnRate);
+        addF("ai.accel", &a->accel);
+    }
+    if (refs_.phys) {
+        PhysicsParams* ph = refs_.phys;
+        addB("phys.enabled", &ph->enabled);
+        addF("phys.bodyRadius", &ph->bodyRadius);
+        addF("phys.pushOut", &ph->pushOut);
+        addF("phys.bladeDrag", &ph->bladeDrag);
+        addF("phys.fistDrag", &ph->fistDrag);
+        addF("phys.minRate", &ph->minRate);
+        addF("phys.knockForce", &ph->knockForce);
+        addF("phys.knockMax", &ph->knockMax);
+        addF("phys.knockDamp", &ph->knockDamp);
+        addF("phys.recoil", &ph->recoil);
+        addF("phys.stagger", &ph->stagger);
+        addF("phys.staggerBite", &ph->staggerBite);
+    }
+    // M-DEATH
+    addB("death.enabled", &l->death.enabled);
+    addF("death.threshold", &l->death.threshold);
+    addF("death.respawn", &l->death.respawn);
+    addF("death.eyeSpeed", &l->death.eyeSpeed);
+    addF("death.eyeLift", &l->death.eyeLift);
+    addF("death.eyeBounce", &l->death.eyeBounce);
+    addF("death.eyeRoll", &l->death.eyeRoll);
+    addF("death.spawnRadius", &l->death.spawnRadius);
+    addI("death.burstGobs", &l->death.burstGobs);
+    addF("death.burstFrac", &l->death.burstFrac);
+    addF("death.burstSpeed", &l->death.burstSpeed);
+    addF("death.burstLift", &l->death.burstLift);
+    addF("death.splatMax", &l->death.splatMax);
+    addF("death.splatSpread", &l->death.splatSpread);
     addB("gaze.track", &l->gaze.track);
     addF("gaze.maxAngle", &l->gaze.maxAngle);
     OrbitCamera* c = refs_.cam;
@@ -203,6 +267,15 @@ void CtlServer::buildRegistry() {
             addF(name, &refs_.renderer->playerPosePtr(i)->lean);
             std::snprintf(name, sizeof(name), "p%d.moving", i);
             addB(name, &refs_.renderer->playerPosePtr(i)->moving);
+            // M-FIST. Settable so a journal can pose a fist without the AI:
+            // `set ai.enabled 0` then drive p1.guard / p1.punch by hand, which
+            // is how a punch cut gets a repeatable regression scenario.
+            std::snprintf(name, sizeof(name), "p%d.guard", i);
+            addB(name, &refs_.renderer->playerPosePtr(i)->guard);
+            std::snprintf(name, sizeof(name), "p%d.punch", i);
+            addF(name, &refs_.renderer->playerPosePtr(i)->punch);
+            std::snprintf(name, sizeof(name), "p%d.punchSide", i);
+            addI(name, &refs_.renderer->playerPosePtr(i)->punchSide);
         }
         // `foe.*` is player 1 under its old name. Journals are the durable
         // form of a scenario (CLAUDE.md), and scenarios/ already contains
@@ -217,6 +290,9 @@ void CtlServer::buildRegistry() {
         addF("fighter.yaw", &refs_.fighter->yaw);
         addF("fighter.lean", &refs_.fighter->lean);
         addB("fighter.moving", &refs_.fighter->moving);
+        addB("fighter.guard", &refs_.fighter->guard);
+        addF("fighter.punch", &refs_.fighter->punch);
+        addI("fighter.punchSide", &refs_.fighter->punchSide);
     }
     if (refs_.brush) {
         addI("brush.mode", &refs_.brush->mode);

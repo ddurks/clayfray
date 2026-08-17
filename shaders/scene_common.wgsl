@@ -56,14 +56,24 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
 }
 fn toLinear(c: vec3f) -> vec3f { return pow(c, vec3f(2.2)); }
 
-// ---------- arena: pebble-mosaic floor + wall ----------
-const WALL_Z: f32 = -2.3;
+// ---------- arena: pebble-mosaic floor ----------
+//
+// THERE IS NO WALL. A pebble-mosaic backdrop plane used to stand at z = -2.3,
+// and it was doing what a lit backdrop always does: it gave the scene a visible
+// edge, a "this is a set" boundary, and it caught enough key light to read as a
+// surface rather than as depth.
+//
+// What replaced it is nothing at all. The floor is an infinite plane and the
+// key is a close point light with a quadratic falloff, so the ground simply
+// runs out of light — by ~3 m it is within a few LSB of the background, which
+// is itself near black (trace.wgsl `background`). The darkness IS the wall, and
+// it has no seam, no corner and no texture to recognise.
+//
+// The fighters are held inside it by MotionParams::arenaRadius, which is the
+// only "wall" left: an invisible one, out where the light has already gone.
 const FLOOR_CELL: f32 = 0.34;
-const WALL_CELL: f32 = 0.85;
 const FLOOR_SEED: f32 = 7.0;
-const WALL_SEED: f32 = 3.0;
 const FLOOR_SQUASH: f32 = 0.20;
-const WALL_SQUASH: f32 = 0.12;
 
 fn pebbleField(pl: vec3f, cell: f32, seed: f32, squash: f32) -> f32 {
   var d = 1e9;
@@ -102,23 +112,15 @@ fn pebbleCell(pl: vec3f, cell: f32, seed: f32, squash: f32) -> vec2f {
   return bestId;
 }
 
-// Conservative height/depth bounds skip the 9-ellipsoid loops for queries
-// far from the floor/wall planes — which is nearly all of them for rays,
-// AO taps, and shadow samples up in the scene.
+// A conservative height bound skips the 9-ellipsoid loop for queries far from
+// the floor plane — which is nearly all of them for rays, AO taps, and shadow
+// samples up in the scene.
 fn arenaFloor(p: vec3f) -> f32 {
   let bound = p.y - 0.058; // pebbles never rise above y = 0.058
   if (bound > 0.08) {
     return bound;
   }
   return min(p.y + 0.045, pebbleField(p, FLOOR_CELL, FLOOR_SEED, FLOOR_SQUASH));
-}
-fn arenaWall(p: vec3f) -> f32 {
-  let bound = p.z - WALL_Z - 0.086; // wall pebbles protrude at most 0.086
-  if (bound > 0.08) {
-    return bound;
-  }
-  return min(p.z - WALL_Z + 0.045,
-             pebbleField(vec3f(p.x, p.z - WALL_Z, p.y), WALL_CELL, WALL_SEED, WALL_SQUASH));
 }
 
 // ---------- analytic character body (bake source; eyes stay live in trace) ----------

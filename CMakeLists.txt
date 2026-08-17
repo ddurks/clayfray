@@ -177,45 +177,53 @@ if(EMSCRIPTEN)
     #
     # What DOES land in the wasm heap is dominated by ONE number, and it is
     # not a number anyone would guess — it has to be read off a run. The
-    # startup line `import: 14848 tris binned (8000190 refs)` is the whole
+    # startup line `import: 20480 tris binned (10975582 refs)` is the whole
     # budget: the voxelizer bins every triangle into every cell its
-    # band-dilated AABB touches, and at kBand = 12 voxels that fans 14,848
-    # triangles out to EIGHT MILLION cell references, ~539 per triangle.
+    # band-dilated AABB touches, and at kBand = 12 voxels that fans 20,480
+    # triangles out to ELEVEN MILLION cell references, ~536 per triangle.
     #
-    #   tri refs `ids`            8,000,190 * 4        = 30.5 MiB
-    #   `merged` = offsets + ids  8,125,191 * 4        = 31.0 MiB
+    #   tri refs `ids`           10,975,582 * 4        = 41.9 MiB
+    #   `merged` = offsets + ids 11,100,583 * 4        = 42.3 MiB
     #     ^ a full COPY of ids, alive at the same time as ids (brick.cpp,
     #       just before the "cell tris" upload) — together they ARE the peak
     #   cell offsets (kGrid^3+1)                        = 0.48 MiB
     #   inside bits (kGrid^3)                           = 0.48 MiB
-    #   posNrm 0.66 + normals 0.32                      = 0.98 MiB
-    #   CharacterAsset vectors (27,776 verts/14,848 tris) ~1.6 MiB
-    #   .glb read buffer + MEMFS preload package        ~1.9 MiB
+    #   posNrm 0.93 + normals 0.45                      = 1.38 MiB
+    #   CharacterAsset vectors (39,040 verts/20,480 tris) ~2.2 MiB
+    #   .glb read buffer + MEMFS preload package        ~2.6 MiB
     #   static data (measured from the linked .wasm)      0.16 MiB
     #   ImGui + SDL + libc + Dawn's client-side objects   a few MiB
     #
-    # Peak ~= 70 MiB, and it is a STARTUP TRANSIENT: once the import uploads
+    # Peak ~= 95 MiB, and it is a STARTUP TRANSIENT: once the import uploads
     # to the GPU, everything above but the asset vectors is freed. That does
     # not help the reservation, because wasm memory never shrinks — whatever
     # the module grows to during import it holds for the session. So size for
     # the peak up front and skip the growth memcpys rather than pretend the
     # steady state (~5 MiB) is the requirement.
     #
-    # 96 MiB = the ~70 MiB peak plus room for a somewhat denser asset. Note
-    # the stage-1 guess of 64 MiB was slightly UNDER the real peak, so it
-    # would have grown during startup on every load.
+    # 128 MiB = the ~95 MiB peak plus room for a somewhat denser asset.
     #
-    # WORTH FIXING LATER: `merged` is a pure copy that exists only to upload
-    # offsets and ids as one buffer. Two WriteBuffer calls into the same
-    # buffer at offsets 0 and offsets.size()*4 are byte-identical and would
-    # cut 31 MiB off the peak, letting this drop to 64 MiB or below. Left
-    # alone here because it is shared native/web code and this branch is
-    # meant to be additive.
+    # THE NUMBER MOVES WITH THE BRUSH COUNT, and by more than the geometry
+    # suggests. M-FIST added two hand shape keys as two more brushes: 14,848
+    # tris -> 20,480 (+38%) took the refs 8.0M -> 11.0M and the peak ~70 ->
+    # ~95 MiB, straight past the previous 96 MiB reservation. Every brush is a
+    # whole extra mesh through the binner, so RE-READ THE `import:` LINE after
+    # adding one — estimating it from vertex counts is hopeless (CLAUDE.md
+    # trap 10), and the stage-1 guess of 64 MiB was already under the peak of
+    # the day, which grew the heap during startup on every single load.
+    #
+    # WORTH FIXING, AND NOW WORTH MORE: `merged` is a pure copy that exists
+    # only to upload offsets and ids as one buffer. Two WriteBuffer calls into
+    # the same buffer at offsets 0 and offsets.size()*4 are byte-identical and
+    # would cut 42 MiB off the peak — it was 31 MiB before the fist brushes —
+    # letting this drop back to 64 MiB. Left alone because it is shared
+    # native/web code and neither branch that touched it was about the
+    # voxelizer.
     #
     # ALLOW_MEMORY_GROWTH stays ON regardless: it is what makes being wrong
     # about the number above recoverable rather than fatal.
     -sALLOW_MEMORY_GROWTH=1
-    -sINITIAL_MEMORY=100663296
+    -sINITIAL_MEMORY=134217728
     # Emscripten defaults the stack to 64 KB; this code was written against a
     # native 8 MB one. Nothing here has a frame over ~2 KB (the largest local
     # buffer in src/ is a 2048-byte char array), so 64 KB would probably do —

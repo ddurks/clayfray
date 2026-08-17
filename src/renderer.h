@@ -104,6 +104,30 @@ class Renderer {
     float traceMs() const { return traceMs_; }
     float postMs() const { return postMs_; }
 
+    // ---- M-PHYS: one frame of weapon-in-body contact ----
+    // The renderer resolves WHERE weapons are — it owns the piece transforms
+    // and the posed capsules — so it is the only place that can say how deep
+    // one is. It deliberately does not ACT on that: knockback, hitstun and
+    // resistance are gameplay, and gameplay is the deterministic 60 Hz tick in
+    // main.cpp. So this is a pure report, rebuilt from scratch every frame and
+    // read once by the sim on the next.
+    //
+    // `bite` is metres of weapon inside the target's proxy, and it means
+    // slightly different things per weapon on purpose: for a blade it is the
+    // LENGTH OF BLADE buried (a sword half-through a body is fighting far more
+    // than one that nicked it), for a fist it is how far the fist is past the
+    // surface. Each has its own drag coefficient, so they never have to be the
+    // same quantity.
+    struct StrikeContact {
+        int attacker = 0;
+        int target = 0;
+        int side = -1;    // -1 = the blade, 0/1 = which mitt
+        float bite = 0.f; // m
+        float dir[3] = {0.f, 0.f, 1.f}; // weapon travel, unit
+        float speed = 0.f;              // m/s
+    };
+    const std::vector<StrikeContact>& contacts() const { return contacts_; }
+
   private:
     bool buildPipelines();
     void buildTargets();
@@ -205,18 +229,22 @@ class Renderer {
         int srcBone = -1;
         float xform[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     };
-    // Static description of the three brushes, measured off the asset at import
-    // and then constant. `canonLo/canonHi` are each hand brush's bounds mapped
-    // back onto the authored (rest-hand) frame, so both poses are placed by the
-    // same grip maths; `ofs` is the rest-space translation that brush carries
-    // in the volume (zero for the rest hand, kGrabBrushOffset for the grab).
+    // Static description of the brushes, measured off the asset at import and
+    // then constant. `canonLo/canonHi` are each hand brush's bounds mapped back
+    // onto the authored (rest-hand) frame, so every pose is placed by the same
+    // grip maths; `ofs` is the rest-space translation that brush carries in the
+    // volume (zero for the rest hand, kHandBrushOffset[pose] otherwise).
+    //
+    // Indexed by HandBrush, so a pose the asset did not ship simply repeats the
+    // rest entry and selecting it samples the rest brush.
     struct BrushRig {
         bool valid = false;
         float bodyLo[3], bodyHi[3];
-        float handLo[2][3], handHi[2][3];   // [0] = rest, [1] = grab, in-volume
-        float canonLo[2][3], canonHi[2][3]; // the same, mapped to the rest frame
-        float ofs[2][3];
-        float palm[2][3]; // grip point per pose, canonical frame
+        float bodyCenter[3] = {0.f, 0.35f, 0.f}; // the reach ball's origin
+        float handLo[kHandBrushCount][3], handHi[kHandBrushCount][3]; // in-volume
+        float canonLo[kHandBrushCount][3], canonHi[kHandBrushCount][3];
+        float ofs[kHandBrushCount][3];
+        float palm[kHandBrushCount][3]; // grip point per pose, canonical frame
     };
     BrushRig brush_{};
     float handPoseTime_ = -1.f;
@@ -250,14 +278,33 @@ class Renderer {
         // Posed brush pieces — body affine + one rigid transform per mitt.
         // Each fighter needs its OWN, since its own pose drives them.
         std::vector<AffinePiece> pieces;
-        // Pose index per hand, LATCHED on the 12 Hz grid: 0 = rest brush,
-        // 1 = grab brush. Discrete, never interpolated — see brick_read.wgsl.
-        int handPose[2] = {0, 0};
+        // Which HandBrush each mitt is sampling, LATCHED on the 12 Hz grid.
+        // Discrete, never interpolated — see brick_read.wgsl.
+        int handPose[2] = {kHandRest, kHandRest};
+        // Where each mitt's fist centre was LAST frame, world. A punch cuts the
+        // swept segment between the two, which is the same trick the blade uses
+        // (updateBladeCut) and for the same reason: at strike speed a fist
+        // crosses several centimetres per frame, so testing only where it is
+        // now leaves a wound made of disconnected bites.
+        float handPrev[2][3] = {{0, 0, 0}, {0, 0, 0}};
+        bool haveHandPrev = false;
         // Its own clip clock, so two identical bodies don't breathe in
         // lockstep — that reads as one puppet duplicated, not two actors.
         float animT = 0.f;
         // Player 0 is always live; the rest switch on via addPlayer().
         bool enabled = false;
+
+        // ---- M-DEATH ----
+        // Clay carved off THIS body, m^3, net of anything that stuck back on.
+        // Accumulated from the same measurements that feed the arena ledger
+        // (absorbMeasured), because damage IS the conservation number — there
+        // is no separate health pool that could drift out of step with it.
+        float carved = 0.f;
+        // Collapsed: no clay, no beads, no hitbox, nothing to punch. Distinct
+        // from `enabled`, which means "this player slot is in play at all" and
+        // is permanently true for the hero — the hero has to be able to die.
+        bool dead = false;
+        float respawnT = 0.f; // s left face-down
     };
 
   private:
@@ -281,10 +328,23 @@ class Renderer {
                     const RigParams& r, float out[16]) const;
     // Recomputes one fighter's three piece transforms and brush boxes for the
     // current pose. `grip` is the world-space sword geometry to hold, or null
-    // to leave the mitts riding the body.
+    // to place the mitts from look.handPose (idle / guard / punch).
+    // `poseTime` is the 12 Hz clock the hand bob steps on.
     void updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
                         const FighterPose& disp, const BodySpring& s,
-                        const LookParams& look, const SwordParams* grip) const;
+                        const LookParams& look, const SwordParams* grip,
+                        float poseTime) const;
+    // Palm position and orientation for ONE unarmed mitt, in CHARACTER space
+    // (before the body affine and the per-side mirror). Split out because the
+    // punch cut needs the same answer the rig draws, and re-deriving it would
+    // be two places to get the guard height wrong.
+    void unarmedHand(const FighterPose& disp, const LookParams& look, int side,
+                     float poseTime, float outPos[3], float outRot[16]) const;
+    // How far a mitt may stray from the body's centre. Under the brush rig
+    // there is no skeleton to measure a wrist off, so this is the rest
+    // distance from the body box's centre to the authored palm — the same
+    // quantity autoReach_ held under the bone rig, taken from the boxes.
+    float handReach(const LookParams& look) const;
     // Writes fighter `idx`'s pieces into its block and returns how many it
     // wrote. Capped at BrickSystem::kPiecesPerFighter — the brush rig uses
     // exactly three, and a piece that does not fit would silently vanish, so
@@ -335,6 +395,31 @@ class Renderer {
     bool playerEnabled(int i) const {
         return i <= 0 || (i < kMaxPlayers && fighters_[i].enabled);
     }
+    // M-DEATH: in play AND still standing. This is the predicate gameplay
+    // wants — a collapsed fighter has no body to collide with, steer at, or
+    // punch — while playerEnabled() stays "is this slot in play at all".
+    bool playerAlive(int i) const {
+        return playerEnabled(i) && i >= 0 && i < kMaxPlayers && !fighters_[i].dead;
+    }
+    // Consumes a one-shot "this fighter just respawned" flag.
+    //
+    // It exists because a respawn TELEPORTS a body, and for the hero that body
+    // belongs to the caller: the renderer can move fighters_[0].pose, but
+    // main.cpp overwrites it from GameState every frame via setFighter, so the
+    // new position would be gone before it was ever drawn. The caller has to
+    // be told, and it has to drop the old velocity too — otherwise the fighter
+    // arrives at the spawn point still running the direction it died going.
+    bool takeRespawn(int i) {
+        if (i < 0 || i >= kMaxPlayers || !respawned_[i]) return false;
+        respawned_[i] = false;
+        return true;
+    }
+    // 0 = untouched, 1 = at the collapse threshold. For a UI/telemetry read;
+    // the collapse itself is decided inside updateDeaths.
+    float playerDamage(int i) const {
+        if (i < 0 || i >= kMaxPlayers || fighterVolume_ <= 0.f) return 0.f;
+        return fighters_[i].carved / fighterVolume_;
+    }
     // exposed so ctl/replay can place and toggle each opponent by index
     FighterPose* playerPosePtr(int i) { return &fighters_[clampPlayer(i)].pose; }
     bool* playerEnabledPtr(int i) { return &fighters_[clampPlayer(i)].enabled; }
@@ -362,12 +447,57 @@ class Renderer {
     };
     void updateConservation(const LookParams& look, const FrameInfo& frame);
     void absorbMeasured(); // drain brick measurements into the ledger
+
+    // ---- M-DEATH ----
+    // One fighter's worth of clay, m^3: the body brush plus two mitts, summed
+    // from the mesh volumes measured at import. The denominator of the damage
+    // fraction, and 0 for the analytic blob (which therefore never dies).
+    float fighterVolume_ = 0.f;
+    void updateDeaths(const LookParams& look, const FrameInfo& frame, float dt);
+    bool respawned_[kMaxPlayers] = {}; // one-shot, drained by takeRespawn
+    void collapseFighter(int i, const LookParams& look);
+    void respawnFighter(int i, const LookParams& look);
+    // The eyes, once nothing is wearing them. Four beads per collapse, and a
+    // dead fighter frees exactly the four marble slots its corpse used to
+    // occupy — so this rides in the SAME uniform array at the same size and
+    // costs no layout change (trap 2 stays untouched).
+    struct LooseMarble {
+        float pos[3], vel[3], disp[3]; // disp = 12 Hz-stepped display position
+        float radius = 0.02f;
+        float col[3] = {0.8f, 0.8f, 0.8f};
+        float rest = 0.f; // s spent stationary; retired once it settles
+    };
+    std::vector<LooseMarble> loose_;
+    void updateLooseMarbles(const LookParams& look, const FrameInfo& frame, float dt,
+                            bool poseStep);
     // M5: a MOVING blade that overlaps fighter 1 carves a channel along its
     // sweep. Gated on blade speed so a sword merely resting against the
     // opponent doesn't eat it.
     void updateBladeCut(const LookParams& look);
     float prevTip_[3] = {0, 0, 0}, prevHilt_[3] = {0, 0, 0};
     bool haveBlade_ = false;
+    // M-FIST: the same idea one weapon down. A closed fist travelling fast
+    // enough carves a fist-sized channel out of any OTHER fighter it passes
+    // through, and the wound is pooled into one gob like a sword slice rather
+    // than dribbled — a punch takes a chunk, it does not sneeze.
+    void updatePunchCut(const LookParams& look);
+    // A capsule of `owner`'s, posed into world. Under the brush rig the stored
+    // capsule is fitted to ONE brush's box, so it has to be refitted from the
+    // piece's CURRENT box before it is transformed — the piece's transform
+    // undoes the selected brush's rest-space offset, so a capsule still
+    // expressed in another brush's frame lands a metre across the arena. This
+    // was invisible while every target held rest hands and became real the
+    // moment opponents started closing their fists.
+    void posedCapsule(const Fighter& owner, const BoneCapsule& c, float a[3],
+                      float b[3], float& r) const;
+    // Rebuilt every frame by the two cut paths, before either queues an edit.
+    std::vector<StrikeContact> contacts_;
+    // Contact is reported per (attacker, target, weapon) with the DEEPEST bite
+    // of the frame, not once per substep or per sample — a blade emits up to
+    // kOpsPerFrame capsule carves as it sweeps, and six separate shoves off one
+    // swing would multiply knockback by the substep count.
+    void reportContact(int attacker, int target, int side, float bite,
+                       const float dir[3], float speed);
 
     // ---- sword slice sploot ----
     // A slice is a CONTIGUOUS RUN OF CUTTING POSE STEPS: it opens on the first

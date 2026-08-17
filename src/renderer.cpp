@@ -570,9 +570,83 @@ void Renderer::capsuleFromBox(const float lo[3], const float hi[3], float a[3],
     b[axis] = c[axis] + half;
 }
 
+float Renderer::handReach(const LookParams& look) const {
+    return look.hands.reach > 0.f ? look.hands.reach
+                                  : autoReach_ * look.hands.reachScale;
+}
+
+// One unarmed mitt, in CHARACTER space (before the body affine and before the
+// per-side mirror, so this is always the AUTHORED side's answer and the right
+// mitt is its reflection).
+//
+// The rotation is Ry(yaw) * Rz(-pitch) about the PALM: the authored mitt points
+// its fingers along +x, Rz(-pitch) tips them down, and Ry(yaw) then swings the
+// whole hand about the vertical. Composed in that order so the droop happens in
+// the hand's own frame — the other order rolls a hanging hand sideways.
+void Renderer::unarmedHand(const FighterPose& disp, const LookParams& look, int side,
+                           float poseTime, float outPos[3], float outRot[16]) const {
+    const HandPoseParams& hp = look.handPose;
+    // A punch IS the guard pose with the lead fist thrown, so anything mid-jab
+    // reads as guarding whatever the flag says. That keeps the brush selection
+    // in render() and the placement here agreeing on one predicate.
+    const bool guard = disp.guard || disp.punch > 0.f;
+    const float* base = guard ? hp.fistPos : hp.idlePos;
+    float p[3] = {base[0], base[1], base[2]};
+    float pitch = guard ? hp.fistPitch : hp.idlePitch;
+    float yaw = guard ? hp.fistYaw : hp.idleYaw;
+
+    if (disp.punch > 0.f && side == (disp.punchSide & 1)) {
+        const float u = std::min(std::max(disp.punch, 0.f), 1.f);
+        p[2] += hp.punchReach * u;
+        // the fist crosses toward the midline and the knuckles square up as it
+        // extends — a jab finishes in line with the body, not out at the hip
+        p[0] -= p[0] * 0.55f * u;
+        yaw *= 1.f - 0.6f * u;
+    }
+
+    // ---- the bob ----
+    // Deliberately the same expression as GameState::swordOffset, sampled off
+    // the same 12 Hz clock: lift on sin(rate), roll on sin(rate/2) so the two
+    // never quite line up and the loop does not read as a metronome. Both mitts
+    // are IN PHASE, because the sword bobs one hilt and two hands ride it — a
+    // phase offset here would make putting the sword down change the idle.
+    const float amp = hp.bobAmp * (disp.moving ? hp.bobAmpMove : 1.f);
+    const float rate = disp.moving ? hp.bobRateMove : hp.bobRate;
+    p[1] += amp * std::sin(poseTime * rate);
+    pitch += hp.bobTilt * std::sin(poseTime * rate * 0.5f);
+
+    // The reach ball, the only thing holding a mitt to an armless body. The
+    // sword's grips are clamped by exactly this (HandParams::reach), so a
+    // punch cannot out-reach a sword thrust: same ball, same radius.
+    const float reach = handReach(look);
+    if (reach > 0.f) {
+        float d[3], len = 0.f;
+        for (int k = 0; k < 3; k++) {
+            d[k] = p[k] - brush_.bodyCenter[k];
+            len += d[k] * d[k];
+        }
+        len = std::sqrt(len);
+        if (len > reach && len > 1e-6f) {
+            const float f = reach / len;
+            for (int k = 0; k < 3; k++) p[k] = brush_.bodyCenter[k] + d[k] * f;
+        }
+    }
+    std::memcpy(outPos, p, sizeof(float) * 3);
+
+    const float cp = std::cos(pitch), sp = std::sin(pitch);
+    const float cy = std::cos(yaw), sy = std::sin(yaw);
+    // Rz(-pitch) columns: (cp, -sp, 0), (sp, cp, 0), (0, 0, 1)
+    // Ry(yaw) columns:    (cy, 0, -sy), (0, 1, 0), (sy, 0, cy)
+    matIdentity(outRot);
+    outRot[0] = cp * cy;  outRot[1] = -sp; outRot[2] = -cp * sy;
+    outRot[4] = sp * cy;  outRot[5] = cp;  outRot[6] = -sp * sy;
+    outRot[8] = sy;       outRot[9] = 0.f; outRot[10] = cy;
+}
+
 void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
                               const FighterPose& disp, const BodySpring& s,
-                              const LookParams& look, const SwordParams* grip) const {
+                              const LookParams& look, const SwordParams* grip,
+                              float poseTime) const {
     if (!brush_.valid || pieces.size() < 3) return;
     float A[16];
     bodyAffine(disp, s, look.rig, A);
@@ -605,7 +679,8 @@ void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPo
 
     for (int side = 0; side < 2; side++) { // 0 = left, 1 = right
         AffinePiece& ap = pieces[1 + side];
-        const int b = (handPose[side] != 0) ? 1 : 0;
+        const int b =
+            std::min(std::max(handPose[side], 0), (int)kHandBrushCount - 1);
         for (int k = 0; k < 3; k++) {
             ap.lo[k] = brush_.handLo[b][k];
             ap.hi[k] = brush_.handHi[b][k];
@@ -615,15 +690,18 @@ void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPo
         // forms M^T M) returns exactly 1 for it. Confirmed, not assumed.
         const float mir = (side == 1) ? -1.f : 1.f;
 
-        // Pre-translation applied in BRUSH space, before the mirror.
-        //   holding: brush -> canonical -> palm at the origin, so the grip
-        //            transform below lands the palm exactly on the hilt.
-        //   riding:  brush -> canonical ONLY. The hand keeps its authored
-        //            offset from the body, and mirroring about x=0 (the body's
-        //            own axis) puts the other one on the other side.
+        // Pre-translation applied in BRUSH space, before the mirror: brush ->
+        // canonical -> palm at the origin, so whatever transform follows lands
+        // the PALM on its target and any rotation spins the mitt in place.
+        //
+        // It used to be brush -> canonical only when unarmed, which left the
+        // hand wherever the artist happened to model it. That was fine while
+        // "unarmed" meant "the sword is switched off"; it is not a pose, and
+        // idle/guard/punch need the mitt placed, so both branches now centre
+        // the palm and differ only in where they put it.
         float pre[3];
         for (int k = 0; k < 3; k++) {
-            pre[k] = -brush_.ofs[b][k] - (grip ? brush_.palm[b][k] : 0.f);
+            pre[k] = -brush_.ofs[b][k] - brush_.palm[b][k];
         }
 
         float M[16];
@@ -686,11 +764,23 @@ void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPo
             for (int k = 0; k < 3; k++) M[12 + k] = g[k] + offs[k] * lateral;
             M[15] = 1.f;
         } else {
-            // No sword: the mitt just rides the body, mirrored, where authored.
+            // No sword: place the palm from look.handPose (idle hang, guard,
+            // or a thrown punch) in CHARACTER space, then ride the body affine.
+            // The mirror sits between the two, so the right mitt is the exact
+            // reflection of the left — position, droop and knuckle roll all
+            // flip together, which is what stops a mirrored hand from pointing
+            // its fingers the wrong way round the body.
+            float target[3], R[16];
+            unarmedHand(disp, look, side, poseTime, target, R);
+            R[12] = target[0];
+            R[13] = target[1];
+            R[14] = target[2];
             float Mir[16];
             matIdentity(Mir);
             Mir[0] = mir;
-            matMul(A, Mir, M);
+            float AM[16];
+            matMul(A, Mir, AM);
+            matMul(AM, R, M);
         }
         // fold the pre-translation in: xform = M * T(pre)
         float T[16];
@@ -888,8 +978,31 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     };
     for (int i = 0; i < kMaxPlayers; i++) {
         const Fighter& f = fighters_[i];
+        if (f.dead) continue; // M-DEATH: the beads are loose_ now, packed below
         if (i > 0 && !(f.enabled && (!f.skinMats.empty() || brushRig))) continue;
         packMarbles(f);
+    }
+    // How many of those are still attached to a face. The gaze pass below
+    // pairs a pupil with its eyeball BY PROXIMITY, so it must not see the loose
+    // ones: a bead rolling on the floor has no eyeball to look out of, and
+    // leaving it in the search would let a live pupil pick a corpse's eye as
+    // its partner and stare through the floor.
+    const int liveMarbles = n;
+
+    // The loose eyes take the slots their corpse just gave up — four freed per
+    // collapse, four spawned, so the array size is unchanged by construction
+    // and trap 2's hand-mirrored layout never has to move.
+    for (const LooseMarble& lm : loose_) {
+        if (n >= kMaxMarbles) break;
+        float* slotA = out[kSlotMarbles + n * 2];
+        float* slotB = out[kSlotMarbles + n * 2 + 1];
+        slotA[0] = lm.disp[0]; slotA[1] = lm.disp[1]; slotA[2] = lm.disp[2];
+        slotA[3] = lm.radius;
+        slotB[0] = lm.col[0]; slotB[1] = lm.col[1]; slotB[2] = lm.col[2];
+        // Deliberately NOT written into eyeWorld: gaze pairs a pupil with its
+        // eyeball by proximity, and a bead rolling on the floor has no eyeball
+        // to look out of. Leaving them out keeps the gaze pass blind to them.
+        n++;
     }
     // ---- gaze, without bones ----
     // The eye bones died with the armature, but a bead does not need one: an
@@ -902,10 +1015,10 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // sliding the pupils at 60 Hz would both break the stop-motion and make a
     // STANDING fighter a unique frame every frame, costing the idle reuse.
     if (look.gaze.track) {
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < liveMarbles; i++) {
             int mate = -1;
             float best = 1e9f;
-            for (int j = 0; j < n; j++) {
+            for (int j = 0; j < liveMarbles; j++) {
                 if (j == i) continue;
                 float d2 = 0.f;
                 for (int k = 0; k < 3; k++) {
@@ -1061,6 +1174,11 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     for (int i = 0; i < kMaxPlayers; i++) {
         const Fighter& f = fighters_[i];
         if (i > 0 && !f.enabled) continue;
+        // M-DEATH: leave the block zeroed. base[0] is the shader's `enabled`
+        // flag and the memset above already cleared it, so a collapsed fighter
+        // costs the tracer one rejected test and draws nothing — no clay, no
+        // reject sphere, no shadow proxy.
+        if (f.dead) continue;
         live = i + 1;
         const int base = fighterSlot(i);
         // Skeleton-free with the rig switched off: pn = 0 puts the shader on
@@ -1196,8 +1314,6 @@ void Renderer::setCharacter(CharacterAsset asset) {
     for (Fighter& f : fighters_) f.pieces.clear();
     if (asset.hasBrushRig()) {
         const MeshPart& body = asset.parts[asset.partBody];
-        const MeshPart& hr = asset.parts[asset.partHandRest];
-        const MeshPart& hg = asset.parts[asset.partHandGrab];
         // Pad each brush box outward. The pad only has to CONTAIN the brush's
         // clay (a box that contains it makes max(field, boxDist) exact); it
         // must not reach a neighbour, and with ~0.12 m of clearance a pad this
@@ -1210,13 +1326,23 @@ void Renderer::setCharacter(CharacterAsset asset) {
             }
         };
         setBox(body, brush_.bodyLo, brush_.bodyHi);
-        setBox(hr, brush_.handLo[0], brush_.handHi[0]);
-        setBox(hg, brush_.handLo[1], brush_.handHi[1]);
+        // The reach ball's origin. Under the bone rig this was the blob's
+        // centre of mass, decomposed off the skin; with no skin the body
+        // brush's own box centre is the same quantity measured off the only
+        // thing left that knows where the body is.
         for (int k = 0; k < 3; k++) {
-            brush_.ofs[0][k] = 0.f;
-            brush_.ofs[1][k] = kGrabBrushOffset[k];
+            brush_.bodyCenter[k] = (brush_.bodyLo[k] + brush_.bodyHi[k]) * 0.5f;
         }
-        for (int b = 0; b < 2; b++) {
+        for (int b = 0; b < kHandBrushCount; b++) {
+            setBox(asset.parts[asset.handPart(b)], brush_.handLo[b], brush_.handHi[b]);
+            // A pose the asset did not ship falls back to the REST brush, and
+            // therefore has to carry the rest brush's offset — the offset says
+            // where in the volume this pose's clay actually lives, so taking it
+            // from the table while sampling rest's region would place the mitt
+            // half a metre away from its own geometry.
+            const bool own = asset.partHand[b] >= 0;
+            const float* ofs = kHandBrushOffset[own ? b : kHandRest];
+            for (int k = 0; k < 3; k++) brush_.ofs[b][k] = ofs[k];
             for (int k = 0; k < 3; k++) {
                 brush_.canonLo[b][k] = brush_.handLo[b][k] - brush_.ofs[b][k];
                 brush_.canonHi[b][k] = brush_.handHi[b][k] - brush_.ofs[b][k];
@@ -1259,20 +1385,41 @@ void Renderer::setCharacter(CharacterAsset asset) {
             for (int k = 0; k < 3; k++) { bc.lo[k] = lo[k]; bc.hi[k] = hi[k]; }
             capsules_.push_back(bc);
         };
-        // Rest-pose defaults. packUniforms REFITS the a/b/r of each of these
-        // every frame from its piece's current brush box, so these values only
-        // serve the blade hit test, which works in rest space.
+        // Rest-pose defaults. packUniforms and posedCapsule both REFIT the
+        // a/b/r of each of these from its piece's CURRENT brush box, so these
+        // values are only the un-posed seed.
         addCapsule(brush_.bodyLo, brush_.bodyHi, 0);
-        addCapsule(brush_.handLo[0], brush_.handHi[0], 1);
-        addCapsule(brush_.handLo[0], brush_.handHi[0], 2);
+        addCapsule(brush_.handLo[kHandRest], brush_.handHi[kHandRest], 1);
+        addCapsule(brush_.handLo[kHandRest], brush_.handHi[kHandRest], 2);
+
+        // How far a mitt may float from the body. The bone rig measured this
+        // as the rest COM->wrist distance; the boxes give the same quantity
+        // without an armature, and hands.reachScale still scales it.
+        autoReach_ = 0.f;
+        for (int k = 0; k < 3; k++) {
+            const float d = brush_.palm[kHandRest][k] - brush_.bodyCenter[k];
+            autoReach_ += d * d;
+        }
+        autoReach_ = std::sqrt(autoReach_);
+
+        // M-DEATH's denominator: the clay one fighter IS, as drawn — the body
+        // plus TWO mitts (the rig mirrors one hand into two pieces, so the
+        // brush is paid for twice). The other hand poses are alternates of the
+        // same mitt, not extra limbs, so counting them would inflate the
+        // denominator and make a fighter take ~35% more damage before dropping.
+        fighterVolume_ = asset.parts[asset.partBody].volume +
+                         2.f * asset.parts[asset.handPart(kHandRest)].volume;
 
         std::printf("rig: brush rig — body (%.3f %.3f %.3f)..(%.3f %.3f %.3f), "
-                    "hand rest x[%.3f %.3f], hand grab x[%.3f %.3f], "
-                    "%zu marbles\n",
+                    "hands rest/grab/idle/fist x[%.3f %.3f]/[%.3f %.3f]/"
+                    "[%.3f %.3f]/[%.3f %.3f], reach %.3f m, %zu marbles\n",
                     brush_.bodyLo[0], brush_.bodyLo[1], brush_.bodyLo[2],
                     brush_.bodyHi[0], brush_.bodyHi[1], brush_.bodyHi[2],
-                    brush_.handLo[0][0], brush_.handHi[0][0], brush_.handLo[1][0],
-                    brush_.handHi[1][0], marbles_.size());
+                    brush_.handLo[kHandRest][0], brush_.handHi[kHandRest][0],
+                    brush_.handLo[kHandGrab][0], brush_.handHi[kHandGrab][0],
+                    brush_.handLo[kHandIdle][0], brush_.handHi[kHandIdle][0],
+                    brush_.handLo[kHandFist][0], brush_.handHi[kHandFist][0],
+                    autoReach_, marbles_.size());
         // Fail LOUDLY rather than rendering a silently clipped fighter: a brush
         // that pokes outside the volume box, or two brushes whose padded boxes
         // touch, both break the clip's exactness (CLAUDE.md trap 5 drops edits
@@ -1282,31 +1429,43 @@ void Renderer::setCharacter(CharacterAsset asset) {
         const float vhi[3] = {vlo[0] + BrickSystem::kExtent,
                               vlo[1] + BrickSystem::kExtent,
                               vlo[2] + BrickSystem::kExtent};
-        const float* boxes[3][2] = {{brush_.bodyLo, brush_.bodyHi},
-                                    {brush_.handLo[0], brush_.handHi[0]},
-                                    {brush_.handLo[1], brush_.handHi[1]}};
-        static const char* bnames[3] = {"body", "hand.rest", "hand.grab"};
-        for (int i = 0; i < 3; i++) {
+        // One entry per DISTINCT region. A hand pose the asset did not ship
+        // shares the rest brush's box, and comparing a box against itself would
+        // report a guaranteed overlap — a warning that is always wrong is worse
+        // than no warning, because it trains you to ignore the real one.
+        struct NamedBox {
+            const char* name;
+            const float* lo;
+            const float* hi;
+        };
+        std::vector<NamedBox> boxes{{"body", brush_.bodyLo, brush_.bodyHi}};
+        static const char* kBrushNames[kHandBrushCount] = {
+            "hand.rest", "hand.grab", "hand.idle", "hand.fist"};
+        for (int b = 0; b < kHandBrushCount; b++) {
+            if (b != kHandRest && asset.partHand[b] < 0) continue; // fell back
+            boxes.push_back({kBrushNames[b], brush_.handLo[b], brush_.handHi[b]});
+        }
+        for (size_t i = 0; i < boxes.size(); i++) {
             for (int k = 0; k < 3; k++) {
-                if (boxes[i][0][k] < vlo[k] || boxes[i][1][k] > vhi[k]) {
+                if (boxes[i].lo[k] < vlo[k] || boxes[i].hi[k] > vhi[k]) {
                     std::fprintf(stderr,
                                  "[rig] WARNING brush '%s' axis %d leaves the volume "
                                  "box (%.4f..%.4f vs %.4f..%.4f) — it will render "
                                  "clipped\n",
-                                 bnames[i], k, boxes[i][0][k], boxes[i][1][k], vlo[k],
-                                 vhi[k]);
+                                 boxes[i].name, k, boxes[i].lo[k], boxes[i].hi[k],
+                                 vlo[k], vhi[k]);
                 }
             }
-            for (int j = i + 1; j < 3; j++) {
+            for (size_t j = i + 1; j < boxes.size(); j++) {
                 bool overlap = true;
                 for (int k = 0; k < 3; k++)
-                    if (boxes[i][1][k] < boxes[j][0][k] || boxes[j][1][k] < boxes[i][0][k])
+                    if (boxes[i].hi[k] < boxes[j].lo[k] || boxes[j].hi[k] < boxes[i].lo[k])
                         overlap = false;
                 if (overlap) {
                     std::fprintf(stderr,
                                  "[rig] WARNING brushes '%s' and '%s' overlap — the "
                                  "AABB clip is no longer an exact separation\n",
-                                 bnames[i], bnames[j]);
+                                 boxes[i].name, boxes[j].name);
                 }
             }
         }
@@ -1433,8 +1592,11 @@ void Renderer::setCharacter(CharacterAsset asset) {
     // is how far the wrists sit from it at rest — the natural "arm length" of
     // a fighter that has no arms.
     bodyCom_ = deriveBodyCom(asset, handBones);
-    autoReach_ = 0.f;
+    // Only a RIGGED asset re-derives it. The brush rig measured its own reach
+    // off the boxes above and there is no COM to decompose without a skin, so
+    // an unconditional reset here would zero it and let the mitts float free.
     if (!bodyCom_.bone.empty()) {
+        autoReach_ = 0.f;
         float com[3];
         evalBodyCom(bodyCom_, fighters_[0].skinMats, com); // fighters_[0].skinMats = rest pose here
         for (const HandIkChain& c : handIk_) {
@@ -1669,11 +1831,18 @@ void Renderer::absorbMeasured() {
         if (m.edit.mode == 1) {
             sploot_.carved += m.volume;
             sploot_.debt += m.volume;
+            // M-DEATH: the same measurement, billed to the body it came off.
+            // Damage is not a separate quantity — it is this one, per fighter,
+            // which is why a wound cannot exist on the ledger and be missing
+            // from the health bar or the other way round.
+            if (m.edit.player >= 0 && m.edit.player < kMaxPlayers) {
+                fighters_[m.edit.player].carved += m.volume;
+            }
             std::memcpy(lastWound_, m.edit.worldPos, sizeof(lastWound_));
             std::memcpy(woundDir_, m.edit.outDir, sizeof(woundDir_));
             std::memcpy(woundCol_, m.edit.srcColor, sizeof(woundCol_));
             haveWound_ = true;
-            if (m.edit.fromBlade) {
+            if (m.edit.fromWeapon) {
                 // Billing is UNCHANGED above (carved += v, debt += v). All this
                 // does is withhold that much debt from the dribble spawner so
                 // the whole slice can leave as one blob — the clay is on the
@@ -1687,8 +1856,279 @@ void Renderer::absorbMeasured() {
             // on the ledger so nothing is created or destroyed
             sploot_.deposited += m.volume;
             sploot_.debt += m.edit.gobVol - m.volume;
+            // M-DEATH: clay that sticks back on is damage UNDONE. Without this
+            // a fighter could be healed to visibly whole by re-sticks and still
+            // drop dead, because the damage counter only ever went up.
+            if (m.edit.player >= 0 && m.edit.player < kMaxPlayers) {
+                Fighter& f = fighters_[m.edit.player];
+                f.carved = std::max(0.f, f.carved - m.volume);
+            }
         }
       }
+    }
+}
+
+void Renderer::reportContact(int attacker, int target, int side, float bite,
+                             const float dir[3], float speed) {
+    if (!(bite > 0.f)) return;
+    for (StrikeContact& c : contacts_) {
+        if (c.attacker != attacker || c.target != target || c.side != side) continue;
+        // Deepest wins. Keeping the deepest sample's direction with it matters:
+        // a blade's sweep direction barely changes across one frame's substeps,
+        // but a fist's does at the turnaround, and pairing a deep bite with a
+        // retreating direction would knock the target TOWARD the puncher.
+        if (bite > c.bite) {
+            c.bite = bite;
+            c.speed = speed;
+            for (int k = 0; k < 3; k++) c.dir[k] = dir[k];
+        }
+        return;
+    }
+    StrikeContact c;
+    c.attacker = attacker;
+    c.target = target;
+    c.side = side;
+    c.bite = bite;
+    c.speed = speed;
+    for (int k = 0; k < 3; k++) c.dir[k] = dir[k];
+    contacts_.push_back(c);
+}
+
+void Renderer::posedCapsule(const Fighter& owner, const BoneCapsule& c, float a[3],
+                            float b[3], float& r) const {
+    for (int k = 0; k < 3; k++) {
+        a[k] = c.a[k];
+        b[k] = c.b[k];
+    }
+    r = c.r;
+    if (skeletonFree()) {
+        // Under the brush rig `bone` is a PIECE index into THIS fighter's own
+        // piece table. Falling through to identity would leave its hitboxes at
+        // the origin while the body stands elsewhere, and a weapon would cut
+        // empty air.
+        if (c.bone >= 0 && (size_t)c.bone < owner.pieces.size()) {
+            // REFIT from the piece's CURRENT box, do not transform the stored
+            // rest capsule. The stored one was fitted to the rest brush; the
+            // piece's transform undoes the SELECTED brush's rest-space offset,
+            // so a capsule still expressed in another brush's frame lands a
+            // metre across the arena. Invisible while every target held rest
+            // hands; real the moment an opponent closes its fists.
+            const AffinePiece& ap = owner.pieces[c.bone];
+            float ca[3], cb[3];
+            capsuleFromBox(ap.lo, ap.hi, ca, cb, r);
+            matTransformPoint(ap.xform, ca, a);
+            matTransformPoint(ap.xform, cb, b);
+        }
+        return;
+    }
+    if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= owner.skinMats.size()) {
+        matTransformPoint(&owner.skinMats[c.bone * 16], c.a, a);
+        matTransformPoint(&owner.skinMats[c.bone * 16], c.b, b);
+    }
+}
+
+// M-FIST: a travelling fist carves whatever it goes through.
+//
+// The same shape as updateBladeCut one weapon down, and the differences are
+// all consequences of a fist being a BALL rather than a blade:
+//   - the swept volume of a ball IS a capsule, so one edit covers the frame's
+//     whole motion and there is no substep loop to bridge the gap;
+//   - the hit test inflates the target's capsules by the fist radius, because
+//     what has to overlap is two solids, not a point and a solid;
+//   - there is no reach test, because the rig already applied one — the mitt
+//     is clamped to the reach ball in unarmedHand, so a punch physically
+//     cannot arrive from further away than a sword thrust.
+// Everything else — rest-space mapping through the piece that was hit, the
+// bounds pre-check, pooling into one gob — is the blade's, deliberately.
+void Renderer::updatePunchCut(const LookParams& look) {
+    // Needs the brush rig's piece transforms: the fist's world centre is a
+    // piece's translation column, and a rigged asset has no such piece.
+    if (!skeletonFree() || capsules_.empty()) return;
+    const HandPoseParams& hp = look.handPose;
+    const float fistR = std::max(hp.fistRadius, 0.005f);
+    // Same gate as the blade, same reason: a fist resting against a body would
+    // otherwise bore through it one edit per frame. Expressed as a speed and
+    // converted at the sim's fixed tick rate, so it means the same thing
+    // whatever the frame rate is.
+    const float minSweep = std::max(hp.cutSpeed, 0.f) / 60.f;
+
+    for (int atk = 0; atk < kMaxPlayers; atk++) {
+        Fighter& att = fighters_[atk];
+        if (atk > 0 && !att.enabled) continue;
+        if (att.dead) continue; // no arms, no punch
+        if (att.pieces.size() < 3) continue;
+
+        // The fist's centre, in world.
+        //
+        // NOT the piece's translation column, which is the tempting one-liner
+        // and is WRONG: xform = M * T(pre), so its translation is M applied to
+        // `pre` — the world position of the brush-space ORIGIN, which is most
+        // of a metre from the palm. Using it put every punch's wound low on the
+        // target's body while the fist visibly struck high, and the ledger
+        // cannot tell you that (it only ever reports a volume).
+        //
+        // The palm's own brush-space coordinate is palm + ofs, and running THAT
+        // through the piece gives the fist where it is actually drawn.
+        float cur[2][3];
+        for (int side = 0; side < 2; side++) {
+            const int b =
+                std::min(std::max(att.handPose[side], 0), (int)kHandBrushCount - 1);
+            const float palmBrush[3] = {brush_.palm[b][0] + brush_.ofs[b][0],
+                                        brush_.palm[b][1] + brush_.ofs[b][1],
+                                        brush_.palm[b][2] + brush_.ofs[b][2]};
+            matTransformPoint(att.pieces[1 + side].xform, palmBrush, cur[side]);
+        }
+        if (!att.haveHandPrev) {
+            std::memcpy(att.handPrev, cur, sizeof(cur));
+            att.haveHandPrev = true;
+            continue;
+        }
+
+        for (int side = 0; side < 2; side++) {
+            float pv[3];
+            std::memcpy(pv, att.handPrev[side], sizeof(pv));
+            std::memcpy(att.handPrev[side], cur[side], sizeof(pv));
+            // Only a CLOSED fist punches. An open idle hand brushing past a
+            // body is not a strike, and the pose is already latched on the
+            // 12 Hz grid so this cannot flicker within a pose step.
+            if (att.handPose[side] != kHandFist) continue;
+
+            float sweep = 0.f;
+            for (int k = 0; k < 3; k++) {
+                const float d = cur[side][k] - pv[k];
+                sweep += d * d;
+            }
+            sweep = std::sqrt(sweep);
+            // CLAYFRAY_DEBUG_PUNCH=1: the twin of CLAYFRAY_DEBUG_BLADE. A punch
+            // that visibly connects but carves nothing has four possible
+            // culprits — wrong brush, too slow, missed the capsules, or the
+            // rest-space edit fell outside the volume — and they are
+            // indistinguishable from the ledger, which just reads 0.0 ml.
+            const bool dbg = std::getenv("CLAYFRAY_DEBUG_PUNCH") != nullptr;
+            if (dbg) {
+                std::printf("[punch] p%d side %d sweep=%.4f fist=(%.2f %.2f %.2f)\n",
+                            atk, side, sweep, cur[side][0], cur[side][1],
+                            cur[side][2]);
+                std::fflush(stdout);
+            }
+            if (sweep < minSweep) continue;
+            // A TELEPORT is not a punch. `set p1.pos`, a snapshot load, or a
+            // pose index re-latch can move a mitt further in one frame than any
+            // strike ever does, and carving that path would mow a trench across
+            // the arena. 0.35 m in a frame is ~21 m/s — well past a jab and
+            // well short of anything the rig produces.
+            if (sweep > 0.35f) continue;
+
+            for (int ti = 0; ti < kMaxPlayers; ti++) {
+                if (ti == atk) continue; // a fighter cannot punch itself
+                Fighter& tgt = fighters_[ti];
+                if (ti > 0 && !tgt.enabled) continue;
+                if (tgt.dead) continue; // nothing left to hit
+                if (tgt.pieces.empty()) continue;
+
+                // the span of this frame's fist path that lies inside the target
+                float tIn = 2.f, tOut = -1.f, nrm[3] = {0, 1, 0};
+                int hitPiece = -1;
+                bool haveNrm = false;
+                // M-PHYS: deepest penetration of the fist past the surface,
+                // over the whole swept path. NOT the swept span (tOut - tIn) —
+                // that is how far the fist TRAVELLED while inside, which for a
+                // fist pressing slowly into a body is near zero exactly when
+                // the resistance should be highest.
+                float maxPen = 0.f;
+                const int kSamples = 16;
+                for (int i = 0; i <= kSamples; i++) {
+                    const float t = (float)i / (float)kSamples;
+                    float p[3];
+                    for (int k = 0; k < 3; k++) p[k] = pv[k] + (cur[side][k] - pv[k]) * t;
+                    for (const BoneCapsule& c : capsules_) {
+                        float a2[3], b2[3], cr;
+                        posedCapsule(tgt, c, a2, b2, cr);
+                        float ab[3] = {b2[0] - a2[0], b2[1] - a2[1], b2[2] - a2[2]};
+                        float ap[3] = {p[0] - a2[0], p[1] - a2[1], p[2] - a2[2]};
+                        const float len2 =
+                            ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                        float u = len2 > 1e-9f
+                                      ? (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) /
+                                            len2
+                                      : 0.f;
+                        u = std::min(std::max(u, 0.f), 1.f);
+                        float q[3] = {a2[0] + ab[0] * u, a2[1] + ab[1] * u,
+                                      a2[2] + ab[2] * u};
+                        float d[3] = {p[0] - q[0], p[1] - q[1], p[2] - q[2]};
+                        const float dist =
+                            std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                        // inflate by the fist: two solids, not a point
+                        if (dist >= cr + fistR) continue;
+                        maxPen = std::max(maxPen, (cr + fistR) - dist);
+                        tIn = std::min(tIn, t);
+                        tOut = std::max(tOut, t);
+                        if (hitPiece < 0) hitPiece = c.bone;
+                        if (!haveNrm) {
+                            const float inv = dist > 1e-6f ? 1.f / dist : 0.f;
+                            for (int k = 0; k < 3; k++) nrm[k] = d[k] * inv;
+                            haveNrm = true;
+                        }
+                        break;
+                    }
+                }
+                if (tOut < tIn) continue; // missed
+
+                // M-PHYS. Reported BEFORE the bounds test below, and that is
+                // deliberate: the fist is physically inside the target whether
+                // or not the carve was accepted, and an edit dropped at the
+                // volume boundary (trap 5) must not also silently drop the
+                // knockback. Contact is about the capsules; the edit is about
+                // the volume.
+                {
+                    const float inv = sweep > 1e-6f ? 1.f / sweep : 0.f;
+                    const float d[3] = {(cur[side][0] - pv[0]) * inv,
+                                        (cur[side][1] - pv[1]) * inv,
+                                        (cur[side][2] - pv[2]) * inv};
+                    reportContact(atk, ti, side, maxPen, d, sweep * 60.f);
+                }
+
+                BrickEdit e;
+                e.mode = 1; // carve
+                e.radius = fistR;
+                e.segment = true;
+                float wA[3], wB[3];
+                for (int k = 0; k < 3; k++) {
+                    const float d = cur[side][k] - pv[k];
+                    wA[k] = pv[k] + d * tIn;
+                    wB[k] = pv[k] + d * tOut;
+                }
+                // world -> the TARGET'S REST volume (trap 6), through the piece
+                // the fist actually met
+                float invPiece[16];
+                matIdentity(invPiece);
+                if (hitPiece >= 0 && (size_t)hitPiece < tgt.pieces.size()) {
+                    matInvAffine(tgt.pieces[hitPiece].xform, invPiece);
+                }
+                matTransformPoint(invPiece, wA, e.pos);
+                matTransformPoint(invPiece, wB, e.posB);
+                for (int k = 0; k < 3; k++) e.worldPos[k] = (wA[k] + wB[k]) * 0.5f;
+                std::memcpy(e.outDir, nrm, sizeof(e.outDir));
+                e.player = tgt.vol.slot();
+                e.fromWeapon = true; // one chunk, not a dribble
+
+                if (!tgt.vol.editInBounds(e)) continue;
+                tgt.vol.queueEdit(e);
+                // the chunk leaves from where the fist was DEEPEST, along the
+                // punch — clay knocked off the far side of the impact
+                std::memcpy(sliceExit_, wB, sizeof(sliceExit_));
+                std::memcpy(sliceNrm_, nrm, sizeof(sliceNrm_));
+                std::memcpy(sliceCol_, e.srcColor, sizeof(sliceCol_));
+                const float inv = sweep > 1e-6f ? 1.f / sweep : 0.f;
+                for (int k = 0; k < 3; k++) {
+                    sliceSweep_[k] = (cur[side][k] - pv[k]) * inv;
+                }
+                sliceOpen_ = true;
+                sliceCutStep_ = true;
+                slicePending_++;
+                sliceWait_ = 0;
+            }
+        }
     }
 }
 
@@ -1750,23 +2190,6 @@ void Renderer::updateBladeCut(const LookParams& look) {
     // ever player 1. Each target drains its own kOpsPerFrame substep budget
     // (separate BrickSystems), so they do not compete for edit slots.
     auto cut = [&](Fighter& tgt) {
-    // Blade tests happen in WORLD space, so the target's rest capsules have to
-    // be posed first. Under the brush rig `bone` is a PIECE index into THAT
-    // FIGHTER'S piece table — falling through to identity would leave its
-    // hitboxes at the origin while the body stands elsewhere, and the sword
-    // would cut empty air.
-    auto toWorld = [&](const BoneCapsule& c, const float* r, float* w) {
-        if (brushRig) {
-            if (c.bone >= 0 && (size_t)c.bone < tgt.pieces.size()) {
-                matTransformPoint(tgt.pieces[c.bone].xform, r, w);
-                return;
-            }
-        } else if (c.bone >= 0 && (size_t)(c.bone * 16 + 16) <= tgt.skinMats.size()) {
-            matTransformPoint(&tgt.skinMats[c.bone * 16], r, w);
-            return;
-        }
-        w[0] = r[0]; w[1] = r[1]; w[2] = r[2];
-    };
     // Sweep in TIME as well as along the blade, and emit ONE CAPSULE PER
     // SUBSTEP rather than collapsing the whole sweep into a single capsule.
     // Testing only the current hilt->tip segment samples an instant: at swing
@@ -1796,9 +2219,8 @@ void Renderer::updateBladeCut(const LookParams& look) {
             float p[3] = {h0[0] + (t0s[0] - h0[0]) * t, h0[1] + (t0s[1] - h0[1]) * t,
                           h0[2] + (t0s[2] - h0[2]) * t};
             for (const BoneCapsule& c : capsules_) {
-                float a2[3], b2[3];
-                toWorld(c, c.a, a2);
-                toWorld(c, c.b, b2);
+                float a2[3], b2[3], cr;
+                posedCapsule(tgt, c, a2, b2, cr);
                 float ab[3] = {b2[0] - a2[0], b2[1] - a2[1], b2[2] - a2[2]};
                 float ap[3] = {p[0] - a2[0], p[1] - a2[1], p[2] - a2[2]};
                 float len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
@@ -1809,7 +2231,7 @@ void Renderer::updateBladeCut(const LookParams& look) {
                 float q[3] = {a2[0] + ab[0] * u, a2[1] + ab[1] * u, a2[2] + ab[2] * u};
                 float d[3] = {p[0] - q[0], p[1] - q[1], p[2] - q[2]};
                 float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-                if (dist >= c.r) continue;
+                if (dist >= cr) continue;
                 tIn = std::min(tIn, t);
                 tOut = std::max(tOut, t);
                 if (hitBone < 0) hitBone = c.bone;
@@ -1832,6 +2254,17 @@ void Renderer::updateBladeCut(const LookParams& look) {
         float dirW[3] = {t0s[0] - h0[0], t0s[1] - h0[1], t0s[2] - h0[2]};
         float bladeLen =
             std::sqrt(dirW[0] * dirW[0] + dirW[1] * dirW[1] + dirW[2] * dirW[2]);
+        // M-PHYS: metres of BLADE inside this target. Reported before the
+        // bounds test below, for the same reason the fist's is — the blade is
+        // in the body whether or not the carve landed. reportContact keeps the
+        // deepest of the frame, so the substep loop shoves once, not six times.
+        {
+            const float inv = sweep > 1e-6f ? 1.f / sweep : 0.f;
+            const float sweepDir[3] = {(tip[0] - pT[0]) * inv, (tip[1] - pT[1]) * inv,
+                                       (tip[2] - pT[2]) * inv};
+            reportContact(0, tgt.vol.slot(), -1, (tOut - tIn) * bladeLen, sweepDir,
+                          sweep * 60.f);
+        }
         // push past entry and exit so the cut breaks the surface both sides
         float over = bladeLen > 1e-6f ? (e.radius * 0.9f) / bladeLen : 0.f;
         float t0 = std::max(0.f, tIn - over), t1 = std::min(1.f, tOut + over);
@@ -1856,7 +2289,7 @@ void Renderer::updateBladeCut(const LookParams& look) {
         for (int k = 0; k < 3; k++) e.worldPos[k] = (wA[k] + wB[k]) * 0.5f;
         std::memcpy(e.outDir, nrm, sizeof(e.outDir)); // gobs spray off the cut
         e.player = tgt.vol.slot(); // whose clay this is, for the ledger/snapshot
-        e.fromBlade = true; // pool this into the slice gob, don't dribble it
+        e.fromWeapon = true; // pool this into the slice gob, don't dribble it
         // editInBounds is what queueEdit re-checks, so testing it here keeps
         // slicePending_ counting exactly the edits that will be measured — an
         // edit silently dropped at the volume boundary (trap 5) must not leave
@@ -1884,7 +2317,7 @@ void Renderer::updateBladeCut(const LookParams& look) {
 
     for (int ti = 1; ti < kMaxPlayers; ti++) {
         Fighter& tgt = fighters_[ti];
-        if (!tgt.enabled) continue;
+        if (!tgt.enabled || tgt.dead) continue; // nothing left to cut
         // Bail only when there is NO posing data at all. This guard used to
         // read `skinMats.empty()` alone, which is ALWAYS true once the
         // armature is gone — so the sword silently stopped cutting while UI
@@ -1893,6 +2326,243 @@ void Renderer::updateBladeCut(const LookParams& look) {
         if (brushRig ? tgt.pieces.empty() : tgt.skinMats.empty()) continue;
         cut(tgt);
     }
+}
+
+// ---- M-DEATH ----
+//
+// A body that has lost `threshold` of its clay stops holding together: what is
+// left of it is handed to the ledger as debt, the eyes come off, and the slot
+// goes quiet until it respawns.
+//
+// The collapse deliberately spawns NO gobs itself. Adding the remaining mass to
+// carved+debt in the same breath leaves `carved == deposited + inFlight + debt`
+// true at that instant, and the dribble spawner in updateConservation then
+// drains the debt over the next few pose steps — up to twelve blobs at a time,
+// which is exactly the "it comes apart" read we want, out of code that already
+// exists and is already conservation-correct. A bespoke burst would have been a
+// second way to create gobs and a second way to leak clay.
+void Renderer::collapseFighter(int i, const LookParams& look) {
+    Fighter& f = fighters_[i];
+    if (f.dead) return;
+    f.dead = true;
+    f.respawnT = std::max(look.death.respawn, 0.f);
+
+    // What is still standing, handed to the ledger. Clamped at zero because the
+    // mesh volume and the voxel occupancy agree closely but not exactly, and a
+    // negative remainder would MINT clay.
+    const float remaining = std::max(0.f, fighterVolume_ - f.carved);
+    if (look.conserveClay && remaining > 0.f) {
+        // It has left the body: on the ledger as carved, and owed. Everything
+        // below only MOVES that debt into gobs and splats, so the invariant
+        // holds at every line rather than only at the end.
+        sploot_.carved += remaining;
+        sploot_.debt += remaining;
+
+        const float* col = haveWound_ ? woundCol_ : sliceCol_;
+        const float cx = f.disp.pos[0], cz = f.disp.pos[2];
+
+        // 1. the burst: a few chunky gobs thrown clear
+        const int want = std::max(0, look.death.burstGobs);
+        const int room = std::max(0, 12 - (int)gobs_.size());
+        const int ng = std::min(want, room);
+        float thrown = 0.f;
+        if (ng > 0 && look.death.burstFrac > 0.f) {
+            const float each = remaining * std::min(look.death.burstFrac, 1.f) / (float)ng;
+            for (int k = 0; k < ng && sploot_.debt >= each; k++) {
+                Gob g{};
+                g.vol = each;
+                g.radius = std::cbrt(each * 3.f / (4.f * 3.14159265f));
+                // Golden-angle fan, no RNG: this runs inside the sim, and the
+                // gob dribble's seeded stream must stay bit-identical for
+                // scenes where nothing dies.
+                const float a = 2.39996323f * (float)k;
+                g.pos[0] = cx + std::cos(a) * 0.10f;
+                g.pos[1] = f.disp.pos[1] + 0.30f;
+                g.pos[2] = cz + std::sin(a) * 0.10f;
+                g.vel[0] = std::cos(a) * look.death.burstSpeed;
+                g.vel[1] = look.death.burstLift;
+                g.vel[2] = std::sin(a) * look.death.burstSpeed;
+                std::memcpy(g.col, col, sizeof(g.col));
+                std::memcpy(g.disp, g.pos, sizeof(g.disp));
+                g.grace = 0.3f;
+                gobs_.push_back(g);
+                sploot_.debt -= each;
+                thrown += each;
+            }
+        }
+
+        // 2. the heap: the rest deposited straight onto the ground where it
+        // stood, spread over enough splats that none of them stacks a spike.
+        float pool = std::min(remaining - thrown, sploot_.debt);
+        if (pool > 0.f) {
+            const float per = std::max(look.death.splatMax, 1e-4f);
+            const int ns = std::min(std::max((int)std::ceil(pool / per), 1), 32);
+            const float v = pool / (float)ns;
+            for (int k = 0; k < ns; k++) {
+                // sunflower spiral: even area coverage, deterministic, and no
+                // two points share a radius so the heap has no visible rings
+                const float a = 2.39996323f * (float)k;
+                const float rr = look.death.splatSpread *
+                                 std::sqrt(((float)k + 0.5f) / (float)ns);
+                ground_.splat(cx + std::cos(a) * rr, cz + std::sin(a) * rr, v, col);
+                sploot_.deposited += v;
+                sploot_.debt -= v;
+            }
+        }
+        // Whatever is still owed (the gob array was full, or conserveClay
+        // raced) stays as debt and the dribble drains it. Slow, never lost.
+    }
+
+    // The eyes outlive the body. Their world positions come from the body
+    // piece, which is still holding this frame's transform — after this the
+    // fighter stops being packed at all, so it has to happen here.
+    for (const MarbleProp& m : marbles_) {
+        if ((int)loose_.size() >= kMaxMarbles) break;
+        LooseMarble lm;
+        float p[3] = {m.pos[0], m.pos[1], m.pos[2]};
+        if (!f.pieces.empty()) matTransformPoint(f.pieces[0].xform, m.pos, p);
+        std::memcpy(lm.pos, p, sizeof(lm.pos));
+        std::memcpy(lm.disp, p, sizeof(lm.disp));
+        lm.radius = m.radius;
+        std::memcpy(lm.col, m.color, sizeof(lm.col));
+        // Kick outward from the body's axis so the pair scatters instead of
+        // dropping straight down in a neat little stack. Direction comes from
+        // the bead's own offset — no RNG, because this runs inside the sim.
+        float d[3] = {p[0] - f.disp.pos[0], 0.f, p[2] - f.disp.pos[2]};
+        float dl = std::sqrt(d[0] * d[0] + d[2] * d[2]);
+        if (dl < 1e-3f) {
+            d[0] = 1.f;
+            d[2] = 0.f;
+            dl = 1.f;
+        }
+        lm.vel[0] = d[0] / dl * look.death.eyeSpeed;
+        lm.vel[1] = look.death.eyeLift;
+        lm.vel[2] = d[2] / dl * look.death.eyeSpeed;
+        loose_.push_back(lm);
+    }
+
+    std::printf("[death] player %d collapsed (%.0f of %.0f ml carved), %.0f ml "
+                "sploots, respawn in %.1fs\n",
+                i, f.carved * 1e6f, fighterVolume_ * 1e6f, remaining * 1e6f,
+                f.respawnT);
+}
+
+void Renderer::respawnFighter(int i, const LookParams& look) {
+    Fighter& f = fighters_[i];
+    // A full re-import rebuilds the volume from the mesh — encodeImport clears
+    // the indirection grid and the allocator first, so a body minced to lace
+    // comes back whole rather than accumulating the old holes.
+    f.vol.requestBake();
+    f.carved = 0.f;
+    f.dead = false;
+    f.respawnT = 0.f;
+
+    // Come back at a distance. An opponent reappears on the far side of the
+    // arena from the hero — respawning inside arm's reach is a free hit for
+    // whoever just killed it — and the hero, having no one to be far from,
+    // comes back at the middle.
+    const float r = std::max(look.death.spawnRadius, 0.f);
+    if (i == 0) {
+        f.pose.pos[0] = 0.f;
+        f.pose.pos[2] = 0.f;
+    } else {
+        const float hx = fighters_[0].pose.pos[0], hz = fighters_[0].pose.pos[2];
+        const float hl = std::sqrt(hx * hx + hz * hz);
+        // Directly opposite the hero as seen from the centre; if the hero IS
+        // at the centre there is no "opposite", so take a fixed bearing.
+        const float ux = hl > 1e-3f ? -hx / hl : 1.f;
+        const float uz = hl > 1e-3f ? -hz / hl : 0.f;
+        f.pose.pos[0] = ux * r;
+        f.pose.pos[2] = uz * r;
+        f.pose.yaw = std::atan2(hx - f.pose.pos[0], hz - f.pose.pos[2]);
+    }
+    f.pose.pos[1] = 0.f;
+    f.pose.lean = 0.f;
+    f.pose.moving = false;
+    f.pose.guard = false;
+    f.pose.punch = 0.f;
+    f.disp = f.pose;
+    f.spring = BodySpring{};
+    // The mitts are somewhere else entirely now; a stale "where the fist was"
+    // would read that teleport as a strike (updatePunchCut's own guard would
+    // catch it, but relying on a magnitude threshold for a known discontinuity
+    // is how the blade got its teleport bug in the first place).
+    f.haveHandPrev = false;
+    haveBlade_ = false;
+    respawned_[i] = true;
+    std::printf("[death] player %d respawned at (%.2f, %.2f)\n", i, f.pose.pos[0],
+                f.pose.pos[2]);
+}
+
+void Renderer::updateDeaths(const LookParams& look, const FrameInfo& frame, float dt) {
+    (void)frame;
+    if (!look.death.enabled || fighterVolume_ <= 0.f) return;
+    const float thresh = std::min(std::max(look.death.threshold, 0.05f), 1.f);
+    for (int i = 0; i < kMaxPlayers; i++) {
+        Fighter& f = fighters_[i];
+        if (!playerEnabled(i)) continue;
+        if (f.dead) {
+            f.respawnT -= dt;
+            if (f.respawnT <= 0.f) respawnFighter(i, look);
+            continue;
+        }
+        if (f.carved >= fighterVolume_ * thresh) collapseFighter(i, look);
+    }
+}
+
+// Loose eyes: the only rigid bodies in the game, and they exist for about two
+// seconds after a fighter comes apart.
+//
+// Ballistic, then rolling. The floor is taken as the flat arena plane rather
+// than the pebble field — a bead is 2 cm across and the pebbles are a 4 cm
+// mosaic, so bouncing off the real height field would make them jitter on
+// contact for a visual difference nobody can see at this size.
+void Renderer::updateLooseMarbles(const LookParams& look, const FrameInfo& frame,
+                                  float dt, bool poseStep) {
+    if (loose_.empty()) return;
+    const float kGravity = 9.81f;
+    const float kFloor = 0.f;
+    for (size_t i = 0; i < loose_.size();) {
+        LooseMarble& m = loose_[i];
+        m.vel[1] -= kGravity * dt;
+        for (int k = 0; k < 3; k++) m.pos[k] += m.vel[k] * dt;
+        const float rest = kFloor + m.radius;
+        if (m.pos[1] <= rest) {
+            m.pos[1] = rest;
+            if (m.vel[1] < 0.f) m.vel[1] = -m.vel[1] * look.death.eyeBounce;
+            if (m.vel[1] < 0.35f) m.vel[1] = 0.f; // stop micro-bouncing
+            // rolling friction, applied to the horizontal only
+            float hs = std::sqrt(m.vel[0] * m.vel[0] + m.vel[2] * m.vel[2]);
+            const float drop = look.death.eyeRoll * dt;
+            if (hs <= drop) {
+                m.vel[0] = 0.f;
+                m.vel[2] = 0.f;
+                hs = 0.f;
+            } else if (hs > 1e-5f) {
+                const float s = (hs - drop) / hs;
+                m.vel[0] *= s;
+                m.vel[2] *= s;
+                hs -= drop;
+            }
+            // Settled and still: retire it. Eyes are litter, and litter that
+            // never expires is a slow leak of uniform slots that the NEXT
+            // collapse needs.
+            if (hs < 0.02f && m.vel[1] == 0.f) {
+                m.rest += dt;
+                if (m.rest > 6.f) {
+                    loose_.erase(loose_.begin() + (long)i);
+                    continue;
+                }
+            } else {
+                m.rest = 0.f;
+            }
+        }
+        // trap 4: it MOVES, so what is drawn steps on the 12 Hz pose grid even
+        // though it simulates at frame rate — same rule the gobs obey.
+        if (poseStep) std::memcpy(m.disp, m.pos, sizeof(m.disp));
+        i++;
+    }
+    (void)frame;
 }
 
 void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame) {
@@ -1914,6 +2584,14 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
     lastSimTime_ = frame.time;
     bool poseStep = frame.poseTime != lastPoseTime_;
     lastPoseTime_ = frame.poseTime;
+
+    // M-DEATH, and it must run HERE — after absorbMeasured, before the dribble.
+    // A collapse works by handing the remaining mass to `debt`, so it has to
+    // see this frame's measurements (or it kills on stale damage) and the
+    // dribble below has to see the debt it just added (or the body vanishes a
+    // frame before anything falls out of it).
+    updateDeaths(look, frame, dt);
+    updateLooseMarbles(look, frame, dt, poseStep);
 
     // spawn gobs while the ledger owes clay: 2..35 ml each (r ~ 8..20 mm)
     const float kMinGob = 2.0e-6f, kMaxGob = 3.5e-5f;
@@ -2223,11 +2901,20 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         const bool holding = swordWorld_.enabled && look.hands.ik;
         if (frame.poseTime != handPoseTime_) {
             handPoseTime_ = frame.poseTime;
-            // Only player 0 carries the sword, so only player 0 grips. The
-            // others keep rest hands until a second weapon exists.
-            fighters_[0].handPose[0] = fighters_[0].handPose[1] = holding ? 1 : 0;
-            for (int i = 1; i < kMaxPlayers; i++)
-                fighters_[i].handPose[0] = fighters_[i].handPose[1] = 0;
+            for (int i = 0; i < kMaxPlayers; i++) {
+                Fighter& f = fighters_[i];
+                // Only player 0 carries the sword, so only player 0 grips.
+                // Everyone else — and the hero with the sword put down —
+                // chooses between the loose idle hand and a closed fist by
+                // whether they are squaring up to someone.
+                int pose = kHandIdle;
+                if (i == 0 && holding) {
+                    pose = kHandGrab;
+                } else if (f.disp.guard || f.disp.punch > 0.f) {
+                    pose = kHandFist;
+                }
+                f.handPose[0] = f.handPose[1] = pose;
+            }
         }
         for (int i = 0; i < kMaxPlayers; i++) {
             Fighter& f = fighters_[i];
@@ -2235,7 +2922,8 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             const SwordParams* grip =
                 (i == 0 && swordWorld_.enabled && look.hands.ik) ? &swordWorld_
                                                                  : nullptr;
-            updateBrushRig(f.pieces, f.handPose, f.disp, f.spring, look, grip);
+            updateBrushRig(f.pieces, f.handPose, f.disp, f.spring, look, grip,
+                           frame.poseTime);
         }
     }
 
@@ -2406,9 +3094,18 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
         }
     }
 
-    // the blade cuts its targets before conservation, so a fresh wound is on
-    // the ledger the same frame it is made
+    // Weapons cut their targets before conservation, so a fresh wound is on
+    // the ledger the same frame it is made. Both read the piece transforms
+    // updateBrushRig wrote above, so they must sit after it and before the
+    // pack — a fist tested against last frame's pieces would land its wound a
+    // pose step behind the mitt that made it.
+    // M-PHYS: contacts are a per-FRAME report with no history, so clear before
+    // the weapons run rather than after the sim reads them. A stale contact
+    // surviving one frame is a shove that keeps pushing after the fist has
+    // withdrawn, which reads as the target being magnetically repelled.
+    contacts_.clear();
     updateBladeCut(look);
+    updatePunchCut(look);
 
     // conservation runs before packing so this frame's uniforms carry fresh
     // gob positions and the ground bound
@@ -2823,6 +3520,10 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
     // but the LATCH CLOCK does have to be invalidated or a restored scene can
     // hold a stale grip until the pose time happens to move.
     handPoseTime_ = -1.f;
+    // Same story for the punch tracker: a restore relocates every mitt, and a
+    // stale "where the fist was last frame" would read that jump as a strike.
+    for (Fighter& f : fighters_) f.haveHandPrev = false;
+    haveBlade_ = false;
     if (simT) *simT = rc.simT;
     std::printf("[snap] loaded %s (t=%.2fs, %zu gob(s))\n", path.c_str(), rc.simT,
                 gobs_.size());

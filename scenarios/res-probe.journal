@@ -4,6 +4,11 @@
 # surface (z=0.20) so every one bites, unlike carve-duel's subsurface grazes.
 # Replay: ./build/clayfray --replay scenarios/res-probe.journal
 #   --screenshot out.png --frames 240 --size 960x540 --aa 2 --cam 0.30,0.10,1.4
+# M-FIST: the opponent AI is ON by default and would wander into this
+# measurement — a body that moves differently each run is exactly what a
+# benchmark/reference scenario must not have. It is deterministic, so this
+# is not about repeatability; it is about isolating what the run measures.
+0 set ai.enabled 0
 2 set sword.enabled 0
 2 set look.keyIntensity 16
 6 edit carve -0.13 0.45 0.20 0.07 0.72 0.45 0.4 0 0 1 0.15 0.4 0.45

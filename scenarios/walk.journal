@@ -1,6 +1,11 @@
 # clayfray scenario: the fighter WALKS. Measures the cost of MOTION,
 # which is what governs frame rate — the idle scene reuses ~75% of frames.
 # Root is set once per pose tick, i.e. quantized to the 12 Hz grid.
+# M-FIST: the opponent AI is ON by default and would wander into this
+# measurement — a body that moves differently each run is exactly what a
+# benchmark/reference scenario must not have. It is deterministic, so this
+# is not about repeatability; it is about isolating what the run measures.
+0 set ai.enabled 0
 0 set fighter.moving 1
 0 set fighter.pos -0.5500 0 0.2000
 0 set fighter.yaw 0.0000

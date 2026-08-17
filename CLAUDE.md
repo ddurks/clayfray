@@ -182,11 +182,14 @@ grip.
   sigma_min, and trusting the column norm makes the march step through the
   skin. For the two hands it is exactly 1 — a mirror has det -1 but
   `M^T M = I`, so it is distance-preserving and needs no special case.
-- **The grip is a discrete brush swap.** Holding the sword selects the grab
-  brush, releasing selects the rest brush, latched on the 12 Hz pose grid and
-  NEVER interpolated: blending two brushes would reintroduce exactly the
-  per-sample blending this rig deletes, and a snap on a pose step is the
-  stop-motion idiom.
+- **The grip is a discrete brush swap.** There are FOUR hand poses — `rest`
+  (as authored), `grab`, `idle`, `fist` — each its own brush in its own region
+  of the volume, selected whole and latched on the 12 Hz pose grid, NEVER
+  interpolated: blending two brushes would reintroduce exactly the per-sample
+  blending this rig deletes, and a snap on a pose step is the stop-motion
+  idiom. Selection is one predicate in `Renderer::render`: sword in hand →
+  `grab`, squaring up → `fist`, otherwise → `idle`. `rest` is now only the
+  canonical frame and the fallback for an asset shipping fewer shape keys.
 - **Not carried over from the bone rig**: eye gaze as a bone rotation (the
   eye bones are gone — the eyes are beads riding the body affine, and gaze
   spins each pupil about its own eyeball) and per-digit finger curl
@@ -196,6 +199,236 @@ grip.
   spins the whole mitt about the blade. A wound carved into a hand belongs to
   the POSE it was made in, since the two hand poses are separate volume
   regions.
+
+## Fists, idle hands, and the opponent AI (M-FIST)
+
+Three things landed together because they are one feature: the mitts got
+somewhere to be when they are not holding the sword, and something to do there.
+
+**Hands are PLACED now, not left where the artist modelled them.** The old
+no-sword path was `xform = A * Mirror` with the brush's authored offset intact,
+i.e. "the mitt rides the body wherever it happens to sit". That was fine while
+"unarmed" meant "the sword is switched off"; it is not a pose. Both branches of
+`updateBrushRig` now centre the PALM and differ only in where they put it —
+`unarmedHand()` returns a character-space palm position plus a rotation, the
+mirror sits between it and the body affine, so the right mitt is the exact
+reflection (position, droop and knuckle roll flip together). Everything about
+that placement is a judgement call you make by looking, so it lives in ctl:
+
+```sh
+tools/ctl.sh "set handpose.idlePos 0.28 0.29 0.04" "set handpose.fistYaw -0.95"
+```
+
+Two numbers to know before dialling them: **the body is x ±0.21, z ±0.21,
+y 0..0.69, and the palm is the mitt's CENTRE**, so a placement much inside those
+bounds buries the hand in the torso. A little overlap is wanted — it is what
+makes a detached blob read as attached rather than as floating nearby.
+
+**The bob is the sword's bob, moved.** It used to exist only in
+`GameState::swordOffset`, riding the hilt, so putting the sword down killed the
+only motion the hands had. `HandPoseParams` now carries the same expression
+(lift on `sin(rate)`, roll on `sin(rate/2)`, same constants, same 12 Hz clock)
+and applies it to any unarmed mitt. Both mitts bob IN PHASE, because the sword
+bobs one hilt and two hands ride it — a phase offset would make putting the
+sword down change how the fighter idles.
+
+**A punch is the sword slice one weapon down**, and `updatePunchCut` is
+deliberately `updateBladeCut`'s shape. The differences are all consequences of
+a fist being a ball rather than a blade: the swept volume of a ball IS a
+capsule, so one edit covers the frame's whole motion and there is no substep
+loop; the hit test inflates the target's capsules by the fist radius, because
+what has to overlap is two solids; and there is no reach test, because the rig
+already applied one. Both weapons set `BrickEdit::fromWeapon` (was `fromBlade`
+— the pooling was never blade-specific, only the caller was), so a punch ejects
+ONE chunk on the same ledger path a slice does.
+
+**THE FIST'S WORLD POSITION IS NOT THE PIECE'S TRANSLATION COLUMN.** That is
+the tempting one-liner and it is wrong: `xform = M * T(pre)`, so its
+translation is `M` applied to `pre` — the world position of the brush-space
+ORIGIN, which is most of a metre from the palm. It shipped once and the symptom
+was punches landing visibly high on the target while the dents appeared low on
+its body, with a ledger that cheerfully reported the volume. Run `palm + ofs`
+through the piece instead. `CLAYFRAY_DEBUG_PUNCH=1` prints the fist position
+and sweep per frame, which is the only way to tell that failure from the three
+others that also read as 0.0 ml (wrong brush, too slow, edit out of bounds).
+
+**The reach ball is real now.** `HandParams::reach` claimed the mitts were held
+to an armless body by a max distance and nothing enforced it under the brush
+rig — `autoReach_` was derived from bones and stayed 0. It is now the rest
+distance from the body box's centre to the authored palm (0.566 m on this
+asset, printed in the `rig:` banner), and `unarmedHand` clamps to it. So a
+punch cannot out-reach a sword thrust: same ball, same radius.
+
+**The opponent AI (`AiParams`, `OpponentAi` in main.cpp) runs in EVERY path,
+headless included.** It is deterministic by the house rules — fixed 60 Hz tick,
+seeded RNG, no wall clock — so `--replay` reproduces a brawl exactly, and the
+sword bob is the precedent: a headless render that disagrees with the running
+game is what look-dev and the GIF read from. It wanders, locks on inside
+`lockRange`, closes to `standoff`, jabs inside `strikeRange`, and gives up
+outside `breakRange`.
+
+It is **slower than the hero on purpose**: `chaseSpeed` 0.92 against the hero's
+1.1 m/s, with lower `accel` and `turnRate` too, so the player can always break
+away by running and corners tighter. An opponent matching the hero's top speed
+is glued to their back and there is no way out of a fight. Spawn spots are
+likewise all OUTSIDE `lockRange` — inside it, an opponent was locked on at
+frame zero, walked straight out of the dark and started punching before the
+player touched a key, so nobody ever saw it wander or saw the idle hand pose.
+
+A journal that places opponents by hand must turn it off first, or the AI walks
+them off the marks it set:
+
+```sh
+tools/ctl.sh "set ai.enabled 0" "set p1.pos -0.95 0 0.35" "set p1.guard 1"
+```
+
+`scenarios/walk.journal` and `res-probe.journal` do exactly that — not for
+repeatability (it is deterministic either way) but to isolate what they
+measure. `carve-duel.journal` leaves it ON, so the conservation gate now
+exercises the punch path.
+
+## Physics (M-PHYS) — resistance, knockback, bodies
+
+Three mechanics, one struct (`PhysicsParams`), and no solver. A fighter is a
+point with a velocity on a plane, so everything here is a force, a position
+constraint, or a rate multiplier on a strike's own clock.
+
+**THE INPUT IS THE CAPSULE TEST, NOT THE CARVED VOLUME.** Resistance scales
+with how much weapon is inside a body, and the tempting source is the measured
+carved volume — it is right there in the ledger and it is the physically honest
+quantity. It must not be used. That volume is a GPU readback landing one or two
+frames late, whose arrival frame is pinned only under `--replay`'s
+`syncMeasurements`, and blocking for it is illegal on web (trap 9). Feeding it
+into the sim would make how a swing FEELS depend on GPU scheduling, and make a
+replay disagree with the run that recorded it. The capsule hit test both cut
+paths already run is exact, free, and one frame earlier.
+
+So `Renderer::StrikeContact` is a **pure report**: the renderer resolves where
+weapons are (it owns the piece transforms and the posed capsules) and says how
+deep they are; it does not act on it. Knockback, hitstun and resistance are
+gameplay, and gameplay is the deterministic 60 Hz tick in main.cpp. The report
+is rebuilt every frame and read once, on the next — a one-frame lag by
+construction, invisible at 60 Hz.
+
+- **`bite` means different things per weapon on purpose.** Blade: metres of
+  BLADE buried (a sword half through a body is fighting far more than one that
+  nicked it). Fist: how far the fist is past the surface — *not* the swept span
+  `(tOut - tIn)`, which is how far it travelled while inside and is near zero
+  exactly when resistance should be highest. Each has its own drag coefficient,
+  so they never have to be the same quantity.
+- **Contact is reported per (attacker, target, weapon), deepest wins.** A blade
+  emits up to `kOpsPerFrame` capsule carves as it sweeps, and six separate
+  shoves off one swing would multiply knockback by the substep count.
+- **Reported BEFORE the bounds test**, in both paths. The weapon is physically
+  inside the body whether or not the carve was accepted, and an edit dropped at
+  the volume boundary (trap 5) must not silently drop the knockback too.
+- **Resistance is a rate multiplier on the strike's own clock**
+  (`swingT`/`punchT`), `1 / (1 + drag * bite)` floored at `minRate`. Every beat
+  of the flourish and the whole punch curve read off that clock, so a buried
+  blade visibly labours and then snaps back to speed as it exits — no extra
+  animation, no state. The floor is not just a stall guard: `updateBladeCut`
+  stops cutting below a minimum sweep, so a swing dragged far enough would stop
+  cutting, lose contact, speed up, cut again, and buzz.
+- **Knockback is a FORCE, not an impulse.** Contact persists across frames
+  while a weapon ploughs through, so it integrates over the strike; an impulse
+  per frame would scale the shove with the frame rate.
+- **Knock velocity is SEPARATE from locomotion velocity**, summed only at
+  integration. Folding a shove into `vel` puts it in the path of the
+  accel-toward-desired model that drives walking, and at `kAccel` 7 m/s² a
+  2 m/s knock is cancelled by the victim's own steering in under a third of a
+  second — the hit reads as nothing happening. Kept apart, it decays on its own
+  LINEAR schedule (an exponential one asymptotes and never quite stops, which
+  is how a fighter drifts out of the arena with nothing touching it).
+- **Hitstun** (`stagger`) is the one place the game takes the controls away, so
+  it is deliberately brief. Without it the shove is cancelled by the victim's
+  own accel and there is no hit to feel.
+
+**Bodies do not interpenetrate** — a pairwise xz position constraint, run after
+every fighter has integrated. That ordering is why `stepWorld` exists: bodies
+used to integrate and confine themselves inside their own `tick()`, and there
+was no moment when every fighter had moved but none had been corrected.
+Collision is a *relation*, not a property, and it cannot be written at all
+while each fighter's velocity is private to whatever drives it — which is why
+`GameState::vel` and `OpponentAi::vel` collapsed into one `Body bodies[]`.
+Correction is symmetric (half each); pushing only the "second" body would make
+collision depend on player index and let the hero bulldoze.
+
+## Death and respawn (M-DEATH)
+
+A fighter that has lost `death.threshold` (0.5) of its clay comes apart.
+
+**The threshold is measured against the CARVED LEDGER, not a hit-point pool.**
+Damage is literally the clay that left your body — the same measurements
+`absorbMeasured` bills to the arena ledger, billed per fighter at the same
+time. There is no second health model that could drift out of step, and a
+re-stick *heals*: clay that sticks back on subtracts from the damage, or a
+fighter could be visibly whole and still drop dead.
+
+The denominator is the **mesh volume** of its brushes (body + two mitts),
+computed by the divergence theorem at import and printed per brush in the
+`asset:` banner. Voxel occupancy is the more honest number and is unavailable:
+it needs a blocking readback (`debugStats`, dev-tools only). The two agree
+closely because the voxelizer is a watertight parity fill — measured 85,744 ml
+for the body, matching an independent check on the .glb to the millilitre.
+
+**A fighter is ~91 litres, so 50% is ~46 litres — about twenty connecting
+punches.** That is the spec, and it is a long fight; `death.threshold` is the
+knob if you want it shorter.
+
+**The collapse cannot use the dribble spawner.** It moves at most twelve 35 ml
+gobs per pose step, so 46 litres would leak as a thin stream for FIFTEEN
+SECONDS. Same reasoning as the sword's slice gob one scale up — what comes off
+has to match what was removed. So the mass splits: a burst of chunky gobs that
+fly, and the rest deposited straight into the ground field as a heap where the
+body stood, spread over enough splats that none stacks a spike (`splat()`
+clamps its radius at 0.28 m, past which volume stops widening and starts
+building a tower taller than the fighter was). Anything that will not fit falls
+back to debt and the dribble drains it — slow, never lost.
+
+**Conservation holds across all of it**, and `scenarios/death.journal` is the
+gate: the remaining mass is added to `carved` and `debt` in the same breath and
+every line after only *moves* that debt into gobs and splats. Respawn then
+re-imports a whole body, which does put new clay in the world — the ledger's
+invariant is that CARVED clay is conserved, not that total scene mass is.
+
+**The eyes outlive the body.** On collapse the four beads stop riding the
+corpse and become `loose_` marbles that fall, bounce and roll — the only rigid
+bodies in the game. They take the uniform slots the corpse just gave up (four
+freed, four spawned), so `kMaxMarbles` is unchanged and trap 2's hand-mirrored
+layout never moves. They are deliberately excluded from the gaze pass, which
+pairs a pupil to an eyeball by proximity: a bead on the floor has no eyeball to
+look out of, and leaving it in the search lets a live pupil pick a corpse's eye
+as its partner.
+
+**`dead` is not `enabled`.** `playerEnabled` means "this slot is in play at
+all" and is permanently true for the hero — who has to be able to die.
+`playerAlive` is the predicate gameplay wants. A respawn is a teleport decided
+in the renderer (it owns the ledger that triggers it) but every fighter's
+DRIVER lives in main.cpp, so `takeRespawn()` is a one-shot the sim drains: it
+adopts the new pose (GameState's copy of the hero is authoritative and
+`setFighter` would overwrite the renderer's every frame) and drops the old
+velocity, or the fighter arrives still running the direction it died going.
+
+## There is no wall
+
+The arena used to end at a pebble-mosaic backdrop plane at `z = -2.3`
+(`arenaWall`, gone from scene_common.wgsl). It did what a lit backdrop always
+does: gave the scene a visible edge and caught enough key light to read as a
+surface rather than as depth.
+
+Nothing replaced it. The floor is an infinite plane and the key is a close
+point light with quadratic falloff, so the ground simply runs out of light and
+meets the near-black `background()` with no seam, corner or texture to
+recognise. `MAT_WALL`'s id (2.0) is left unused rather than reclaimed — every
+material test downstream is a `<` against a threshold, so renumbering to close
+the gap would move boundaries the rest of `shade()` is written around.
+
+The only wall left is invisible: `MotionParams::arenaRadius` (2.6 m) clamps
+every fighter's position and kills the outward part of its velocity, so a body
+SLIDES along the boundary instead of grinding into it. It sits where the light
+has already gone, which is what makes it invisible rather than a barrier you
+can watch yourself bump into. `set motion.arenaRadius 0` removes it; the light
+will not follow you out there.
 
 ## The look-dev panel is deliberately small
 
@@ -229,8 +462,19 @@ per-frame blade sweep inside what `BrickSystem::kOpsPerFrame` (6) cut substeps
 can bridge, so a faster swing would need that budget raised.
 `1/2/3` still switch orbit/carve/add.
 
-Headless has no keyboard, so locomotion there is whatever `fighter.pos`,
-`fighter.yaw`, `fighter.lean` and `fighter.moving` are set to via ctl/replay.
+**`SPACE` throws a JAB instead when the sword is away** (`set sword.enabled 0`).
+The same key, because the sword's own state decides which it is — there is no
+separate mode to keep in sync — and the hero's fists come up the moment the
+sword goes down. The punch arc is NOT quantized to the pose grid, and neither
+is the sword's swing (only its idle bob is): a strike is carved as a swept
+capsule between consecutive frames, so a display that jumped 12 times a second
+would cut in stripes.
+
+Headless has no keyboard, so the HERO's locomotion there is whatever
+`fighter.pos`, `fighter.yaw`, `fighter.lean`, `fighter.moving` — and now
+`fighter.guard` / `fighter.punch` — are set to via ctl/replay. Opponents are
+different: the AI drives them in headless too (see M-FIST above), so a journal
+that wants them still has to `set ai.enabled 0`.
 
 ## Agent dev loop (PREFER THIS over rebuild-relaunch cycles)
 
@@ -250,7 +494,11 @@ tools/ctl.sh quit
 ```
 
 Commands: `get NAME|*`, `set NAME V..` (any LookParams/sword/cam/brush field,
-names = struct paths like `sword.pitch`; plus `p1.*`… per opponent),
+names = struct paths like `sword.pitch`; plus `handpose.*` for the unarmed mitt
+placement and its bob, `ai.*` for opponent behaviour, `phys.*` for knockback /
+resistance / body collision, `death.*` for the collapse threshold and how the
+mass leaves, `motion.arenaRadius` for the invisible wall, and `p1.*`… per
+opponent, now including `guard`/`punch`/`punchSide`),
 `edit carve|add x y z r [rgb [dir srcRGB [player]]]`, `bake`, `shot PATH`,
 `stats`, `probe`/`pickuv u v`, `pause`, `resume`, `step [N]`, `timescale F`,
 `snap save|load NAME`, `record PATH|stop`, `break ledger TOL_ML|off`, `quit`.
@@ -362,6 +610,9 @@ Iteration rules of thumb:
   work still gets executed, plus the test. Removing work for EVERY lane is
   what moves the number. Small edits also swing the frame by ~10% in either
   direction via register pressure — measure, never assume.
+- `scenarios/death.journal` is the M-DEATH gate: it drops `death.threshold` to
+  3% (at the shipping 50% a fighter is ~46 litres and it would be a 30-second
+  journal), carves one body past it, and exits 3 if the collapse leaks clay.
 - Scenario regression: `record` a journal (or hand-write one: `<poseTick>
   <ctl command>` per line, see `scenarios/`), then
   `./build/clayfray --replay scenarios/X.journal --screenshot out.png
@@ -464,24 +715,40 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    the cursor — if they differ while the fighter is unposed at the origin,
    something is wrong.
 
-7. **The character is THREE BRUSHES selected by node name — and there is no
+7. **The character is FIVE BRUSHES selected by node name — and there is no
    armature.** The asset has no skins, no animations and no bones: three
    meshes authored in place (`body`, `hand`, `eye`). `CharacterAsset::load`
    keeps them SEPARATE (it used to merge every mesh bound to the armature)
-   and imports the hand TWICE — once as authored, once with its `grab` morph
-   target at full weight, translated by `kGrabBrushOffset` into the empty
-   negative-x half of the rest volume. Three disjoint regions, one volume, no
-   new GPU resources. `eye` is consumed as marble beads via its `marble_*`
-   materials and the right eye/hand are MIRRORED in x at runtime, because the
-   artist authors one side only.
+   and imports the hand FOUR TIMES — once as authored (`rest`), then once per
+   shape key (`grab`, `idle`, `fist`) at full weight, each translated by
+   `kHandBrushOffset[pose]` into a part of the rest volume the body never
+   uses. Five disjoint regions, one volume, no new GPU resources. `eye` is
+   consumed as marble beads via its `marble_*` materials and the right
+   eye/hand are MIRRORED in x at runtime, because the artist authors one side
+   only.
+
+   **Shape keys are matched BY NAME**, not by index — glTF carries them in the
+   mesh's `extras.targetNames`, cgltf parses that, and both `asset.cpp` and
+   `verify_brush_layout.py` key on it. Reordering shape keys in Blender would
+   otherwise silently swap two poses, which renders as a fighter gripping its
+   hilt with an open palm and logs nothing at all. A key the asset does not
+   have is imported as NOTHING and `handPart()` falls back to `rest`, so an
+   older .glb still rigs — it just has fewer distinct grips.
 
    The old failure mode (a fighter made of nothing but hands, with no error)
    is still the one to watch for after a re-export. The `asset: brush '...'`
    lines print each brush's triangle count and AABB, and
    `tools/verify_brush_layout.py` re-derives the whole layout from the .glb
-   and `src/brick.h` — run it if the artist moves anything. A brush that
-   leaves the volume box, or two brushes closer than the narrow band, breaks
-   the AABB clip that separates the pieces and both are reported.
+   and `src/brick.h` — **run it after adding a shape key**, not just after
+   moving something: a new pose lands in a region nothing else validated. A
+   brush that leaves the volume box, or two brushes closer than the narrow
+   band, breaks the AABB clip that separates the pieces and both are reported.
+
+   Adding a brush is not free anywhere else either. It is a whole extra mesh
+   through the voxelizer's triangle binner, so it moves the number trap 10 is
+   about: the two fist/idle brushes took `import:` from 8.0M to 11.0M refs and
+   the web startup transient from ~70 to ~95 MiB, straight past the old
+   `-sINITIAL_MEMORY`. Re-read the `import:` line and re-check CMakeLists.
 
 8. **Core WebGPU guarantees a stage only 8 storage buffers, and `trace` uses
    4.** Two limits stack here, and the SMALLER one is the binding budget:
@@ -598,12 +865,17 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
 
 10. **The voxelizer's triangle binning is the app's biggest CPU allocation,
     by two orders of magnitude — and nothing about the mesh predicts it.**
-    `import: 14848 tris binned (8000190 refs)` at startup: each triangle is
+    `import: 20480 tris binned (10975582 refs)` at startup: each triangle is
     binned into every cell its band-dilated AABB touches, and `kBand` = 12
-    voxels fans 14.8k triangles out to **8 million** cell refs, ~539 each.
-    That is 30.5 MiB for `ids` plus another 31.0 MiB for `merged` (a full
-    copy of it, alive simultaneously), i.e. a **~70 MiB startup transient**
+    voxels fans 20.5k triangles out to **11 million** cell refs, ~536 each.
+    That is 41.9 MiB for `ids` plus another 42.3 MiB for `merged` (a full
+    copy of it, alive simultaneously), i.e. a **~95 MiB startup transient**
     on a scene whose steady state is about 5 MiB.
+
+    **It moves with the BRUSH count, not just with the mesh.** M-FIST's two
+    extra hand shape keys took tris 14,848 → 20,480 (+38%), refs 8.0M → 11.0M,
+    and the transient ~70 → ~95 MiB — straight past the 96 MiB
+    `-sINITIAL_MEMORY` of the day, which is now 128 MiB.
 
     Desktop never noticed. The browser must reserve for it, which is what
     `-sINITIAL_MEMORY` in CMakeLists is sized from — and wasm memory never
@@ -638,6 +910,7 @@ reference renders — diff against them by eye after a lighting/shading change.
 | `CLAYFRAY_NO_REDIST` / `_NO_ANIM` / `_NO_PIECES` | disable redistance / animation / chunk articulation |
 | `CLAYFRAY_AO` / `_DETAIL` / `_SHADOWK` | override look params (float) |
 | `CLAYFRAY_DEBUG_PICK=1` | print world vs REST position under the cursor (trap 6) |
+| `CLAYFRAY_DEBUG_BLADE` / `_DEBUG_PUNCH` | per-frame weapon sweep + position. A strike that visibly connects and carves nothing has four indistinguishable causes from the ledger alone (which just reads 0.0 ml): wrong brush selected, under the cutting speed, missed the target's capsules, or the rest-space edit fell outside the volume |
 | `CLAYFRAY_NO_AFFINE=1` | draw the rest volume UNPOSED (pieces = 0), i.e. all three brushes side by side where they are authored. Answers "is the rig wrong or is the volume wrong?" in one keystroke. It used to select the 13-piece inverse-LBS warp; that path died with the armature, so this is no longer an A/B between two rigs |
 | `CLAYFRAY_DEBUG_REUSE=1` | name the input behind every re-trace that happens BETWEEN pose steps (a re-trace ON a pose step is the 12 Hz floor, so it stays quiet — silence means optimal) — a uniform (by slot NAME, e.g. "gobs (flying clay)") or the volume whose generation moved. Frame reuse is what makes motion affordable, so when the `[reuse] traced N of M` line collapses toward 0% skipped, this says which input refuses to settle |
 | `CLAYFRAY_TEST_ADDSTRESS` / `_TEST_NULLEDITS` | `--carve-test` variants (pool stress / null-edit JFA) |
