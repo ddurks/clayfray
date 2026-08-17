@@ -3,6 +3,10 @@
 #   --screenshot out.png --frames 240 --size 640x360 --aa 1
 # Deterministic: same binary + same journal = byte-identical screenshot,
 # and the conservation gate (exit 3) runs at the end.
+# The opponent is normally passive until something hits it (ai.retaliatory);
+# nothing here throws a punch at it, so it is switched to attack-on-sight —
+# this scenario is what exercises the punch path against the ledger.
+0 set ai.retaliatory 0
 30 edit carve 0.02 0.42 0.12 0.07 0.72 0.45 0.4 0 1 0 0.15 0.4 0.45
 44 edit carve -0.08 0.60 0.08 0.055 0.72 0.45 0.4 0.2 0.8 0.4 0.15 0.4 0.45
 60 set sword.pitch 0.35

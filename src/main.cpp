@@ -183,6 +183,10 @@ float punchExtension(float u) {
 struct OpponentAi {
     uint32_t rng = 0;
     bool locked = false;
+    // Has anything hit us yet? Set from the strike-contact report in
+    // GameState::applyContacts and never cleared — a respawn throws the whole
+    // OpponentAi away, so forgiveness is something you have to kill it for.
+    bool provoked = false;
     float wanderT = 0.f;      // s until a new heading is chosen
     float heading = 0.f;      // where we are wandering, radians
     float cooldown = 0.f;     // s until the next punch is allowed
@@ -202,21 +206,22 @@ struct OpponentAi {
 
     void tick(FighterPose& me, const FighterPose& hero, const AiParams& ai,
               Body& body, const PhysicsParams& phys, float punchDur, float dt) {
-        // ---- lock on, with hysteresis ----
+        // ---- lock on, with hysteresis, once we have a reason to ----
+        //
+        // The reason is `provoked` (AiParams::retaliatory): being near the hero
+        // is not a reason to fight, having been hit by one is. Gating the LOCK
+        // rather than the chase speed is deliberate — an unprovoked opponent is
+        // not "chasing at zero", it is genuinely elsewhere: no guard up, no
+        // standoff, no jab, just wandering.
         const float dx = hero.pos[0] - me.pos[0], dz = hero.pos[2] - me.pos[2];
         const float dist = std::sqrt(dx * dx + dz * dz);
-        if (!locked && dist < ai.lockRange) locked = true;
-        if (locked && dist > ai.breakRange) locked = false;
+        const bool willFight = provoked || !ai.retaliatory;
+        if (!locked && willFight && dist < ai.lockRange) locked = true;
+        if (locked && (!willFight || dist > ai.breakRange)) locked = false;
 
         float want[3] = {0.f, 0.f, 0.f};
         float face = me.yaw;
-        // Hitstun: a staggered opponent stops steering and just takes the ride.
-        // It still TURNS (below) — a body that cannot even face you while being
-        // knocked about reads as switched off rather than as staggered.
-        const bool stunned = body.stagger > 0.f;
-        if (stunned) {
-            // fall through with want = 0 and face unchanged
-        } else if (locked) {
+        if (locked) {
             // close to punching distance and hold there. Walking THROUGH the
             // hero would look like a bug even though the bodies do not collide,
             // and standing off is what gives the jab something to reach for.
@@ -244,6 +249,16 @@ struct OpponentAi {
             want[0] = std::sin(heading) * ai.wanderSpeed;
             want[2] = std::cos(heading) * ai.wanderSpeed;
             face = std::atan2(want[0], want[2]);
+        }
+
+        // Hitstun: a staggered fighter keeps steering, at reduced AUTHORITY —
+        // it stumbles, it does not switch off. It still faces `face` too, at
+        // full turn rate: a body that cannot even look at you while being
+        // knocked about reads as broken rather than as staggered.
+        const bool stunned = body.stagger > 0.f;
+        if (stunned) {
+            want[0] *= phys.staggerControl;
+            want[2] *= phys.staggerControl;
         }
 
         for (int a = 0; a < 3; a += 2) {
@@ -368,15 +383,17 @@ struct GameState {
             want[0] = moveX / dl * kMaxSpeed;
             want[2] = moveZ / dl * kMaxSpeed;
         }
-        // Hitstun: while staggered the player's input is ignored and the
-        // fighter rides out the shove. This is the one place the game takes
-        // the controls away, so it is deliberately brief (PhysicsParams
-        // ::stagger, 0.20 s at full strength) — long enough to feel the hit,
-        // short enough that it never feels like a dropped input.
+        // Hitstun costs the player steering AUTHORITY, never the controls. It
+        // used to zero the input outright and that read as the game freezing:
+        // contact is reported for every frame a weapon ploughs through, so the
+        // timer kept re-arming, and a jab every punchCooldown could pin the hero
+        // in place with nothing to do about it. Scaled instead, WASD still
+        // answers on the frame it is pressed — you simply cannot walk a 2.2 m/s
+        // shove off at 0.45 authority, which is the part that should be true.
         Body& body = bodies[0];
         if (body.stagger > 0.f) {
-            want[0] = 0.f;
-            want[2] = 0.f;
+            want[0] *= phys.staggerControl;
+            want[2] *= phys.staggerControl;
         }
         for (int a = 0; a < 3; a += 2) {
             float d = want[a] - body.vel[a];
@@ -542,6 +559,13 @@ struct GameState {
             const float hit =
                 std::min(1.f, c.bite / std::max(phys.staggerBite, 1e-4f));
             bodies[t].stagger = std::max(bodies[t].stagger, phys.stagger * hit);
+
+            // M-FIST: being hit is what starts a fight (AiParams::retaliatory).
+            // Any strike provokes, whoever threw it — a body does not check who
+            // hurt it before deciding to care. This is the only writer, so an
+            // opponent nobody touches never locks on and the player gets to
+            // choose when the brawl begins.
+            if (t >= 1) foes[t].provoked = true;
 
             // Resistance belongs to the ATTACKER — it is their strike that has
             // to fight through. Minimum across contacts, so cutting two bodies

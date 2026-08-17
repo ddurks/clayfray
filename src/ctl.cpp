@@ -202,6 +202,7 @@ void CtlServer::buildRegistry() {
     if (refs_.ai) {
         AiParams* a = refs_.ai;
         addB("ai.enabled", &a->enabled);
+        addB("ai.retaliatory", &a->retaliatory);
         addF("ai.wanderSpeed", &a->wanderSpeed);
         addF("ai.chaseSpeed", &a->chaseSpeed);
         addF("ai.lockRange", &a->lockRange);
@@ -228,6 +229,7 @@ void CtlServer::buildRegistry() {
         addF("phys.recoil", &ph->recoil);
         addF("phys.stagger", &ph->stagger);
         addF("phys.staggerBite", &ph->staggerBite);
+        addF("phys.staggerControl", &ph->staggerControl);
     }
     // M-DEATH
     addB("death.enabled", &l->death.enabled);

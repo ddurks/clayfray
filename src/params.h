@@ -205,11 +205,22 @@ struct PhysicsParams {
     float knockMax = 2.2f;    // m/s ceiling
     float knockDamp = 10.0f;  // m/s^2 linear bleed-off; 2.2 m/s stops in 0.22 s
     float recoil = 0.35f;     // the attacker takes this fraction, reversed
-    // Hitstun. Without it the target's own accel cancels a shove in ~0.3 s and
-    // the hit reads as nothing happening; with it the fighter stops steering
-    // and just slides, which is what sells the weight.
-    float stagger = 0.20f;     // s of no steering on a full-strength hit
-    float staggerBite = 0.05f; // m of bite that earns all of it
+    // Hitstun, and IT DOES NOT TAKE THE CONTROLS AWAY. It used to zero the
+    // victim's steering outright, and that read as the game freezing rather than
+    // as a hit: contact persists for every frame a weapon ploughs through, so
+    // the timer was re-armed the whole way, and an opponent jabbing every
+    // punchCooldown could hold you there indefinitely.
+    //
+    // The shove is what sells the weight anyway — it lives in Body::knock, which
+    // steering cannot cancel because it is integrated separately and decays on
+    // its own schedule. So hitstun only has to stop the victim from walking
+    // cleanly out of a shove it is still riding: `staggerControl` is the
+    // fraction of steering authority it keeps, and it is never zero. At 0.45 the
+    // hero can push back at ~0.5 m/s against a 2.2 m/s knock — enough to steer,
+    // nowhere near enough to stand the hit up.
+    float stagger = 0.20f;        // s of reduced steering on a full-strength hit
+    float staggerBite = 0.05f;    // m of bite that earns all of it
+    float staggerControl = 0.45f; // authority kept while staggered; never 0
 };
 
 // M-FIST: the opponent's behaviour. Deterministic by the house rules — fixed
@@ -222,6 +233,17 @@ struct PhysicsParams {
 //   tools/ctl.sh "set ai.enabled 0" "set p1.pos -0.95 0 0.35"
 struct AiParams {
     bool enabled = true;
+    // PASSIVE UNTIL PROVOKED. Proximity alone used to be enough to lock on, so
+    // an opponent walked out of the dark and started punching before the player
+    // had touched a key — nobody ever saw it wander, and the first fight was
+    // never the player's idea. Now it minds its own business until something
+    // HITS it; after that, distance decides when it engages exactly as before.
+    // The grudge lives in OpponentAi, which a respawn resets, so a body that
+    // comes back comes back calm.
+    //
+    // Journals that want it swinging from tick zero: `set ai.retaliatory 0`
+    // (scenarios/carve-duel.journal does, to keep exercising the punch path).
+    bool retaliatory = true;
     float wanderSpeed = 0.50f; // m/s while nobody is worth fighting
     // SLOWER THAN THE HERO ON PURPOSE. GameState::kMaxSpeed is 1.1 m/s, so at
     // 0.92 the player can always break away by running — an opponent matching

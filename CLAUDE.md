@@ -267,13 +267,29 @@ game is what look-dev and the GIF read from. It wanders, locks on inside
 `lockRange`, closes to `standoff`, jabs inside `strikeRange`, and gives up
 outside `breakRange`.
 
+**It is PASSIVE UNTIL PROVOKED** (`ai.retaliatory`, default on). Proximity
+alone no longer locks it on: `OpponentAi::provoked` does, and the ONLY thing
+that sets it is a strike landing on that body — `GameState::applyContacts`
+flips it off the same contact report knockback reads. Before that it wanders
+with its hands down and walks straight past you. Distance decides when a
+provoked opponent engages exactly as it always did; provocation only decides
+*whether*. Spawn spots being outside `lockRange` was the earlier, weaker
+version of this fix — an opponent that locked on at frame zero walked out of
+the dark and started punching before the player touched a key, so nobody saw
+it wander or saw the idle hand pose, and the first fight was never the
+player's idea. Both are kept: the spawn distance stops it noticing you
+instantly once it IS angry.
+
+The grudge is never cleared, but it lives in `OpponentAi`, which
+`adoptRespawns` throws away whole — so a body that comes back comes back calm.
+`set ai.retaliatory 0` restores attack-on-sight, which is what
+`carve-duel.journal` does (nothing in it throws a punch, and it is the
+scenario that exercises the punch path against the ledger).
+
 It is **slower than the hero on purpose**: `chaseSpeed` 0.92 against the hero's
 1.1 m/s, with lower `accel` and `turnRate` too, so the player can always break
 away by running and corners tighter. An opponent matching the hero's top speed
-is glued to their back and there is no way out of a fight. Spawn spots are
-likewise all OUTSIDE `lockRange` — inside it, an opponent was locked on at
-frame zero, walked straight out of the dark and started punching before the
-player touched a key, so nobody ever saw it wander or saw the idle hand pose.
+is glued to their back and there is no way out of a fight.
 
 A journal that places opponents by hand must turn it off first, or the AI walks
 them off the marks it set:
@@ -284,8 +300,9 @@ tools/ctl.sh "set ai.enabled 0" "set p1.pos -0.95 0 0.35" "set p1.guard 1"
 
 `scenarios/walk.journal` and `res-probe.journal` do exactly that — not for
 repeatability (it is deterministic either way) but to isolate what they
-measure. `carve-duel.journal` leaves it ON, so the conservation gate now
-exercises the punch path.
+measure. `carve-duel.journal` leaves it ON — plus `set ai.retaliatory 0`, since
+nothing in it hits the opponent — so the conservation gate exercises the punch
+path.
 
 ## Physics (M-PHYS) — resistance, knockback, bodies
 
@@ -339,9 +356,16 @@ construction, invisible at 60 Hz.
   second — the hit reads as nothing happening. Kept apart, it decays on its own
   LINEAR schedule (an exponential one asymptotes and never quite stops, which
   is how a fighter drifts out of the arena with nothing touching it).
-- **Hitstun** (`stagger`) is the one place the game takes the controls away, so
-  it is deliberately brief. Without it the shove is cancelled by the victim's
-  own accel and there is no hit to feel.
+- **Hitstun (`stagger`) does NOT take the controls away** — it scales steering
+  authority to `staggerControl` (0.45), and that floor is load-bearing. It used
+  to zero the input outright, and the result read as the game freezing rather
+  than as a hit: contact is reported for *every* frame a weapon ploughs
+  through, so the timer re-armed the whole way, and an opponent jabbing every
+  `punchCooldown` could pin a fighter in place indefinitely. Scaled instead,
+  WASD answers on the frame it is pressed and the hit still lands, because what
+  sells it is the shove — which lives in `knock`, which steering cannot cancel
+  at all. Hitstun only has to stop you WALKING a 2.2 m/s shove off, and 0.45
+  authority (~0.5 m/s of push-back) does that without ever dropping an input.
 
 **Bodies do not interpenetrate** — a pairwise xz position constraint, run after
 every fighter has integrated. That ordering is why `stepWorld` exists: bodies
