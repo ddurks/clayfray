@@ -174,6 +174,12 @@ void CtlServer::buildRegistry() {
     addF("rig.idleScale", &l->rig.idleScale);
     addF("rig.hop", &l->rig.hop);
     addF("rig.widen", &l->rig.widen);
+    addF("rig.impactGain", &l->rig.impactGain);
+    addF("rig.impactMax", &l->rig.impactMax);
+    addF("rig.impactK", &l->rig.impactK);
+    addF("rig.impactDamp", &l->rig.impactDamp);
+    addF("rig.impactWiden", &l->rig.impactWiden);
+    addF("rig.impactLift", &l->rig.impactLift);
     addB("hands.ik", &l->hands.ik);
     addF("hands.reach", &l->hands.reach);
     addF("hands.reachScale", &l->hands.reachScale);

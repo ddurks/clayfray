@@ -364,8 +364,14 @@ construction, invisible at 60 Hz.
   `punchCooldown` could pin a fighter in place indefinitely. Scaled instead,
   WASD answers on the frame it is pressed and the hit still lands, because what
   sells it is the shove — which lives in `knock`, which steering cannot cancel
-  at all. Hitstun only has to stop you WALKING a 2.2 m/s shove off, and 0.45
+  at all. Hitstun only has to stop you WALKING the shove off, and 0.45
   authority (~0.5 m/s of push-back) does that without ever dropping an input.
+- **The shove is a NUDGE now, not the hit** (M-BAG). `knockForce` 26 -> 7 and
+  `knockMax` 2.2 -> 0.8 m/s, because the reaction moved into the body: a body
+  made of clay answers a punch by DEFORMING, and a fighter sliding cleanly away
+  from a fist was the read of a rigid body on ice. What is left is enough to
+  rock the stance so a hit body is not bolted to the floor. `set
+  phys.knockForce 0` gives the pure punching bag.
 
 **Bodies do not interpenetrate** — a pairwise xz position constraint, run after
 every fighter has integrated. That ordering is why `stepWorld` exists: bodies
@@ -376,6 +382,74 @@ while each fighter's velocity is private to whatever drives it — which is why
 `GameState::vel` and `OpponentAi::vel` collapsed into one `Body bodies[]`.
 Correction is symmetric (half each); pushing only the "second" body would make
 collision depend on player index and let the hero bulldoze.
+
+## The punching bag (M-BAG) — a hit deforms the body
+
+A punch used to be answered by MOVING the target. That is what a rigid body
+does, and this one is made of clay: the reaction is now a dent that springs
+back, and the shove is the small remainder that keeps the body from reading as
+bolted down.
+
+**THE DEFORMATION IS NOT THE DAMAGE.** The wound is still the swept-capsule
+carve `updatePunchCut` makes, still permanent, still billed to the conservation
+ledger. The wobble is a POSE — one more factor in the body affine — and it
+moves no clay at all, which is why nothing in it touches `sploot_` and why the
+`--carve-test` / journal gates are unaffected by it. A body can be visibly
+dented and owe nothing, and a body can be missing a litre and be perfectly
+round.
+
+**It is a second spring** (`RigParams::impact*`, `Renderer::ImpactWobble`), and
+it is directional where the gait spring is not: the gait spring squashes about
+the vertical and knows only walking speed, this one squashes about the axis the
+weapon arrived on. Two springs, not one, because they are driven by unrelated
+things and are meant to be visible together — a walking fighter that takes a
+punch should keep bouncing while it wobbles.
+
+- **The dent is applied in WORLD xz, outside the yaw**:
+  `T(pos+hop) . Dent . Yaw . Shear . Scale`. Where a punch came from has
+  nothing to do with which way the victim happens to be facing, and inside the
+  yaw a body turning to face its attacker would drag its own dent around with
+  it. Written as an outer-product `fa*aa^T + fb*bb^T` rather than
+  rotate-scale-rotate-back — same matrix, two fewer multiplies, and the
+  translation column is deliberately untouched so the squash is about the FEET
+  like everything else in that matrix.
+- **The spring is DRIVEN, not kicked.** The target squash tracks how deep the
+  weapon is *right now*, so the dent deepens while the fist buries and only
+  springs back — through zero, several times — when the fist leaves. An impulse
+  at contact would have fired and finished before the punch had.
+- **`hitPeak` is banked EVERY FRAME in `reportContact`, and drained on the pose
+  step.** Reading `contacts_` at 12 Hz instead looks equivalent and is not: a
+  jab's contact can begin and end entirely between two pose steps, so the
+  fastest punches — the ones that should wobble hardest — would produce nothing
+  at all.
+- **Stepped on the 12 Hz pose grid** with the gait spring (trap 4), and PARKED
+  at exactly zero when it rings out. A `q` of 1e-7 drifting toward zero is a
+  traced uniform that never settles, which quietly costs the idle frame rate
+  reuse buys — `CLAYFRAY_DEBUG_REUSE=1` is what names that class of bug.
+- **Everything rides it for free** because it goes into `pieces[0].xform`: the
+  eye beads, the shadow proxy capsules, the strike hit capsules, and the
+  unarmed mitts (which hang off the body affine). No new uniform, no new
+  binding, no shader change — the tracer has always been sent a matrix.
+- **That includes a feedback path, and it is deliberate**: a dented body moves
+  its own hit capsules, so a fist has to reach further into a dent to keep
+  biting. It is bounded (`impactMax` 0.34), damped, and stepped on a fixed
+  grid, so it stays replay-deterministic.
+
+The mitts follow the dent only while UNARMED. A sword grip is placed off world
+blade geometry rather than off the body affine, so a hero holding a sword
+wobbles from the waist while its hands stay on the hilt — which is what hands
+gripping something should do.
+
+Snapshots carry it in an additive `RBAG` section (four floats per fighter: the
+spring pair plus the axis, which is state — nothing after the hit remembers
+where the hit came from). An older snapshot has no `RBAG` and restores at rest,
+so no `kVersion` bump.
+
+Tuning is all ctl, and by eye:
+
+```sh
+tools/ctl.sh "set rig.impactGain 4" "set rig.impactDamp 3" "set phys.knockForce 0"
+```
 
 ## Death and respawn (M-DEATH)
 

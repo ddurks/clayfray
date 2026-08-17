@@ -645,11 +645,11 @@ void Renderer::unarmedHand(const FighterPose& disp, const LookParams& look, int 
 
 void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
                               const FighterPose& disp, const BodySpring& s,
-                              const LookParams& look, const SwordParams* grip,
-                              float poseTime) const {
+                              const ImpactWobble& w, const LookParams& look,
+                              const SwordParams* grip, float poseTime) const {
     if (!brush_.valid || pieces.size() < 3) return;
     float A[16];
-    bodyAffine(disp, s, look.rig, A);
+    bodyAffine(disp, s, w, look.rig, A);
     std::memcpy(pieces[0].xform, A, sizeof(A));
     for (int k = 0; k < 3; k++) {
         pieces[0].lo[k] = brush_.bodyLo[k];
@@ -824,8 +824,16 @@ void Renderer::stepSpring(BodySpring& s, const RigParams& r, bool moving, float 
 // to exactly that rotation when ky = cos(lean) and t = tan(lean), which is the
 // sanity check that the sign convention below matches the old root transform:
 // positive lean tips the head toward +Z, the fighter's forward.
+//
+// M-BAG appends ONE factor on the world side:
+//   world = T(pos + hop) . Dent(hit axis) . Yaw . Shear . Scale(squish)
+// Dent is in WORLD xz because the axis it squashes about is where the punch
+// came from, which has nothing to do with which way the victim happens to be
+// facing — and putting it outside the yaw is what keeps a body spinning to
+// face its attacker from dragging its own dent around with it.
 void Renderer::bodyAffine(const FighterPose& disp, const BodySpring& s,
-                          const RigParams& r, float out[16]) const {
+                          const ImpactWobble& w, const RigParams& r,
+                          float out[16]) const {
     const float ky = std::min(std::max(1.f + s.q, 0.55f), 1.45f);
     // sideways bulge: squashing down pushes clay out. Not strictly volume
     // preserving — `widen` is a taste knob, and clay is not water.
@@ -842,6 +850,74 @@ void Renderer::bodyAffine(const FighterPose& disp, const BodySpring& s,
     out[13] = disp.pos[1] + hop;
     out[14] = disp.pos[2];
     out[15] = 1.f;
+    if (w.q == 0.f) return;
+
+    // Dent: scale by `fa` along the hit axis a, by `fb` across it, by `fy` up.
+    // Written as the outer-product form fa*aa^T + fb*bb^T with b = perp(a),
+    // which is the same thing as rotating into the axis and back, minus the two
+    // matrix multiplies. Like the squish it is about the FEET (y = 0), so the
+    // dent never lifts the fighter off the floor — only the linear part is
+    // touched below and the translation column is left exactly as it was.
+    const float fa = std::min(std::max(1.f + w.q, 0.4f), 1.6f);
+    const float fb = std::min(std::max(1.f - r.impactWiden * w.q, 0.4f), 1.6f);
+    const float fy = std::min(std::max(1.f - r.impactLift * w.q, 0.4f), 1.6f);
+    const float ax = w.ax, az = w.az;
+    const float d00 = fa * ax * ax + fb * az * az;
+    const float d02 = (fa - fb) * ax * az;
+    const float d22 = fa * az * az + fb * ax * ax;
+    for (int c = 0; c < 3; c++) { // column-major: D * out, column by column
+        float* col = out + c * 4;
+        const float x = col[0], y = col[1], z = col[2];
+        col[0] = d00 * x + d02 * z;
+        col[1] = fy * y;
+        col[2] = d02 * x + d22 * z;
+    }
+}
+
+// One 12 Hz step of the punching-bag wobble, for ONE fighter.
+//
+// The spring is DRIVEN toward a target set by however deep a weapon currently
+// is (RigParams::impactGain), not kicked by an impulse at contact: a fist is
+// inside a body for a tenth of a second or more, and the dent has to deepen
+// with it and then let go, which an impulse cannot express.
+//
+// `hitPeak` is consumed here and refilled by reportContact over the frames that
+// follow, so a contact that has ENDED reads as target 0 on the next step and
+// the body springs back through zero — the ring-out is the spring's own, with
+// no separate release state to get stuck in.
+void Renderer::stepImpact(Fighter& f, const RigParams& r, float dt) {
+    if (dt <= 0.f) return;
+    ImpactWobble& w = f.wobble;
+    if (f.hitPeak > 0.f) {
+        // Latch the axis on a fresh hit only. Held through the recovery, so a
+        // dent finishes wobbling along the line it was made on.
+        const float l = std::sqrt(f.hitDir[0] * f.hitDir[0] +
+                                  f.hitDir[2] * f.hitDir[2]);
+        if (l > 1e-4f) {
+            w.ax = f.hitDir[0] / l;
+            w.az = f.hitDir[2] / l;
+        }
+    }
+    const float target = -std::min(r.impactGain * f.hitPeak, r.impactMax);
+    f.hitPeak = 0.f;
+    // Same substepped semi-implicit Euler as the gait spring, and for the same
+    // reason: dt is a whole ~83 ms pose step against a ~0.64 s period, so one
+    // step per frame integrates visibly lumpily. Fixed count, no wall clock.
+    const int kSub = 4;
+    const float h = dt / (float)kSub;
+    for (int i = 0; i < kSub; i++) {
+        w.v += (-r.impactK * (w.q - target) - r.impactDamp * w.v) * h;
+        w.q += w.v * h;
+    }
+    w.q = std::min(std::max(w.q, -r.impactMax), r.impactMax);
+    // Park it exactly at rest once the ring-out is inaudible. The wobble is a
+    // TRACED uniform, so a q of 1e-7 drifting toward zero would re-trace a
+    // standing fighter every pose step forever and quietly cost the idle frame
+    // rate that reuse buys (trap: CLAYFRAY_DEBUG_REUSE names inputs like this).
+    if (std::fabs(w.q) < 1e-4f && std::fabs(w.v) < 1e-3f && target == 0.f) {
+        w.q = 0.f;
+        w.v = 0.f;
+    }
 }
 
 int Renderer::packAffinePieces(float out[kUniformSlots][4], int idx,
@@ -1871,6 +1947,16 @@ void Renderer::absorbMeasured() {
 void Renderer::reportContact(int attacker, int target, int side, float bite,
                              const float dir[3], float speed) {
     if (!(bite > 0.f)) return;
+    // M-BAG: bank the deepest bite of the moment for the wobble. Kept on the
+    // FIGHTER rather than read off contacts_ at the pose step, because
+    // contacts_ is rebuilt per frame and a fast jab can come and go entirely
+    // between two 12 Hz steps — the wobble would then miss the hardest hits.
+    // Also deliberately independent of the deepest-wins dedup below: this is
+    // "how hard was this body hit", summed over nobody, maxed over everybody.
+    if (target >= 0 && target < kMaxPlayers && bite > fighters_[target].hitPeak) {
+        fighters_[target].hitPeak = bite;
+        for (int k = 0; k < 3; k++) fighters_[target].hitDir[k] = dir[k];
+    }
     for (StrikeContact& c : contacts_) {
         if (c.attacker != attacker || c.target != target || c.side != side) continue;
         // Deepest wins. Keeping the deepest sample's direction with it matters:
@@ -2483,6 +2569,11 @@ void Renderer::respawnFighter(int i, const LookParams& look) {
     f.pose.punch = 0.f;
     f.disp = f.pose;
     f.spring = BodySpring{};
+    // A fresh body is not still wobbling from the punch that killed the last
+    // one — and hitPeak has to go with it, or the first pose step after the
+    // respawn dents a whole body with the fatal blow's bite.
+    f.wobble = ImpactWobble{};
+    f.hitPeak = 0.f;
     // The mitts are somewhere else entirely now; a stale "where the fist was"
     // would read that teleport as a strike (updatePunchCut's own guard would
     // catch it, but relying on a magnitude threshold for a known discontinuity
@@ -2883,7 +2974,13 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                 ? std::min(std::max(frame.poseTime - springPoseTime_, 0.f), 0.25f)
                 : 0.f;
         springPoseTime_ = frame.poseTime;
-        for (Fighter& f : fighters_) stepSpring(f.spring, look.rig, f.pose.moving, dt);
+        for (Fighter& f : fighters_) {
+            stepSpring(f.spring, look.rig, f.pose.moving, dt);
+            // M-BAG rides the same grid and the same guard: both springs feed
+            // one matrix, and stepping them on different clocks would give a
+            // fighter two rates of stop-motion at once.
+            stepImpact(f, look.rig, dt);
+        }
     }
 
     // pose the skeleton at the quantized clock; paused = rest pose
@@ -2922,8 +3019,8 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             const SwordParams* grip =
                 (i == 0 && swordWorld_.enabled && look.hands.ik) ? &swordWorld_
                                                                  : nullptr;
-            updateBrushRig(f.pieces, f.handPose, f.disp, f.spring, look, grip,
-                           frame.poseTime);
+            updateBrushRig(f.pieces, f.handPose, f.disp, f.spring, f.wobble, look,
+                           grip, frame.poseTime);
         }
     }
 
@@ -2943,7 +3040,8 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             // reproduces procedurally, at three pieces instead of thirteen.
             evalPose(bones_, nullptr, 0.f, fighters_[0].skinMats);
             float A[16];
-            bodyAffine(fighters_[0].disp, fighters_[0].spring, look.rig, A);
+            bodyAffine(fighters_[0].disp, fighters_[0].spring, fighters_[0].wobble,
+                       look.rig, A);
             for (size_t b = 0; b * 16 + 16 <= fighters_[0].skinMats.size(); b++) {
                 float tmp[16];
                 matMul(A, &fighters_[0].skinMats[b * 16], tmp);
@@ -3059,7 +3157,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             // same collapse as the hero, driven by ITS pose and ITS spring
             evalPose(bones_, nullptr, 0.f, f.skinMats);
             float A[16];
-            bodyAffine(f.disp, f.spring, look.rig, A);
+            bodyAffine(f.disp, f.spring, f.wobble, look.rig, A);
             for (size_t b = 0; b * 16 + 16 <= f.skinMats.size(); b++) {
                 float tmp[16];
                 matMul(A, &f.skinMats[b * 16], tmp);
@@ -3445,6 +3543,20 @@ bool Renderer::saveSnapshot(const std::string& path, double simT,
         }
         w.section("RRIG", rig, sizeof(rig));
     }
+    // M-BAG wobble, its own additive section: an older snapshot simply has no
+    // RBAG and restores at rest, which is a valid body. Four floats per fighter
+    // — the spring pair plus the axis it is ringing along, which is state, not
+    // a derivable: nothing after the hit remembers where the hit came from.
+    {
+        float bag[4 * kMaxPlayers];
+        for (int i = 0; i < kMaxPlayers; i++) {
+            bag[i * 4 + 0] = fighters_[i].wobble.q;
+            bag[i * 4 + 1] = fighters_[i].wobble.v;
+            bag[i * 4 + 2] = fighters_[i].wobble.ax;
+            bag[i * 4 + 3] = fighters_[i].wobble.az;
+        }
+        w.section("RBAG", bag, sizeof(bag));
+    }
     w.section("RGOB", gobs_.data(), gobs_.size() * sizeof(Gob));
     w.section("CHRP", charPath.data(), charPath.size());
     bool ok = w.close();
@@ -3510,6 +3622,20 @@ bool Renderer::loadSnapshot(const std::string& path, double* simT,
         r.read("RRIG", rig, sizeof(rig));
         for (int i = 0; i < kMaxPlayers; i++)
             fighters_[i].spring = BodySpring{rig[i * 3], rig[i * 3 + 1], rig[i * 3 + 2]};
+    }
+    // Same deal for the impact wobble — absent in any snapshot older than
+    // M-BAG, and a body at rest is the right thing to restore to. The axis
+    // default is +z rather than zero: a zero axis would make the dent matrix
+    // scale by fb in every horizontal direction if q were ever non-zero.
+    {
+        float bag[4 * kMaxPlayers] = {};
+        for (int i = 0; i < kMaxPlayers; i++) bag[i * 4 + 3] = 1.f;
+        r.read("RBAG", bag, sizeof(bag));
+        for (int i = 0; i < kMaxPlayers; i++) {
+            fighters_[i].wobble =
+                ImpactWobble{bag[i * 4], bag[i * 4 + 1], bag[i * 4 + 2], bag[i * 4 + 3]};
+            fighters_[i].hitPeak = 0.f;
+        }
     }
     // fresh dt baseline: the restored clock may sit anywhere on the timeline
     lastSimTime_ = -1.f;

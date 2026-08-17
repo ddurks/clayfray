@@ -201,9 +201,16 @@ struct PhysicsParams {
     // A FORCE, not an impulse. Contact persists across frames while a weapon
     // ploughs through, so this integrates over the strike; firing an impulse
     // per frame instead would scale knockback with the frame rate.
-    float knockForce = 26.0f; // m/s^2 per metre of bite
-    float knockMax = 2.2f;    // m/s ceiling
-    float knockDamp = 10.0f;  // m/s^2 linear bleed-off; 2.2 m/s stops in 0.22 s
+    //
+    // M-BAG CUT IT TO A NUDGE. It was 26 m/s^2 / 2.2 m/s, i.e. the hit was
+    // ENTIRELY a displacement — the whole read was a rigid body sliding away,
+    // and clay does not do that. The deformation (RigParams::impact*) is the
+    // reaction now, and the shove is what stops a punching bag reading as
+    // bolted to the floor: enough to rock the stance, not enough to move the
+    // fight. `set phys.knockForce 0` gives the pure bag.
+    float knockForce = 7.0f;  // m/s^2 per metre of bite
+    float knockMax = 0.8f;    // m/s ceiling
+    float knockDamp = 10.0f;  // m/s^2 linear bleed-off; 0.8 m/s stops in 0.08 s
     float recoil = 0.35f;     // the attacker takes this fraction, reversed
     // Hitstun, and IT DOES NOT TAKE THE CONTROLS AWAY. It used to zero the
     // victim's steering outright, and that read as the game freezing rather than
@@ -216,8 +223,8 @@ struct PhysicsParams {
     // its own schedule. So hitstun only has to stop the victim from walking
     // cleanly out of a shove it is still riding: `staggerControl` is the
     // fraction of steering authority it keeps, and it is never zero. At 0.45 the
-    // hero can push back at ~0.5 m/s against a 2.2 m/s knock — enough to steer,
-    // nowhere near enough to stand the hit up.
+    // hero pushes back at ~0.5 m/s — enough to steer, not enough to walk the
+    // hit off before it has landed.
     float stagger = 0.20f;        // s of reduced steering on a full-strength hit
     float staggerBite = 0.05f;    // m of bite that earns all of it
     float staggerControl = 0.45f; // authority kept while staggered; never 0
@@ -365,6 +372,36 @@ struct RigParams {
     // so 0.45 is a ~2 cm hop on a 0.69 m body — a skip, not a leap.
     float hop = 0.45f;
     float widen = 0.5f;       // sideways bulge per unit of squish
+
+    // ---- M-BAG: the punching-bag wobble ----
+    //
+    // A SECOND spring, and a DIRECTIONAL one. The gait spring squashes about
+    // the vertical and knows only how fast the fighter is walking; this one
+    // squashes about the axis the weapon came in on, so a body hit in the ribs
+    // dents sideways and one hit head-on dents front-to-back. They are separate
+    // because they are driven by unrelated things and are meant to be visible
+    // at once — a walking fighter that takes a punch should keep bouncing while
+    // it wobbles.
+    //
+    // DRIVEN, not kicked: the target squash tracks how deep the weapon is right
+    // now, so the dent deepens while the fist buries and springs back — through
+    // zero, several times — only once the fist leaves. An impulse at contact
+    // would have fired and finished before the punch had.
+    //
+    // Stepped on the 12 Hz pose grid with the gait spring, for the same two
+    // reasons (trap 4, and a traced uniform must not move at 60 Hz).
+    // Squash per metre of bite. Set so a CONNECTING JAB lands mid-range rather
+    // than on the clamp: the AI's standoff puts a fist ~0.13 m into a body
+    // (see AiParams::standoff), so 1.8 gives -0.23 and leaves the top of the
+    // range for a sword buried to the hilt. Gain high enough to clamp a jab
+    // makes every punch produce the identical dent.
+    float impactGain = 1.8f;
+    float impactMax = 0.34f;  // clamp on |q|, target and ring-out alike
+    float impactK = 95.f;     // stiffness (rad/s)^2; period ~0.64 s, ~8 steps
+    float impactDamp = 5.0f;  // zeta ~0.26 — three or four visible wobbles
+    float impactWiden = 0.7f; // bulge ACROSS the hit axis per unit of squash
+    float impactLift = 0.45f; // ... and upward, which is what reads as clay
+                              // displaced rather than as a body scaled down
 };
 
 // M-DEATH: a fighter that has lost half its clay stops being a fighter.
