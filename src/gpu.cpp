@@ -135,9 +135,22 @@ void cacheStore(size_t keySize, const uint8_t* key, size_t valueSize,
 
 namespace {
 bool gPipelineFailed = false;
+int gUncapturedErrors = 0;
 } // namespace
 
 bool gpuAnyPipelineFailed() { return gPipelineFailed; }
+int gpuUncapturedErrorCount() { return gUncapturedErrors; }
+
+void wgslConstantsFit(int needed, size_t bufSize, const char* who) {
+    if (needed >= 0 && (size_t)needed < bufSize) return;
+    std::fprintf(stderr,
+                 "[fatal] %s::wgslConstants() truncated: needs %d bytes, buffer is "
+                 "%zu. Raise it — a cut constants block compiles to a black screen "
+                 "with a zero exit code.\n",
+                 who, needed, bufSize);
+    std::fflush(stderr);
+    std::abort();
+}
 
 GpuPipelineScope::GpuPipelineScope(const wgpu::Device& device, const char* what)
     : device_(device), what_(what) {
@@ -277,6 +290,12 @@ wgpu::Future Gpu::requestDevice(wgpu::CallbackMode mode, std::function<void()> t
     }
     devDesc.SetUncapturedErrorCallback(
         [](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView msg) {
+            // LATCHED, not just printed. CLAUDE.md's own check for trap 2 is a
+            // human running `2>&1 | grep -c 'wgpu error'` and remembering to —
+            // while every other gate in this project (carve-test, replay,
+            // imgdiff) is an exit code. The failure most likely to be
+            // catastrophic and invisible was the one you had to grep for.
+            gUncapturedErrors++;
             std::fprintf(stderr, "[wgpu error %d] %.*s\n", (int)type, (int)msg.length,
                          msg.data);
         });

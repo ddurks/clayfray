@@ -387,20 +387,20 @@ bool CharacterAsset::load(const std::string& path) {
             if (!channel.target_node || !channel.sampler) continue;
             auto it = jointIndex.find(channel.target_node);
             if (it == jointIndex.end()) continue;
-            int path;
+            int pathKind;
             switch (channel.target_path) {
-            case cgltf_animation_path_type_translation: path = 0; break;
-            case cgltf_animation_path_type_rotation: path = 1; break;
-            case cgltf_animation_path_type_scale: path = 2; break;
+            case cgltf_animation_path_type_translation: pathKind = 0; break;
+            case cgltf_animation_path_type_rotation: pathKind = 1; break;
+            case cgltf_animation_path_type_scale: pathKind = 2; break;
             default: continue; // morph weights: P3
             }
             const cgltf_animation_sampler* smp = channel.sampler;
-            const int comps = path == 1 ? 4 : 3;
+            const int comps = pathKind == 1 ? 4 : 3;
             const bool cubic =
                 smp->interpolation == cgltf_interpolation_type_cubic_spline;
             AnimTrack tr;
             tr.joint = it->second;
-            tr.path = path;
+            tr.path = pathKind;
             tr.interp = smp->interpolation == cgltf_interpolation_type_step ? 0 : 1;
             tr.times.resize(smp->input->count);
             for (cgltf_size k = 0; k < smp->input->count; k++) {

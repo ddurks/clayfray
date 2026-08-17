@@ -7,6 +7,21 @@
 
 struct SDL_Window;
 
+// Guard for the generated `//#constants` blocks (BrickSystem::wgslConstants,
+// GroundClay::wgslConstants), which build into a fixed char buffer.
+//
+// snprintf returns the length it WOULD have written, so an overflow is SILENT:
+// the block gets cut mid-token, the shader fails to compile, and per trap 8 a
+// rejected pipeline is an invalid object every later pass no-ops on. The app
+// then boots, prints a healthy asset banner, renders black, and --carve-test
+// still exits 0 (0 == 0 balances). It is nastier than trap 2's version of the
+// same failure because the corruption exists only in generated text — nothing
+// in the source tree looks wrong, and only CLAYFRAY_DUMP_WGSL would show it.
+//
+// The blocks are mostly comments, so one more explanatory paragraph is all it
+// takes. Fail at startup, loudly, naming the buffer to raise.
+void wgslConstantsFit(int needed, size_t bufSize, const char* who);
+
 // Name a pipeline creation so a failure is LOUD and attributable instead of a
 // black screen. Dawn reports a rejected CreateComputePipeline/CreateRenderPipeline
 // through the uncaptured-error callback and then hands back an INVALID object
@@ -35,6 +50,13 @@ private:
 // startup can say "the picture will be black and here is why" rather than
 // leaving the user to guess.
 bool gpuAnyPipelineFailed();
+
+// How many uncaptured wgpu errors the device has reported. Together with the
+// flag above this is what makes a broken build an EXIT CODE rather than a
+// `grep -c 'wgpu error'` a human has to remember to run — see runHeadless,
+// which returns 4. Trap 2's failure (a bind-group layout mismatch) renders a
+// black screen while --carve-test exits 0, because 0 == 0 balances.
+int gpuUncapturedErrorCount();
 
 // THE blocking-wait chokepoint. Every place that stops the world until a GPU
 // future resolves goes through here — there is no bare `instance.WaitAny` left

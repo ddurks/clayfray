@@ -13,6 +13,18 @@ cmake --build build                 # configures via FetchContent on first run
 ./build/clayfray --screenshot out.png --frames 8 --size 960x540 --aa 2
 ```
 
+`src/` builds with `-Wall -Wextra -Wshadow` and is warning-CLEAN — keep it
+that way, because a list nobody can clear is a list nobody reads. Dependencies
+(SDL3, Dawn, imgui, stb, cgltf) are `SYSTEM` includes so their warnings stay
+out of ours; SDL3's own Objective-C deprecation spew comes from its target, not
+this one. Deliberately NOT `-Werror`: a dependency's next release should not
+break your build. `-DCLAYFRAY_ASAN=ON` adds Address+UB sanitizers (desktop
+only) — point it at the conservation gate, where the mapped-GPU-range casts
+live.
+
+**Exit codes**: 0 ok, 1 I/O, 3 conservation violation, **4 GPU unhealthy** (a
+pipeline was rejected or the device reported an uncaptured error — see trap 2).
+
 ### Web target (Emscripten) — STAGE 2: it RUNS
 
 ```sh
@@ -820,13 +832,26 @@ until resume/step. Snapshots are same-build raw memory — don't ship them.
    `wgslConstants()` emits `MAX_FIGHTERS` and `PIECES_PER_FIGHTER` and why
    `//#constants` sits ABOVE the struct in both roots.
 
-   So after ANY change to the uniform block or to `kMaxFighters`, grep the run
-   for validation spew rather than trusting an exit code:
+   **`capsules` and `gobs` were the same bug still live**, and are now derived
+   too: `Renderer::wgslConstants()` emits `MAX_CAPSULES`/`MAX_GOBS`, both roots
+   say `array<vec4f, MAX_CAPSULES * 2>`, and the C++ clamps in `packUniforms` /
+   `updateConservation` read the same constants. Adding an array to the uniform
+   block means adding its capacity there — never a literal in the WGSL.
+
+   **This is an EXIT CODE now, not a grep.** It used to be a manual check a
+   human had to remember to run, which sat badly next to the iteration rule
+   telling agents not to render to verify their own work. Every headless mode
+   returns through `gpuHealthExit()`: **4** if any pipeline was rejected or the
+   device reported an uncaptured error, distinct from 3 (conservation) and 1
+   (I/O). So after ANY change to the uniform block or to `kMaxFighters`:
 
    ```sh
-   ./build/clayfray --screenshot /tmp/x.png --frames 4 --size 320x180 --aa 1 \
-     2>&1 | grep -c 'wgpu error'      # must print 0
+   ./build/clayfray --screenshot /tmp/x.png --frames 4 --size 320x180 --aa 1
+   echo $?      # 0 = healthy, 4 = a pipeline failed; the picture is a lie
    ```
+
+   Verified by breaking `trace.wgsl` on purpose: exit 4, naming the pipeline.
+   The same run before this existed exited 0 with a black screen.
 
 3. **March fields must be CONSERVATIVE; AO/penumbra fields must be SMOOTH.**
    Feeding a conservative (Lipschitz-scaled / clamped) distance into AO or soft

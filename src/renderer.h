@@ -28,6 +28,20 @@ class Renderer {
     // still queued at teardown bails before touching destroyed buffers.
     ~Renderer() { *alive_ = false; }
 
+    // NON-COPYABLE, and the reason is the sentinel above rather than the GPU
+    // handles. `alive_` is a shared_ptr, so a copy SHARES it — the temporary's
+    // destructor flips it false and every in-flight and future readback
+    // callback on the original then early-returns. The volume ledger silently
+    // stops absorbing measurements, conservation starts "leaking", and nothing
+    // logs a word. One `auto r = renderer;` is all it takes.
+    Renderer(const Renderer&) = delete;
+    Renderer& operator=(const Renderer&) = delete;
+    Renderer() = default;
+
+    // Uniform-array capacities for the WGSL side. Emitted into //#constants
+    // next to BrickSystem's and GroundClay's blocks; see kMaxCapsules below.
+    static std::string wgslConstants();
+
     bool init(Gpu& gpu, int width, int height);
     void resize(int width, int height);
     bool reloadShadersIfChanged();
@@ -145,10 +159,19 @@ class Renderer {
     static constexpr int kSlotSceneMeta = kSlotMarbleMeta + 1;
     static constexpr int kSlotCapsMeta = kSlotSceneMeta + 1;
     static constexpr int kSlotCapsCenter = kSlotCapsMeta + 1;
+    // Capacities, not literals — trap 2. `marbles` was `array<vec4f, 32>` in
+    // both shaders against a C++ count that agreed BY COINCIDENCE, and when
+    // the coincidence broke every bind group against that layout failed: the
+    // app booted, printed a healthy banner, rendered black, and carved 0.0 ml
+    // while --carve-test still exited 0. These two were the same shape and
+    // were left behind by that fix. wgslConstants() now emits both, so the
+    // shader dimensions are DERIVED and cannot drift from these.
+    static constexpr int kMaxCapsules = 16; // shadow proxy, {a,radius},{b,-}
+    static constexpr int kMaxGobs = 12;     // in flight, {pos,radius},{color,-}
     static constexpr int kSlotCapsules = kSlotCapsCenter + 1;
-    static constexpr int kSlotGobMeta = kSlotCapsules + 32; // 16 capsules x2
+    static constexpr int kSlotGobMeta = kSlotCapsules + kMaxCapsules * 2;
     static constexpr int kSlotGobs = kSlotGobMeta + 1;
-    static constexpr int kSlotGroundMeta = kSlotGobs + 24; // 12 gobs x2
+    static constexpr int kSlotGroundMeta = kSlotGobs + kMaxGobs * 2;
     static constexpr int kSlotSwordA = kSlotGroundMeta + 1;
     static constexpr int kSlotFighters = kSlotSwordA + 3; // hilt, tip, colour
     // One Piece: invSkin mat4 + aabb lo/hi. It was 12 — a forward skin mat4
@@ -498,7 +521,7 @@ class Renderer {
     // M5: a MOVING blade that overlaps fighter 1 carves a channel along its
     // sweep. Gated on blade speed so a sword merely resting against the
     // opponent doesn't eat it.
-    void updateBladeCut(const LookParams& look);
+    void updateBladeCut();
     float prevTip_[3] = {0, 0, 0}, prevHilt_[3] = {0, 0, 0};
     bool haveBlade_ = false;
     // M-FIST: the same idea one weapon down. A closed fist travelling fast

@@ -310,6 +310,16 @@ class BrickSystem {
     // teardown bails before it touches destroyed buffers/members.
     ~BrickSystem() { *alive_ = false; }
 
+    // NON-COPYABLE for the same reason Renderer is: a copy SHARES `alive_`,
+    // and the temporary's destructor kills every readback the original is
+    // waiting on. This one is the likelier accident of the two — these live in
+    // `std::array<Fighter, kMaxPlayers>` inside Renderer, so any `auto f =
+    // fighters_[0];` or by-value parameter does it, and raising kMaxFighters
+    // is exactly the kind of refactor that writes one.
+    BrickSystem(const BrickSystem&) = delete;
+    BrickSystem& operator=(const BrickSystem&) = delete;
+    BrickSystem() = default;
+
     // `slot` is which slice of the shared store this fighter owns. Everything
     // this object encodes is confined to that slice.
     bool init(Gpu& gpu, BrickStore& store, int slot, const std::string& editSrc,

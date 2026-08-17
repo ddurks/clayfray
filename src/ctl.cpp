@@ -302,10 +302,16 @@ void CtlServer::buildRegistry() {
         addF("fighter.punch", &refs_.fighter->punch);
         addI("fighter.punchSide", &refs_.fighter->punchSide);
     }
+    // Traced resolution belongs with `look`, NOT inside the brush block: it is
+    // a LookParams field and it has nothing to do with sculpting. It sat there
+    // until now, and `refs_.brush` is null in runHeadless — so `--serve`, the
+    // one session an agent benchmarks in, answered `err unknown param
+    // look.traceW` for the single knob CLAUDE.md's benchmarking rules are built
+    // on ("pin the traced resolution or the number is fiction").
+    addI("look.traceW", &l->traceW);
+    addI("look.traceH", &l->traceH);
     if (refs_.brush) {
         addI("brush.mode", &refs_.brush->mode);
-        addI("look.traceW", &l->traceW);
-        addI("look.traceH", &l->traceH);
         addF("brush.radius", &refs_.brush->radius);
         addF("brush.color", refs_.brush->color, 3);
     }

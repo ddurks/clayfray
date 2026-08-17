@@ -29,6 +29,23 @@ if(CCACHE_PROGRAM)
 endif()
 
 option(CLAYFRAY_TRACY "Enable Tracy profiler client" OFF)
+option(CLAYFRAY_ASAN "Build with Address+UB sanitizers (desktop only)" OFF)
+
+# ---- warnings ----
+# This target built with NO warning flags at all until now, which is a strange
+# place for a codebase whose documented worst failure mode is "boots, prints a
+# healthy banner, renders black, exits 0" to be standing. Measured cost of
+# turning them on: 2 warnings across all ten translation units.
+#
+# NOT -Werror. FetchContent pulls SDL3, Dawn and imgui, whose headers we do not
+# control; those are silenced with SYSTEM below instead, and a hard error on a
+# dependency's next release would break the build for no defect of ours.
+add_library(clayfray_warnings INTERFACE)
+if(MSVC)
+  target_compile_options(clayfray_warnings INTERFACE /W4)
+else()
+  target_compile_options(clayfray_warnings INTERFACE -Wall -Wextra -Wshadow)
+endif()
 # Web escape hatch: link the module with JSPI so gpuBlockOn() can really block
 # (see src/platform.h). OFF is the intended shape — stage 2 removes the last
 # blocking callers instead — but a flag beats a rewrite if that stalls.
@@ -129,7 +146,9 @@ add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui_widgets.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
   ${IMGUI_WGPU_BACKEND})
-target_include_directories(imgui_lib PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+# SYSTEM so imgui's headers do not trip clayfray's warnings (see above); imgui
+# itself is deliberately NOT linked against clayfray_warnings.
+target_include_directories(imgui_lib SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 # emdawnwebgpu IS Dawn's API surface, so the Dawn spelling of imgui's WebGPU
 # backend is correct on web too — it is `IMGUI_IMPL_WEBGPU_BACKEND_WGPU` (the
 # wgpu-native flavour) that would be wrong.
@@ -148,8 +167,22 @@ add_executable(clayfray
   src/ctl.cpp
   src/touch.cpp
   src/ui.cpp)
-target_include_directories(clayfray PRIVATE ${stb_SOURCE_DIR} ${cgltf_SOURCE_DIR})
-target_link_libraries(clayfray PRIVATE clayfray_deps imgui_lib)
+# SYSTEM: stb and cgltf are vendored single-header libraries. Without this the
+# warnings enabled above fire on THEIR code, which we cannot fix and would
+# quickly learn to ignore — and an ignored warning list is the same as none.
+target_include_directories(clayfray SYSTEM PRIVATE ${stb_SOURCE_DIR} ${cgltf_SOURCE_DIR})
+target_link_libraries(clayfray PRIVATE clayfray_deps imgui_lib clayfray_warnings)
+
+# Sanitizers are opt-in and desktop-only: the strict-aliasing and alignment
+# casts off mapped GPU ranges are the things worth pointing UBSan at, and none
+# of them exist on the web path. Run the conservation gate under it:
+#   cmake -S . -B build-asan -DCLAYFRAY_ASAN=ON && cmake --build build-asan
+#   ./build-asan/clayfray --carve-test --frames 300 --size 320x180 --aa 1
+if(CLAYFRAY_ASAN AND NOT EMSCRIPTEN)
+  target_compile_options(clayfray PRIVATE
+    -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  target_link_options(clayfray PRIVATE -fsanitize=address,undefined)
+endif()
 
 if(EMSCRIPTEN)
   # Runtime file reads are UNCHANGED on web — that is the point of preloading.

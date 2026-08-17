@@ -100,6 +100,13 @@ class CtlServer {
 
     ~CtlServer() { stopRecord(); }
 
+    // Owns the journal FILE* that stopRecord() closes, and hands out raw
+    // pointers into a registry built from another object's members. A copy
+    // double-closes the first and outlives the second.
+    CtlServer(const CtlServer&) = delete;
+    CtlServer& operator=(const CtlServer&) = delete;
+    CtlServer() = default;
+
   private:
     struct Param {
         std::string name;
