@@ -23,6 +23,7 @@
 #include "gpu.h"
 #include "params.h"
 #include "renderer.h"
+#include "touch.h"
 #include "ui.h"
 
 namespace {
@@ -1117,6 +1118,7 @@ struct AppState {
     BrushState brush;
     SimClock clock;
     CtlServer ctl;
+    TouchControls touch;
 
     double simT = 0.0;
     bool ctlQuit = false;
@@ -1215,6 +1217,28 @@ bool appStartAfterGpu(AppState& s) {
     addOpponents(s.renderer, wantedPlayers());
     if (!uiInit(s.window, s.gpu)) return false;
 
+    // Touch controls are shown BEFORE the first touch, or a phone opens to what
+    // looks like a screensaver: no keyboard, so no way in. The probe wants BOTH
+    // a touch point and a coarse pointer — `maxTouchPoints > 0` alone fires on
+    // every convertible laptop sitting on a desk with a mouse. Anything the
+    // probe misses still latches on the first finger event (src/touch.h).
+    // CLAYFRAY_TOUCH=1/0 forces it either way, which is how the overlay gets
+    // laid out and eyeballed on the desktop.
+    {
+        int want = 0;
+#ifdef __EMSCRIPTEN__
+        want = EM_ASM_INT({
+            return (navigator.maxTouchPoints > 0 &&
+                    window.matchMedia('(pointer: coarse)').matches)
+                       ? 1
+                       : 0;
+        });
+#endif
+        if (const char* e = std::getenv("CLAYFRAY_TOUCH")) want = std::atoi(e);
+        s.touch.active = want > 0;
+        if (s.touch.active) std::printf("[touch] on-screen controls enabled\n");
+    }
+
     CtlRefs refs;
     refs.look = &s.look;
     refs.cam = &s.cam;
@@ -1288,9 +1312,21 @@ void frameOnce(AppState& s) {
     (void)screenshotCounter;
 
     {
+        // Logical (not backing) size: it is the space finger events normalize
+        // against and the space ImGui draws in, so the touch hit boxes and the
+        // touch overlay cannot disagree about where the button is.
+        int lw = 0, lh = 0;
+        SDL_GetWindowSize(window, &lw, &lh);
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             uiProcessEvent(&ev);
+            // Touch controls get first refusal on every finger. What they claim
+            // (stick zone, action button) never reaches the camera or the
+            // sculpt brush; everything else falls through to the synthetic
+            // mouse, which is what still makes drag-orbit and the ImGui panel
+            // work under a thumb. See src/touch.h.
+            if (s.touch.handleEvent(ev, (float)lw, (float)lh)) continue;
             switch (ev.type) {
             case SDL_EVENT_QUIT:
                 running = false;
@@ -1319,7 +1355,10 @@ void frameOnce(AppState& s) {
                     game.swingRequested = true;
                 break;
             case SDL_EVENT_MOUSE_MOTION:
-                if (!uiWantsMouse() && brush.mode == 0 &&
+                // `!touch.engaged()`: a thumb on the stick or the button also
+                // drives the synthetic mouse, so without this the fighter would
+                // orbit the camera every time it walked.
+                if (!uiWantsMouse() && !s.touch.engaged() && brush.mode == 0 &&
                     (ev.motion.state & SDL_BUTTON_LMASK)) {
                     cam.azimuth -= ev.motion.xrel * 0.005f;
                     cam.elevation += ev.motion.yrel * 0.005f;
@@ -1353,9 +1392,16 @@ void frameOnce(AppState& s) {
             if (keys[SDL_SCANCODE_S]) { mx -= fx; mz -= fz; }
             if (keys[SDL_SCANCODE_D]) { mx += rx; mz += rz; }
             if (keys[SDL_SCANCODE_A]) { mx -= rx; mz -= rz; }
+            // The thumb stick adds into the same vector on the same basis, so
+            // there is no touch "mode" to be in and no second code path for the
+            // sim to disagree with.
+            s.touch.addMovement(cam.azimuth, mx, mz);
             game.moveX = mx;
             game.moveZ = mz;
         }
+        // Edge-triggered exactly like SPACE, so a resting thumb does not
+        // retrigger the swing mid-arc.
+        if (s.touch.takeSwing()) game.swingRequested = true;
 
         uint64_t nowNs = SDL_GetTicksNS();
         double frameDt = (double)(nowNs - prevNs) * 1e-9;
@@ -1449,7 +1495,7 @@ void frameOnce(AppState& s) {
         SDL_GetWindowSize(window, &ww, &wh);
         if (ww > 0 && wh > 0) renderer.setPickUV(mx / (float)ww, my / (float)wh);
         if (brush.mode != 0 && (buttons & SDL_BUTTON_LMASK) && !uiWantsMouse() &&
-            renderer.pickValid()) {
+            !s.touch.engaged() && renderer.pickValid()) {
             BrickEdit e;
             e.mode = brush.mode;
             // REST space, not world: the brick volume is authored in rest
@@ -1485,8 +1531,12 @@ void frameOnce(AppState& s) {
                 lastPresented = pr;
             }
         }
+        uiSetCompact(s.touch.active);
         uiNewFrame(look, brush, fps, renderer.traceMs(), renderer.postMs(),
                    renderer.sploot(), reuseSkipPct, wantScreenshot);
+        // After the panel, so the overlay's foreground draw list is built with
+        // this frame's panel rect already recorded.
+        s.touch.draw();
 
         wgpu::SurfaceTexture surfaceTex;
         gpu.surface.GetCurrentTexture(&surfaceTex);

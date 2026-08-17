@@ -146,6 +146,7 @@ add_executable(clayfray
   src/renderer.cpp
   src/snapshot.cpp
   src/ctl.cpp
+  src/touch.cpp
   src/ui.cpp)
 target_include_directories(clayfray PRIVATE ${stb_SOURCE_DIR} ${cgltf_SOURCE_DIR})
 target_link_libraries(clayfray PRIVATE clayfray_deps imgui_lib)

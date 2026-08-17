@@ -22,6 +22,22 @@ void uiProcessEvent(const SDL_Event* event) {
     ImGui_ImplSDL3_ProcessEvent(event);
 }
 
+namespace {
+bool gCompact = false;
+float gPanel[4] = {0.f, 0.f, 0.f, 0.f}; // x0, y0, x1, y1
+} // namespace
+
+void uiSetCompact(bool compact) {
+    gCompact = compact;
+}
+
+void uiPanelRect(float& x0, float& y0, float& x1, float& y1) {
+    x0 = gPanel[0];
+    y0 = gPanel[1];
+    x1 = gPanel[2];
+    y1 = gPanel[3];
+}
+
 bool uiWantsMouse() {
     return ImGui::GetIO().WantCaptureMouse;
 }
@@ -35,6 +51,9 @@ void uiNewFrame(LookParams& look, BrushState& brush, float fps,
 
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(330, 0), ImGuiCond_FirstUseEver);
+    // On a phone an open panel IS the screen, and it sits exactly where the
+    // left thumb wants to be. Collapsed by default there, one tap from open.
+    if (gCompact) ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
     // WHAT BELONGS HERE: knobs whose right value is still a judgement call you
     // make by looking. Everything settled has been cut — the rig's grip and
     // alignment, the sword's placement, the clip controls for clips this asset
@@ -140,6 +159,18 @@ void uiNewFrame(LookParams& look, BrushState& brush, float fps,
     // The camera sliders (azimuth/elevation/distance/fov) are gone: drag-orbit
     // and the wheel do the first three better, and `--cam AZ,EL,DIST` plus ctl
     // `cam.*` cover the scripted case.
+
+    // Remembered for the touch controls, which yield whatever the panel covers.
+    // Read while the window is still current — outside Begin/End this would be
+    // whatever window happened to be last.
+    {
+        const ImVec2 p = ImGui::GetWindowPos();
+        const ImVec2 sz = ImGui::GetWindowSize();
+        gPanel[0] = p.x;
+        gPanel[1] = p.y;
+        gPanel[2] = p.x + sz.x;
+        gPanel[3] = p.y + sz.y;
+    }
     ImGui::End();
 }
 

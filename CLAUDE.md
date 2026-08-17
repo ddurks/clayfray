@@ -476,6 +476,49 @@ Headless has no keyboard, so the HERO's locomotion there is whatever
 different: the AI drives them in headless too (see M-FIST above), so a journal
 that wants them still has to `set ai.enabled 0`.
 
+### Touch controls (`src/touch.cpp`) — the mobile web hands
+
+A phone has no WASD and no SPACE, so the web build grew the same two inputs as
+an overlay: a dynamic left-thumb stick and one `SWING` button bottom-right.
+`CLAYFRAY_TOUCH=1` forces them on for desktop layout work, `=0` off; otherwise
+web probes `maxTouchPoints > 0 && (pointer: coarse)` at startup (a plain
+`maxTouchPoints` check fires on every convertible laptop) and ANY platform
+latches them on the first finger event.
+
+**The stick is real touch; the camera is still synthetic mouse.** SDL3
+synthesises mouse events from the primary finger, which is what already makes
+drag-orbit and the whole ImGui panel work under a thumb for free — so
+`touch.cpp` claims fingers only inside its two zones and `engaged()` tells
+`frameOnce` to ignore the synthetic mouse for orbit and sculpt while a control
+is held. Reimplementing orbit on finger events would have thrown that away.
+The price, and it is deliberate: **you cannot orbit while walking**, because
+SDL synthesises from the primary finger only and a second finger elsewhere
+produces no mouse motion at all.
+
+Two more things that are load-bearing rather than decoration:
+
+- **Layout is in ImGui screen points**, converted from the normalized finger
+  coords at the event boundary, and sized off the SHORT window edge. Hit test
+  and overlay therefore cannot disagree about where the button is, on any DPR
+  or in either orientation.
+- **The panel wins where it overlaps.** `uiPanelRect()` reports the look-dev
+  window's rect and both zones yield inside it, so a slider under a thumb moves
+  instead of walking the fighter. `uiSetCompact(touch.active)` then starts the
+  panel COLLAPSED on touch devices, because open it is most of a phone screen
+  and sits exactly where the left thumb wants to be.
+
+`web/shell.html` is the other half: `touch-action: none` +
+`overscroll-behavior: none` (a thumb on the stick would otherwise rubber-band
+the page and a two-finger drag would pinch-zoom the app), `100dvh` (plain
+`100vh` is the viewport with the URL bar HIDDEN, so the bottom of the canvas —
+where both controls live — hides under browser chrome), and the log toggle
+moved to the TOP right because a DOM element over the canvas eats the finger
+before SDL sees it, and bottom-right is the swing button.
+
+Movement is direction-only, not analog: `GameState::tick` normalizes the move
+vector to `kMaxSpeed` anyway, so the thumb and WASD produce literally the same
+input. Analog walk speed is a `GameState` change, not a touch one.
+
 ## Agent dev loop (PREFER THIS over rebuild-relaunch cycles)
 
 A running clayfray — windowed or `--serve` — polls `ctl/in/` every frame.
@@ -911,6 +954,7 @@ reference renders — diff against them by eye after a lighting/shading change.
 | `CLAYFRAY_AO` / `_DETAIL` / `_SHADOWK` | override look params (float) |
 | `CLAYFRAY_DEBUG_PICK=1` | print world vs REST position under the cursor (trap 6) |
 | `CLAYFRAY_DEBUG_BLADE` / `_DEBUG_PUNCH` | per-frame weapon sweep + position. A strike that visibly connects and carves nothing has four indistinguishable causes from the ledger alone (which just reads 0.0 ml): wrong brush selected, under the cutting speed, missed the target's capsules, or the rest-space edit fell outside the volume |
+| `CLAYFRAY_TOUCH=1` / `=0` | force the on-screen touch stick + swing button on/off, overriding the coarse-pointer probe (desktop layout work) |
 | `CLAYFRAY_NO_AFFINE=1` | draw the rest volume UNPOSED (pieces = 0), i.e. all three brushes side by side where they are authored. Answers "is the rig wrong or is the volume wrong?" in one keystroke. It used to select the 13-piece inverse-LBS warp; that path died with the armature, so this is no longer an A/B between two rigs |
 | `CLAYFRAY_DEBUG_REUSE=1` | name the input behind every re-trace that happens BETWEEN pose steps (a re-trace ON a pose step is the 12 Hz floor, so it stays quiet — silence means optimal) — a uniform (by slot NAME, e.g. "gobs (flying clay)") or the volume whose generation moved. Frame reuse is what makes motion affordable, so when the `[reuse] traced N of M` line collapses toward 0% skipped, this says which input refuses to settle |
 | `CLAYFRAY_TEST_ADDSTRESS` / `_TEST_NULLEDITS` | `--carve-test` variants (pool stress / null-edit JFA) |
