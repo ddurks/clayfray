@@ -62,9 +62,9 @@ struct Uniforms {
                          // z = piece box margin
   capsMeta: vec4f,       // x = capsule count, y = bounding radius
   capsCenter: vec4f,     // xyz = bounding center (posed)
-  capsules: array<vec4f, 32>, // 16 x {a,radius},{b,-}, posed per 12 Hz step
+  capsules: array<vec4f, MAX_CAPSULES * 2>, // 16 x {a,radius},{b,-}, posed per 12 Hz step
   gobMeta: vec4f,        // x = in-flight gob count (M4.6 conservation)
-  gobs: array<vec4f, 24>, // 12 x {pos, radius}, {color, -}; 12 Hz stepped
+  gobs: array<vec4f, MAX_GOBS * 2>, // 12 x {pos, radius}, {color, -}; 12 Hz stepped
   groundMeta: vec4f,     // w = clay top bound y (0 = field empty)
   swordA: vec4f,         // M4.7: hilt xyz, w = blade radius (0 = no sword)
   swordB: vec4f,         // tip xyz
@@ -322,7 +322,7 @@ fn albedoFor(p: vec3f, m: f32) -> vec3f {
     return fighterAlbedo(f, p);
   } else if (m > MAT_GOB - 0.5) {
     // in-flight gob: the wound albedo it was torn with
-    let gi = clamp(i32(m - MAT_GOB + 0.5), 0, 11);
+    let gi = clamp(i32(m - MAT_GOB + 0.5), 0, i32(MAX_GOBS) - 1);
     return u.gobs[gi * 2 + 1].rgb;
   } else if (m > MAT_GCLAY - 0.5) {
     return groundAlbedo(p);

@@ -1,6 +1,7 @@
 #include "snapshot.h"
 
 #include <cstring>
+#include <memory>
 
 // Snapshots are a desktop dev-loop feature end to end: ~80 MB of raw
 // same-build memory written to disk so a rebuild can drop you back into the
@@ -63,6 +64,14 @@ bool SnapWriter::close() {
     std::fclose(f_);
     f_ = nullptr;
     return ok;
+}
+
+// Backstop for an early return between open() and close(). Every path in
+// Renderer::saveSnapshot calls close() today, including the error one — this
+// is here so the next one that doesn't leaks nothing instead of leaking
+// silently.
+SnapWriter::~SnapWriter() {
+    if (f_) std::fclose(f_);
 }
 
 bool SnapReader::open(const std::string& path) {
@@ -138,14 +147,21 @@ std::vector<uint8_t> readbackBuffer(Gpu& gpu, wgpu::Buffer src, uint64_t size,
     enc.CopyBufferToBuffer(src, srcOffset, rb, 0, size);
     wgpu::CommandBuffer cmd = enc.Finish();
     gpu.queue.Submit(1, &cmd);
-    bool ok = false;
+    // The status flag OUTLIVES this call by construction. gpuBlockOn returns
+    // false whenever WaitAny reports anything but Success — device lost, or the
+    // documented Windows/Vulkan defect where a reused readback map never
+    // completes — and we return with the future still outstanding. Dawn then
+    // fires the callback later, during some processEvents() or at instance
+    // teardown, and a captured `&ok` would be a dangling stack write. Same
+    // discipline as the `alive_` sentinel on the AllowSpontaneous callbacks.
+    auto ok = std::make_shared<bool>(false);
     wgpu::Future f = rb.MapAsync(wgpu::MapMode::Read, 0, size,
                                  wgpu::CallbackMode::WaitAnyOnly,
-                                 [&ok](wgpu::MapAsyncStatus s, wgpu::StringView) {
-                                     ok = s == wgpu::MapAsyncStatus::Success;
+                                 [ok](wgpu::MapAsyncStatus s, wgpu::StringView) {
+                                     *ok = s == wgpu::MapAsyncStatus::Success;
                                  });
     if (!gpuBlockOn(gpu.instance, f, "snapshot readback")) return out;
-    if (!ok) return out;
+    if (!*ok) return out;
     out.resize(size);
     std::memcpy(out.data(), rb.GetConstMappedRange(0, size), size);
     rb.Unmap();

@@ -12,6 +12,14 @@
 // payloads are raw struct/GPU-buffer memory, not a portable interchange.
 class SnapWriter {
   public:
+    SnapWriter() = default;
+    // Owns a FILE*: a copy would fclose it twice. The destructor is the other
+    // half — open() acquires the handle and only close() released it, so any
+    // early return between the two leaked it silently.
+    SnapWriter(const SnapWriter&) = delete;
+    SnapWriter& operator=(const SnapWriter&) = delete;
+    ~SnapWriter();
+
     bool open(const std::string& path);
     void section(const char tag[4], const void* data, uint64_t size);
     bool close(); // false if any write failed
@@ -23,6 +31,11 @@ class SnapWriter {
 
 class SnapReader {
   public:
+    SnapReader() = default;
+    // Owns a FILE*; a copy double-frees it at the second destructor.
+    SnapReader(const SnapReader&) = delete;
+    SnapReader& operator=(const SnapReader&) = delete;
+
     bool open(const std::string& path);
     ~SnapReader();
     bool has(const char tag[4]) const;

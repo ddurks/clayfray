@@ -823,6 +823,32 @@ struct RunOpts {
 };
 
 #if CLAYFRAY_DEV_TOOLS
+// The GPU-health gate every headless mode returns through: 4 if a pipeline was
+// rejected or the device reported an uncaptured error, 0 otherwise.
+//
+// This exists because the two failures most likely to be catastrophic were the
+// only ones with NO exit code. A rejected pipeline is an invalid object every
+// later pass silently no-ops on (trap 8), and a bind-group layout mismatch
+// (trap 2) renders black while balancing the ledger perfectly at zero. Both
+// were diagnosed by asking a human to run `2>&1 | grep -c 'wgpu error'` — a
+// check CLAUDE.md documents and the same file's iteration rules tell agents not
+// to bother running. `--carve-test` grew a `carved <= 0` guard after trap 2
+// bit, but `--replay` and `--screenshot` still exited 0 straight through a
+// black screen. Now nothing does.
+//
+// 4 is deliberately distinct from 3 (conservation violation) and 1 (I/O).
+int gpuHealthExit() {
+    const int errs = gpuUncapturedErrorCount();
+    if (!gpuAnyPipelineFailed() && errs == 0) return 0;
+    std::fprintf(stderr,
+                 "[gpu] UNHEALTHY: %s, %d uncaptured error(s). The render is not "
+                 "trustworthy — see the [wgpu error] lines above.\n",
+                 gpuAnyPipelineFailed() ? "a pipeline failed to create"
+                                        : "pipelines ok",
+                 errs);
+    return 4;
+}
+
 // Every headless mode (--screenshot, --carve-test, --serve, --replay) is a
 // desktop harness: no swapchain, a fixed 1/60 s step regardless of wall clock,
 // and GPU backpressure held by blocking on the queue. A browser has none of
@@ -988,7 +1014,7 @@ int runHeadless(const RunOpts& o) {
             checkBreak(ctl, renderer, clock);
         }
         renderer.syncMeasurements();
-        return 0;
+        return gpuHealthExit();
     }
 
     // one queued edit drains per frame; +80 covers the longest test script
@@ -1093,7 +1119,7 @@ int runHeadless(const RunOpts& o) {
             return 3;
         }
     }
-    return 0;
+    return gpuHealthExit();
 }
 #endif // CLAYFRAY_DEV_TOOLS
 

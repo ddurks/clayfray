@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -80,6 +81,7 @@ std::string loadShader(const char* name) {
         if (line.rfind("//#constants", 0) == 0) {
             out << BrickSystem::wgslConstants();
             out << GroundClay::wgslConstants();
+            out << Renderer::wgslConstants();
         } else if (line.rfind(tag, 0) == 0) {
             std::string inc = line.substr(tag.size());
             while (!inc.empty() && (inc.back() == ' ' || inc.back() == '\r')) inc.pop_back();
@@ -135,6 +137,28 @@ wgpu::ShaderModule makeModule(wgpu::Device& device, const std::string& src,
 }
 
 } // namespace
+
+// The uniform block's ARRAY CAPACITIES, emitted so trace.wgsl and pick.wgsl can
+// size `capsules` and `gobs` off the C++ constants instead of retyping them.
+//
+// Trap 2's rule, applied to the two arrays its own fix missed: any array sized
+// by a C++ constant must be DERIVED in the WGSL, never written as a literal.
+// `marbles` was `array<vec4f, 32>` agreeing with the C++ by coincidence, and
+// when the coincidence broke EVERY bind group against that layout failed to
+// create — a healthy-looking boot rendering a black screen while --carve-test
+// exited 0. `capsules[32]` and `gobs[24]` were the same shape and survived that
+// fix; now they cannot drift either.
+std::string Renderer::wgslConstants() {
+    char buf[512];
+    const int need = std::snprintf(buf, sizeof(buf),
+                                   "// GENERATED from Renderer in src/renderer.h — "
+                                   "do not hand-copy into a shader.\n"
+                                   "const MAX_CAPSULES: u32 = %uu;\n"
+                                   "const MAX_GOBS: u32 = %uu;\n",
+                                   (uint32_t)kMaxCapsules, (uint32_t)kMaxGobs);
+    wgslConstantsFit(need, sizeof(buf), "Renderer");
+    return buf;
+}
 
 bool Renderer::init(Gpu& gpu, int width, int height) {
     gpu_ = &gpu;
@@ -1083,7 +1107,7 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     //
     // Under the brush rig `bone` carries the PIECE index instead of a bone
     // index (see setCharacter), so each capsule rides the clay it stands in for.
-    int cn = std::min((int)capsules_.size(), 16);
+    int cn = std::min((int)capsules_.size(), kMaxCapsules);
     std::array<std::array<float, 3>, kMaxPlayers> centers{};
     for (int pi = 0; pi < kMaxPlayers; pi++) {
       const Fighter& pf = fighters_[pi];
@@ -1221,7 +1245,7 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     static_assert(kSlotFighters + kFighterSlots * kMaxPlayers == kUniformSlots,
                   "fighter blocks must end exactly at kUniformSlots; keep the "
                   "Uniforms struct in trace.wgsl + pick.wgsl in sync");
-    int gn = std::min((int)gobs_.size(), 12);
+    int gn = std::min((int)gobs_.size(), kMaxGobs);
     for (int i = 0; i < gn; i++) {
         const Gob& g = gobs_[i];
         float* slotA = out[kSlotGobs + i * 2];
@@ -2132,7 +2156,7 @@ void Renderer::updatePunchCut(const LookParams& look) {
     }
 }
 
-void Renderer::updateBladeCut(const LookParams& look) {
+void Renderer::updateBladeCut() {
     // Player 0 wields the sword; anyone else on the field is a target.
     if (!swordWorld_.enabled || capsules_.empty()) {
         haveBlade_ = false;
@@ -2363,7 +2387,7 @@ void Renderer::collapseFighter(int i, const LookParams& look) {
 
         // 1. the burst: a few chunky gobs thrown clear
         const int want = std::max(0, look.death.burstGobs);
-        const int room = std::max(0, 12 - (int)gobs_.size());
+        const int room = std::max(0, kMaxGobs - (int)gobs_.size());
         const int ng = std::min(want, room);
         float thrown = 0.f;
         if (ng > 0 && look.death.burstFrac > 0.f) {
@@ -2631,7 +2655,7 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
         const bool timedOut = sliceWait_ >= kSliceWait;
         if (slicePending_ <= 0 || timedOut) {
             bool done = true;
-            if (sliceVol_ > kMinGob && (int)gobs_.size() < 12) {
+            if (sliceVol_ > kMinGob && (int)gobs_.size() < kMaxGobs) {
                 float v = std::min(sliceVol_, sploot_.debt);
                 sploot_.debt -= v;
                 Gob g{};
@@ -3104,7 +3128,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     // surviving one frame is a shove that keeps pushing after the fist has
     // withdrawn, which reads as the target being magnetically repelled.
     contacts_.clear();
-    updateBladeCut(look);
+    updateBladeCut();
     updatePunchCut(look);
 
     // conservation runs before packing so this frame's uniforms carry fresh
@@ -3323,17 +3347,18 @@ bool Renderer::screenshot(const std::string& path) {
     wgpu::CommandBuffer cmd = encoder.Finish();
     gpu_->queue.Submit(1, &cmd);
 
-    bool ok = false;
+    // shared, not `&ok`: the callback can fire after we return. See snapshot.cpp.
+    auto ok = std::make_shared<bool>(false);
     wgpu::Future f = readback.MapAsync(
         wgpu::MapMode::Read, 0, bufSize, wgpu::CallbackMode::WaitAnyOnly,
-        [&ok](wgpu::MapAsyncStatus status, wgpu::StringView msg) {
-            ok = status == wgpu::MapAsyncStatus::Success;
-            if (!ok)
+        [ok](wgpu::MapAsyncStatus status, wgpu::StringView msg) {
+            *ok = status == wgpu::MapAsyncStatus::Success;
+            if (!*ok)
                 std::fprintf(stderr, "readback map failed: %.*s\n", (int)msg.length,
                              msg.data);
         });
     if (!gpuBlockOn(gpu_->instance, f, "screenshot readback")) return false;
-    if (!ok) return false;
+    if (!*ok) return false;
 
     const uint8_t* data = (const uint8_t*)readback.GetConstMappedRange(0, bufSize);
     std::vector<uint8_t> pixels((size_t)width_ * height_ * 4);

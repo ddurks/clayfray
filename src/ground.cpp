@@ -41,7 +41,7 @@ struct BindBuf {
 // next to BrickSystem::wgslConstants(). %.9g round-trips a float exactly.
 std::string GroundClay::wgslConstants() {
     char buf[1024];
-    std::snprintf(
+    const int need = std::snprintf(
         buf, sizeof(buf),
         "// GENERATED from GroundClay in src/ground.h — do not hand-copy these\n"
         "// into a shader. G_BASE/G_HEIGHT/G_COLOR are base indices (in u32\n"
@@ -55,6 +55,7 @@ std::string GroundClay::wgslConstants() {
         "const G_COLOR: u32 = %uu;\n",
         kN, (double)kOrigin, (double)kTexel, (uint32_t)(kBaseOff / 4),
         (uint32_t)(kHeightOff / 4), (uint32_t)(kColorOff / 4));
+    wgslConstantsFit(need, sizeof(buf), "GroundClay");
     return buf;
 }
 

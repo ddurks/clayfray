@@ -7,13 +7,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 
 namespace {
 
 // Volume geometry lives in BrickSystem (brick.h) — the members below are the
 // same constants this file used to keep a private copy of.
 using K = BrickSystem;
-constexpr const float* kOrigin = K::kOrigin;
 
 wgpu::ShaderModule makeModule(wgpu::Device& device, const std::string& src,
                               const char* label) {
@@ -99,7 +99,7 @@ struct EditParamsCpu {
 // different SPAN lands in a different brick.
 std::string BrickSystem::wgslConstants() {
     char buf[2048];
-    std::snprintf(
+    const int need = std::snprintf(
         buf, sizeof(buf),
         "// GENERATED from BrickSystem in src/brick.h — do not edit here, and\n"
         "// do not hand-copy these into a shader. Change kGrid and rebuild.\n"
@@ -136,12 +136,12 @@ std::string BrickSystem::wgslConstants() {
         (uint32_t)(kIndOff / 4), (uint32_t)(kSeedOff / 4),
         (uint32_t)(kCoarseOff / 4), (uint32_t)(kVolumeBytes / 4),
         (uint32_t)kMaxFighters, (uint32_t)kPiecesPerFighter);
+    wgslConstantsFit(need, sizeof(buf), "BrickSystem");
     return buf;
 }
 
 bool BrickStore::init(Gpu& gpu) {
     wgpu::Device& dev = gpu.device;
-    using K = BrickSystem;
     volume = makeStorage(dev, K::kVolumeBytes * K::kMaxFighters, "brick volume store");
     distPool = makeStorage(dev, K::kDistBytes * K::kMaxFighters, "brick dist pool");
     albedoPool =
@@ -283,14 +283,15 @@ void BrickSystem::debugStats(const char* label) {
     enc.CopyBufferToBuffer(counters_, 0, rb, cells * 4ull, kCounterBytes);
     wgpu::CommandBuffer cmd = enc.Finish();
     gpu_->queue.Submit(1, &cmd);
-    bool ok = false;
+    // shared, not `&ok`: the callback can fire after we return. See snapshot.cpp.
+    auto ok = std::make_shared<bool>(false);
     wgpu::Future f = rb.MapAsync(wgpu::MapMode::Read, 0, desc.size,
                                  wgpu::CallbackMode::WaitAnyOnly,
-                                 [&ok](wgpu::MapAsyncStatus s, wgpu::StringView) {
-                                     ok = s == wgpu::MapAsyncStatus::Success;
+                                 [ok](wgpu::MapAsyncStatus s, wgpu::StringView) {
+                                     *ok = s == wgpu::MapAsyncStatus::Success;
                                  });
     if (!gpuBlockOn(gpu_->instance, f, "debugStats readback")) return;
-    if (!ok) return;
+    if (!*ok) return;
     const uint32_t* d = (const uint32_t*)rb.GetConstMappedRange(0, desc.size);
     uint32_t alloc = 0, fresh = 0, inside = 0, maxIdx = 0;
     for (uint32_t i = 0; i < cells; i++) {
@@ -328,14 +329,15 @@ void BrickSystem::debugScanField() {
     enc.CopyBufferToBuffer(distPool, distBase(), rb, cells * 4ull, distBytes);
     wgpu::CommandBuffer cmd = enc.Finish();
     gpu_->queue.Submit(1, &cmd);
-    bool ok = false;
+    // shared, not `&ok`: the callback can fire after we return. See snapshot.cpp.
+    auto ok = std::make_shared<bool>(false);
     wgpu::Future f = rb.MapAsync(wgpu::MapMode::Read, 0, desc.size,
                                  wgpu::CallbackMode::WaitAnyOnly,
-                                 [&ok](wgpu::MapAsyncStatus s, wgpu::StringView) {
-                                     ok = s == wgpu::MapAsyncStatus::Success;
+                                 [ok](wgpu::MapAsyncStatus s, wgpu::StringView) {
+                                     *ok = s == wgpu::MapAsyncStatus::Success;
                                  });
     if (!gpuBlockOn(gpu_->instance, f, "debugScanField readback")) return;
-    if (!ok) return;
+    if (!*ok) return;
     const uint32_t* ind = (const uint32_t*)rb.GetConstMappedRange(0, desc.size);
     const uint16_t* dist = (const uint16_t*)(ind + cells);
     auto halfToFloat = [](uint16_t h) -> float {
@@ -380,14 +382,15 @@ void BrickSystem::debugScanField() {
     cenc.CopyBufferToBuffer(volume, volBase() + kCoarseOff, crb, 0, cells * 4ull);
     wgpu::CommandBuffer ccmd = cenc.Finish();
     gpu_->queue.Submit(1, &ccmd);
-    bool cok = false;
+    // shared, not `&ok`: the callback can fire after we return. See snapshot.cpp.
+    auto cok = std::make_shared<bool>(false);
     wgpu::Future cf = crb.MapAsync(wgpu::MapMode::Read, 0, cdesc.size,
                                    wgpu::CallbackMode::WaitAnyOnly,
-                                   [&cok](wgpu::MapAsyncStatus s, wgpu::StringView) {
-                                       cok = s == wgpu::MapAsyncStatus::Success;
+                                   [cok](wgpu::MapAsyncStatus s, wgpu::StringView) {
+                                       *cok = s == wgpu::MapAsyncStatus::Success;
                                    });
     gpuBlockOn(gpu_->instance, cf, "coarse-field readback");
-    if (cok) {
+    if (*cok) {
         const float* cd = (const float*)crb.GetConstMappedRange(0, cdesc.size);
         int neg = 0, tiny = 0, nan = 0;
         float mn = 1e9f, mx = -1e9f;
