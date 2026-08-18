@@ -25,6 +25,15 @@ fn gColor(i: u32) -> u32 { return gField[G_COLOR + i]; }
 // vertical-distance Lipschitz guard: tolerates surface slope up to ~3
 const G_KLIP: f32 = 0.3;
 
+// Metres to the nearest clay-bearing tile, conservative (src/ground.cpp's
+// rebuildCoarse). One fetch, no filtering: it is a LOWER BOUND, so blockiness
+// costs step length and never correctness.
+fn gCoarseDist(xz: vec2f) -> f32 {
+  let g = (xz - vec2f(G_ORIGIN)) / G_CTEXEL;
+  let c = clamp(vec2i(floor(g)), vec2i(0), vec2i(G_CN - 1));
+  return bitcast<f32>(gField[G_COARSE + u32(c.x) + u32(c.y) * u32(G_CN)]);
+}
+
 fn gTexIdx(t: vec2i) -> u32 {
   let c = clamp(t, vec2i(0), vec2i(G_N - 1));
   return u32(c.x) + u32(c.y) * u32(G_N);
@@ -76,8 +85,34 @@ fn groundClayDist(p: vec3f) -> f32 {
   if (bound > 0.05) {
     return bound;
   }
+  // FAR FROM ANY CLAY -> take a real step. This is the line that fixes the
+  // black wash-out, and the bug it replaces is worth stating because the old
+  // value was perfectly safe and still catastrophic:
+  //
+  //   A column with no clay must return something POSITIVE or the field wins
+  //   the hit on bare floor. It returned a 6 mm constant. The march advances
+  //   by 0.85*d, so 6 mm is a 5.1 mm stride, and 256 steps buys 1.3 m of
+  //   travel. Any ray needing further than that — which is EVERY ray at a low
+  //   camera angle, since a grazing ray crosses metres of floor to reach it —
+  //   ran out of steps, returned a miss, and fell through to background().
+  //   Black. And because the region that lands here is gated on maxTop, which
+  //   ground.cpp's maxH_ only ever RAISES, one tall pile put most of the floor
+  //   into the crawl permanently. Measured on death.journal at 640x360: 14.2%
+  //   of the frame was downward rays that had exhausted their step budget,
+  //   against 8.4% with little clay — and a downward ray cannot legitimately
+  //   miss an infinite floor.
+  //
+  // The honest bound was never 6 mm, it was "how far is the nearest clay",
+  // which is exactly what the coarse DT holds. Still conservative, so it
+  // cannot tunnel; just no longer pessimistic by two orders of magnitude.
+  let cd = gCoarseDist(p.xz);
+  if (cd > 0.006) {
+    return max(cd, bound);
+  }
   // no clay in this texel -> yield to the real floor (a positive value that
-  // clears the march epsilon, so the ground never wins the hit here)
+  // clears the march epsilon, so the ground never wins the hit here). Only
+  // reached within ~2 coarse tiles of actual clay now, where a small step is
+  // genuinely required.
   if (groundThicknessAt(p.xz) < G_THMIN) {
     return max(bound, 0.006);
   }

@@ -52,9 +52,13 @@ std::string GroundClay::wgslConstants() {
         "const G_TEXEL: f32 = %.9g;\n"
         "const G_BASE: u32 = %uu;\n"
         "const G_HEIGHT: u32 = %uu;\n"
-        "const G_COLOR: u32 = %uu;\n",
+        "const G_COLOR: u32 = %uu;\n"
+        "const G_COARSE: u32 = %uu;\n"
+        "const G_CN: i32 = %d;\n"
+        "const G_CTEXEL: f32 = %.9g;\n",
         kN, (double)kOrigin, (double)kTexel, (uint32_t)(kBaseOff / 4),
-        (uint32_t)(kHeightOff / 4), (uint32_t)(kColorOff / 4));
+        (uint32_t)(kHeightOff / 4), (uint32_t)(kColorOff / 4),
+        (uint32_t)(kCoarseOff / 4), kCoarse, (double)kCoarseTexel);
     wgslConstantsFit(need, sizeof(buf), "GroundClay");
     return buf;
 }
@@ -175,6 +179,56 @@ void GroundClay::splat(float x, float z, float volumeM3, const float col[3]) {
     // AO/penumbra across the whole scene and phantom-hits grazing rays.
     // Small pad covers coarse-mirror underestimation of the true peak.
     maxH_ = std::max(maxH_, thicknessAt(op.x, op.z) + 0.15f * amp + 0.003f);
+    coarseDirty_ = true;
+}
+
+// Chamfer distance transform over the 64x64 mirror: metres from each tile to
+// the nearest tile that holds clay. CONSERVATIVE by construction, because the
+// march steps by whatever this returns and a single overestimate anywhere
+// tunnels a ray through a pile.
+//
+// Three separate slacks are subtracted, and all three are needed:
+//   - the sample can sit anywhere inside its own tile   (~0.71 tiles)
+//   - the clay can sit anywhere inside the found tile   (~0.71 tiles)
+//   - mirror_ tests tile CENTRES against the splat radius, so a splat's rim
+//     can deposit real clay into a tile the mirror calls empty (~0.5 tiles)
+// Two tiles of slack covers all three with room over; at 5.5 cm per tile that
+// costs 11 cm of step length and buys correctness that is not negotiable.
+void GroundClay::rebuildCoarse() {
+    static_assert(kCoarse == kMirror, "the DT is built from the thickness mirror");
+    constexpr int N = kCoarse;
+    constexpr float kFar = 1e9f;
+    // chamfer weights: 3 orthogonal / 4 diagonal, the standard integer
+    // approximation to Euclidean; divide by 3 at the end.
+    float d[N * N];
+    for (int i = 0; i < N * N; i++) d[i] = mirror_[i] > 0.f ? 0.f : kFar;
+    auto at = [&](int x, int y) -> float {
+        return (x < 0 || y < 0 || x >= N || y >= N) ? kFar : d[x + y * N];
+    };
+    for (int y = 0; y < N; y++) {
+        for (int x = 0; x < N; x++) {
+            float v = d[x + y * N];
+            v = std::min(v, at(x - 1, y) + 3.f);
+            v = std::min(v, at(x, y - 1) + 3.f);
+            v = std::min(v, at(x - 1, y - 1) + 4.f);
+            v = std::min(v, at(x + 1, y - 1) + 4.f);
+            d[x + y * N] = v;
+        }
+    }
+    for (int y = N - 1; y >= 0; y--) {
+        for (int x = N - 1; x >= 0; x--) {
+            float v = d[x + y * N];
+            v = std::min(v, at(x + 1, y) + 3.f);
+            v = std::min(v, at(x, y + 1) + 3.f);
+            v = std::min(v, at(x + 1, y + 1) + 4.f);
+            v = std::min(v, at(x - 1, y + 1) + 4.f);
+            d[x + y * N] = v;
+        }
+    }
+    for (int i = 0; i < N * N; i++) {
+        const float tiles = d[i] / 3.f;
+        coarseDist_[i] = std::max(0.f, (tiles - 2.f) * kCoarseTexel);
+    }
 }
 
 float GroundClay::thicknessAt(float x, float z) const {
@@ -242,6 +296,9 @@ bool GroundClay::load(SnapReader& r) {
     }
     if (!r.read("GMAX", &maxH_, sizeof(maxH_))) return false;
     if (!r.read("GMIR", mirror_, sizeof(mirror_))) return false;
+    // Derived from mirror_, so it needs no section of its own — but it MUST be
+    // rebuilt, or a restored scene marches against the previous one's clay.
+    coarseDirty_ = true;
     basePending_ = meta[2] != 0;
     pending_.clear();
     return true;
@@ -249,6 +306,13 @@ bool GroundClay::load(SnapReader& r) {
 #endif // CLAYFRAY_DEV_TOOLS
 
 void GroundClay::encode(wgpu::CommandEncoder& enc) {
+    // Before anything else: the march reads this table every step, and a stale
+    // one is the difference between a 40 cm stride and a 6 mm crawl.
+    if (coarseDirty_) {
+        coarseDirty_ = false;
+        rebuildCoarse();
+        gpu_->queue.WriteBuffer(field, kCoarseOff, coarseDist_, sizeof(coarseDist_));
+    }
     if (basePending_) {
         basePending_ = false;
         gen_++;
@@ -256,6 +320,7 @@ void GroundClay::encode(wgpu::CommandEncoder& enc) {
         // be baked by initBase, so it needs no clear
         enc.ClearBuffer(field, kHeightOff, kTexelBytes);
         enc.ClearBuffer(field, kColorOff, kTexelBytes);
+        coarseDirty_ = true; // no clay left; every tile is far from it again
         wgpu::ComputePassEncoder pass = enc.BeginComputePass();
         pass.SetPipeline(initPipe_);
         pass.SetBindGroup(0, initG_);

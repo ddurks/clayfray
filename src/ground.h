@@ -55,7 +55,22 @@ class GroundClay {
     static constexpr uint64_t kBaseOff = 0;
     static constexpr uint64_t kHeightOff = kRegionStride;
     static constexpr uint64_t kColorOff = kRegionStride * 2;
-    static constexpr uint64_t kFieldBytes = kColorOff + kRegionStride;
+    // 0x300000  coarse  64*64 f32   metres to the nearest clay-bearing tile
+    //
+    // A FOURTH region, and it is a march accelerator rather than scene data.
+    // groundClayDist has to return something POSITIVE for a column with no
+    // clay in it, or the field wins the hit on bare floor — and it used to
+    // return a 6 mm constant, which is safe and catastrophic: the march steps
+    // by 0.85*d, so 6 mm caps a ray at 256 * 5.1 mm = 1.3 m of travel. A
+    // grazing ray needs several metres to reach the floor and simply died,
+    // falling through to background() — black. This region is what lets that
+    // column say "the nearest clay is 40 cm away" instead.
+    static constexpr int kCoarse = 64; // == kMirror; the DT is built from it
+    static constexpr float kCoarseTexel = 3.5f / kCoarse;
+    static constexpr uint64_t kCoarseBytes = (uint64_t)kCoarse * kCoarse * 4;
+    static constexpr uint64_t kCoarseStride = (kCoarseBytes + kAlign - 1) & ~(kAlign - 1);
+    static constexpr uint64_t kCoarseOff = kRegionStride * 3;
+    static constexpr uint64_t kFieldBytes = kCoarseOff + kCoarseStride;
 
     // The region map above as WGSL, stitched into every shader root by the
     // renderer's `//#constants` directive alongside BrickSystem's block. The
@@ -107,6 +122,12 @@ class GroundClay {
     bool basePending_ = true;
     uint32_t gen_ = 0;
     float maxH_ = 0.f;
+    // Lateral distance (metres, conservative) from each coarse tile to the
+    // nearest tile holding clay. Rebuilt from mirror_ whenever clay lands, so
+    // it needs no snapshot section of its own — GMIR already persists mirror_.
+    void rebuildCoarse();
+    float coarseDist_[kCoarse * kCoarse] = {};
+    bool coarseDirty_ = true;
     // 64x64 thickness mirror so gobs land on top of existing piles
     static constexpr int kMirror = 64;
     float mirror_[kMirror * kMirror] = {};
