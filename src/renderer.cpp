@@ -3137,6 +3137,7 @@ void Renderer::respawnFighter(int i, const LookParams& look) {
     f.bisectT = 0.f;
     f.sev[0] = Fighter::Severed{};
     f.sev[1] = Fighter::Severed{};
+    f.sevBase.clear(); // the frozen pose goes with the old body
     f.respawnT = 0.f;
 
     // Come back at a distance. An opponent reappears on the far side of the

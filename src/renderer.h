@@ -396,6 +396,12 @@ class Renderer {
         Severed sev[2];          // 0 = below the cut, 1 = above it
         float bisectRestY = 0.f; // the cut plane, in the volume's REST space
         float bisectT = 0.f;     // seconds left before the halves sploot
+        // The rig FROZEN at the instant of the cut. Stopping the sim is not
+        // enough on its own: updateBrushRig poses off `disp` and the 12 Hz
+        // clock, so the mitts kept bobbing and the body kept breathing on a
+        // corpse in two pieces. Each frame the halves are rebuilt from this
+        // rather than re-rigged, so they fall limply, hands included.
+        std::vector<AffinePiece> sevBase;
         float respawnT = 0.f; // s left face-down
     };
 
@@ -494,8 +500,14 @@ class Renderer {
     // M-DEATH: in play AND still standing. This is the predicate gameplay
     // wants — a collapsed fighter has no body to collide with, steer at, or
     // punch — while playerEnabled() stays "is this slot in play at all".
+    // A body cut in two is no longer a combatant, even in the seconds before
+    // the collapse actually runs: it has nothing to steer with, nothing to
+    // collide as, and nothing to punch you with. Without the `bisected` term
+    // the sim kept walking, turning and bobbing a fighter that had visibly
+    // been severed — the halves slid around still animating.
     bool playerAlive(int i) const {
-        return playerEnabled(i) && i >= 0 && i < kMaxPlayers && !fighters_[i].dead;
+        return playerEnabled(i) && i >= 0 && i < kMaxPlayers && !fighters_[i].dead &&
+               !fighters_[i].bisected;
     }
     // M-MASS: how much of this fighter's clay is still on it, 1 = untouched.
     // The SAME number M-DEATH thresholds on, expressed the other way up, so a
