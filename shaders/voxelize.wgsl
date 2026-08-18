@@ -16,6 +16,15 @@ const IND_IDX_MASK: u32 = 0x000FFFFFu;
 @group(0) @binding(0) var<storage, read> mPos: array<f32>;      // xyz + smooth normal, 6/vertex
 @group(0) @binding(1) var<storage, read> mIdx: array<u32>;      // 3 per tri
 @group(0) @binding(2) var<storage, read> mCol: array<f32>;      // rgb per vertex
+// A UNIFORM, not a storage buffer, and that is not a style choice: `meshFill`
+// reaches 8 of the 8 storage bindings core WebGPU guarantees a stage (trap 8),
+// so a ninth would fail to create the voxelizer on a conformant mobile browser
+// while working perfectly on this desk. Uniforms have their own, larger budget.
+// Binding 3 has been free since bWeights went with the skeleton.
+struct VoxParams {
+  bodyColor: vec4f, // rgb = this fighter's clay colour, LINEAR
+}
+@group(0) @binding(3) var<uniform> vox: VoxParams;
 // M-RIG: group(0) binding(3) used to be `mSkin` (per-vertex joint ids +
 // weights). It fed nothing but the packed per-voxel bone weights below, which
 // no shader ever read back. Binding numbers of the survivors are deliberately
@@ -279,22 +288,21 @@ fn meshFill(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid
       bDist[brick * 256u + vi / 2u] = pack2x16float(vec2f(d0, d1));
     }
 
-    // albedo from the nearest triangle's vertices. The 12-slot bone-influence
-    // accumulation that used to run here (three verts x four slots, merged and
-    // sorted to a top-2) went with bWeights — it was per-VOXEL work feeding a
-    // buffer nobody read.
-    var albedo = vec3f(0.15, 0.47, 0.53);
-    if (hit.tri != 0xFFFFFFFFu) {
-      let i0 = mIdx[hit.tri * 3u];
-      let i1 = mIdx[hit.tri * 3u + 1u];
-      let i2 = mIdx[hit.tri * 3u + 2u];
-      let c0 = vec3f(mCol[i0 * 3u], mCol[i0 * 3u + 1u], mCol[i0 * 3u + 2u]);
-      let c1 = vec3f(mCol[i1 * 3u], mCol[i1 * 3u + 1u], mCol[i1 * 3u + 2u]);
-      let c2 = vec3f(mCol[i2 * 3u], mCol[i2 * 3u + 1u], mCol[i2 * 3u + 2u]);
-      albedo = c0 * hit.bary.x + c1 * hit.bary.y + c2 * hit.bary.z;
-    }
-    // clay mottle so imported flat colors still read handled
-    albedo *= (0.82 + 0.32 * fbm(w * 9.0));
+    // ONE COLOUR, SKIN AND CORE. This used to interpolate the nearest
+    // triangle's VERTEX colours, which meant the imported skin was whatever the
+    // .glb happened to carry (near-white on this asset) while any brick
+    // allocated later got edit.wgsl's body colour — a fighter that read light
+    // grey until you cut it open and found clay of a different colour
+    // underneath. Both now read the same per-fighter uniform through the same
+    // mottle field, so a wound matches the body it is in by construction.
+    //
+    // mCol is therefore UNREAD by this entry point, and because these
+    // pipelines use auto layouts that means Dawn drops binding 2 from the
+    // derived layout entirely — so brick.cpp must not list it in the bind
+    // group either, or CreateBindGroup fails outright (trap 8's mechanism,
+    // seen from the other side). The buffer is still uploaded: tinting BY
+    // vertex colour is the obvious thing a future asset would want.
+    let albedo = charBodyAlbedo(w, vox.bodyColor.rgb);
     bAlbedo[brick * 512u + vi] = pack4x8unorm(vec4f(clamp(albedo, vec3f(0.0), vec3f(1.0)), 1.0));
   }
 }

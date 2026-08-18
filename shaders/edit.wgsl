@@ -30,6 +30,12 @@ struct EditParams {
   brushB: vec4f,      // xyz = second capsule endpoint (== brush.xyz for a sphere)
   // x = capsule count, y = dent amplitude (m), z = paint strength
   parms: vec4f,
+  // rgb = this fighter's clay colour, LINEAR. Distinct from `color` above,
+  // which is the BRUSH's colour (what an add deposits, what a paint stains
+  // with): this is what the body is made of, and it is what a freshly
+  // allocated interior brick gets so a deep carve exposes the same clay it cut
+  // through rather than a hardcoded one.
+  bodyColor: vec4f,
   // R19: capsules 1..count-1 of a fused brush, as (A, -) (B, -) pairs sharing
   // brush.w. SIZED OFF THE GENERATED CONSTANT — a literal here that disagrees
   // with the CPU struct fails every bind group against this layout, and the app
@@ -349,13 +355,13 @@ fn fill(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: ve
       // unpainted (black) voxels
       writeAlbedo = true;
       if (mode != 2) {
-        albedo = charBodyAlbedo(w);
+        albedo = charBodyAlbedo(w, ep.bodyColor.rgb);
       }
     }
     if (mode == 0) {
       dNew = charBodyAnalytic(w) / VOXEL;
       writeAlbedo = true;
-      albedo = charBodyAlbedo(w);
+      albedo = charBodyAlbedo(w, ep.bodyColor.rgb);
     } else if (mode == 1) {
       let ds = brushSdf(w) / VOXEL;
       dNew = softCarve(dOld, ds);

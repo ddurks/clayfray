@@ -144,7 +144,18 @@ fn charBodyAnalytic(p: vec3f) -> f32 {
   d += (fbm(p * 5.0) - 0.5) * 0.022;
   return d;
 }
-fn charBodyAlbedo(p: vec3f) -> vec3f {
-  // dusky clay cyan, mottled like handled plasticine
-  return toLinear(vec3f(0.15, 0.47, 0.53)) * (0.82 + 0.32 * fbm(p * 9.0));
+// Mottling, "handled plasticine". A 3D field in REST space, not a surface
+// texture — which is the whole reason a cut through a fighter matches the skin
+// around it: the voxelizer and edit.wgsl evaluate this at the same point at the
+// same frequency, so the pattern is continuous through the solid.
+fn clayMottle(p: vec3f) -> f32 {
+  return 0.82 + 0.32 * fbm(p * 9.0);
+}
+// `base` is LINEAR rgb and comes from the caller's own uniform — per fighter,
+// so two bodies on the field are two colours. It used to be a hardcoded cyan
+// here while the imported SKIN took its colour from the mesh's vertex colours,
+// which is how a fighter came out light grey outside and teal the moment you
+// opened it.
+fn charBodyAlbedo(p: vec3f, base: vec3f) -> vec3f {
+  return base * clayMottle(p);
 }

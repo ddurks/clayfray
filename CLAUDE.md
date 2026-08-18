@@ -534,6 +534,129 @@ while each fighter's velocity is private to whatever drives it — which is why
 Correction is symmetric (half each); pushing only the "second" body would make
 collision depend on player index and let the hero bulldoze.
 
+## Weight, hitstop, and the glance (M-MASS, R22)
+
+Three mechanics that all answer the same question — what a landing hit is
+worth — and all three read one new quantity: how SQUARE the hit was.
+
+**A fighter weighs what is left of it.** `Renderer::massFrac` is M-DEATH's
+damage number the other way up (`1 - carved/fighterVolume_`), so a body cannot
+be visibly whole and secretly light. `Body::invMass` scales knockback and the
+body-collision push-out and NOTHING ELSE: a hurt fighter is easier to shove,
+not faster on its feet. This is Smash's percentage mechanic with the percentage
+DERIVED rather than invented — 91 litres at full, ~46 at the collapse
+threshold, so the last hits of a fight throw twice as far as the first and the
+endgame accelerates without a scripted stage.
+
+Reading the ledger here is legal for exactly the reason it is legal for the
+death threshold and ILLEGAL for resistance (see M-PHYS): mass is
+SLOW-VARYING. A frame of readback lag on a number that moves a fraction of a
+percent per hit is invisible; a frame of lag on a strike's own clock is not.
+The push-out split is mass-weighted rather than half-each, which keeps the
+property that actually mattered — the rule depends on what a body WEIGHS, never
+on its player index, so the hero still cannot bulldoze by virtue of being
+first.
+
+**Hitstop is the animator's held pose.** `phys.hitstop` (0.085 s ≈ one 12 Hz
+step) stops the whole world dead on a landing hit. It is not a fighting-game
+trick dressed up as clay — holding a pose on the impact frame is what a
+stop-motion animator does, and everything visible here is already quantized to
+that grid.
+
+- **It freezes the SIM, not just the display.** `GameState::stepWorld` consumes
+  its ticks without stepping anything and RETURNS HOW MANY IT ACTUALLY RAN; all
+  three callers (windowed, `--serve`, `--replay`) advance their render clock by
+  that return value instead of by the tick budget. Miss one and the world
+  slides underneath a frozen picture and the journal's pose ticks drift off the
+  world they describe.
+- **A HOLD IS BINARY, and a rising edge is not enough to gate it.** Both were
+  learned the expensive way, with `CLAYFRAY_DEBUG_IMPACT=1`:
+  - It was `hitstop * hit`, which measured **0.006–0.051 s** over a real AI
+    brawl — one to three ticks, never even half its nominal length, invisible.
+    An animator holds a frame or does not. Now any bite past `hitstopBite`
+    holds for the full step and anything under it holds not at all.
+  - Contact FLICKERS. `updatePunchCut` drops a fist below `cutSpeed`, so one
+    punch reports a rising edge on alternating frames as it slows at the apex
+    of its arc, and the idle mitt is also inside the target at punching range
+    and reports its own. A rising-edge test alone re-armed several times per
+    punch; keyed per weapon it still put 20 freezes in 5 s, which reads as the
+    game chugging. `hitstopCool` is therefore ONE GLOBAL timer — hitstop is a
+    property of the moment, not of the weapon.
+- **A held frame is CHEAPER than a moving one.** No traced input changes, so
+  frame reuse skips it: carve-duel reports 9.9% of frames skipped where it used
+  to report 0.0%.
+- **A fixed-frame journal now covers less SIM time**, because held frames are
+  real frames that ran no world. Measured -6% carved on carve-duel from hitstop
+  alone. The replay loop keeps going while journal entries are still pending
+  (`kHoldSlack`) rather than dropping the tail, since a scenario that stops
+  firing half way through is a silently weaker gate, not a failing one.
+
+**A fist skids off clay; it does not bore through it.** `impact.glance` refuses
+a fraction of the mitt's penetration and pushes the piece back out along the
+surface normal (`Renderer::Fighter::glance`, applied in `updateBrushRig` as a
+world translation on the mitt's transform). The punch arc keeps moving it
+TANGENTIALLY, so the wound turns from a bore into a furrow — with no second
+edit mode and no extra dispatch, because the rupture was always carved along
+the fist's own path between two frames.
+
+- **SET, not accumulated.** Adding a displacement per frame is a velocity
+  wearing a length's clothes: unbounded while a fist stays buried, and worse at
+  a higher frame rate. Assigned, it is a positional response with a fixed
+  point, because `updatePunchCut` reads the fist's world position off the very
+  piece the offset moved: an animated drive of `p0` settles at an offset of
+  `glance*p0/(1+glance)` and a real penetration of **`p0/(1+glance)`**,
+  frame-rate independent.
+- **Do NOT also push the carve out.** The mitt has already moved, so the fist
+  path IS the glanced path; adding the offset again at the edit counts it twice
+  and cuts a wound shallower than the fist that made it.
+- **A BLADE DOES NOT GLANCE.** Cutting through is what it is for, and the
+  asymmetry is the point: the sword opens you, the fist skids and scrapes.
+- **The normal is taken at the DEEPEST sample**, not at first contact. The dent
+  is placed by walking the deepest point back along it and the dent's whole
+  volume argument rests on that axis being the surface normal THERE; squareness
+  now reads off the same vector, so an entry normal would grade a punch by how
+  it arrived rather than by how it landed.
+
+**DO NOT GRADE A HIT BY `-dot(travel, normal)`.** It is the obvious way to say
+"how square was this", it is correct for a rigid impulse, and it is wrong for
+anything sampled a frame at a time — which is everything here. A punch
+RECIPROCATES, so at the instant it is deepest its radial velocity is ~0 and the
+frame delta is whatever the two bodies were doing sideways. Measured over one
+brawl it printed **0.88, 0.00, 0.69, 0.00, 0.29** on consecutive contacts of the
+same punch. It shipped for one revision as a `grazeKnock` multiplier on the
+shove, the stagger, the hitstop and the dent amplitude, and it quartered all
+four on alternating frames — which is most of why the whole feature read as
+"nothing changed".
+
+`bite` is the stable form of the same idea: it is penetration past the surface,
+and a weapon skidding along the skin does not penetrate. The two multiplied
+together were double-counting a quantity that was only trustworthy once. The
+contact NORMAL survives and is still used — but only where it is read at the
+DEEPEST sample and is therefore stable: the glance push-out direction and the
+dent axis, both renderer-side. The dent's amplitude is graded by
+`maxPen/fistR` for the same reason.
+
+**`CLAYFRAY_DEBUG_IMPACT=1` is how you tell a mechanic that is wired-but-scaled-
+to-nothing from one that never fires**, and every number above came out of it.
+It prints per contact: bite, the stagger factor, whether it cleared
+`hitstopBite`, whether it froze the world, the live hold, and the target's
+`invMass`; plus per glanced fist: penetration and the resulting offset. A
+feature that "does nothing" almost always shows up here as a plausible number
+two orders of magnitude too small.
+
+**Mass is a SLOW-BURN mechanic and that is by construction.** A fighter is
+~91 litres and ~40 connecting punches from death, so five seconds of continuous
+jabbing moves `invMass` from 1.00 to **1.03**. It is not visible early in a
+fight and is not meant to be; it is what makes the END of one accelerate. It
+also multiplies a shove that was deliberately cut to a nudge (`knockForce`
+26 -> 7), so the term you can actually SEE is the stagger — `phys.stagger * hit
+* invMass` — not the slide.
+
+```sh
+tools/ctl.sh "set phys.massKnock 0" "set phys.hitstop 0" "set impact.glance 0"
+```
+...restores the pre-R22 fight exactly.
+
 ## Edit modes: the fused brush, the dent, the stamp (R19–R21)
 
 `edit.wgsl` has five modes now — `0` bake, `1` carve, `2` add, `3` dent,
@@ -622,9 +745,75 @@ tools/ctl.sh "set impact.dentDepth 0.016" "set impact.punchCarve 0.4"
 tools/ctl.sh "set impact.bruise 0.8" "set impact.smear 0"
 ```
 
+## What a fighter is MADE OF (colour)
+
+`look.bodyColor[p]` is one linear RGB per player slot — p0 light blue, p1 light
+green — and it is **the colour all the way through**. That is the point of it,
+and it is why it is here rather than in the .glb.
+
+The volume used to take its SURFACE albedo from the mesh's vertex colours (near
+white on this asset) while any brick allocated LATER took a hardcoded clay cyan
+from `charBodyAlbedo`. So a fighter read light grey until you cut it open and
+found different clay underneath. Both sources now read the same per-fighter
+value through the same rest-space `clayMottle(p)` at the same frequency, so the
+mottle is CONTINUOUS through the solid instead of being a surface texture that
+stops at the wound.
+
+Two write paths, one colour, and they reach it differently:
+
+- **The voxelizer** (imported skin) reads `VoxParams.bodyColor`, a **uniform**
+  at `@group(0) @binding(3)`. It has to be a uniform: `meshFill` already
+  reaches 8 of the 8 storage buffers core WebGPU guarantees a stage (trap 8), so
+  a ninth would fail to create the voxelizer on a conformant phone.
+- **Every edit** reads `EditParams.bodyColor`, which `encodeOp` fills from
+  `BrickSystem::bodyColor_`. That is what paints a freshly allocated interior
+  brick, i.e. what a deep carve exposes.
+
+**The skin is baked ONCE, at import.** `Renderer::applyBodyColors` must run
+BEFORE `setCharacter` or the fighter comes out two-tone — old skin, new core —
+which is why `loadCharacterInto` takes a `LookParams` and why `runHeadless`
+declares its `look` block above the import rather than beside the camera.
+Setting the colour later still repaints newly exposed clay (it rides every
+edit's uniform); repainting the skin means re-voxelizing.
+
+**Trap 8 has a second face, and it bit here.** These pipelines use AUTO layouts,
+so Dawn derives the layout from what the entry point STATICALLY REACHES. The
+moment `meshFill` stopped reading `mCol`, binding 2 vanished from the derived
+layout — and the bind group in `brick.cpp` still listed it, which is a hard
+`CreateBindGroup` failure ("binding index 2 not present in the bind group
+layout") cascading into an invalid command buffer and a black frame. Removing a
+read from a shader is a bind-group change on the C++ side. The gpu-health exit
+code (4) is what caught it.
+
 ## Death and respawn (M-DEATH)
 
-A fighter that has lost `death.threshold` (0.5) of its clay comes apart.
+A fighter that has lost `death.threshold` (0.5) of its clay comes apart — **or
+is cut clean in half, however full it is.**
+
+**Bisection (`death.bisect`) is a second, instant route to the SAME collapse.**
+A blade that enters one side of the body capsule and leaves the other, passing
+within `death.bisectRadius` of its axis, kills on the spot: same
+`collapseFighter`, same ledger, same burst, same heap, same loose eyes.
+Measured on `scenarios/bisect.journal` it fires at **4% damage** (3746 of
+91432 ml) and sploots 87687 ml, with `carved == deposited + inFlight + debt`
+exact and exit 0.
+
+- **It is not connectivity analysis.** Asking the field whether the solid is in
+  two pieces means a GPU pass and a blocking readback (illegal on web, trap 9).
+  This asks the capsule test everything else already runs a different question:
+  did the blade SPAN the body with clay outside both ends, and did it pass near
+  the axis? `firstIn > 0 && lastIn < kS` is the span test — a sword whose hilt
+  is inside the target has been shoved in, not passed through.
+- **Distance is measured to the AXIS, not the surface.** "Through the centre of
+  mass" is a statement about the spine; surface distance is zero anywhere
+  inside.
+- **Blade only, by construction rather than by a flag** — a fist is a ball and a
+  ball cannot bisect. Same asymmetry the R22 glance draws.
+- **Body capsule only** (`bc.bone == 0`): severing a mitt is a wound.
+- **`respawnFighter` must clear `bisected`** or the body dies again on its first
+  frame back.
+- It runs inside `updateBladeCut`'s sweep gate, so it takes a real cutting
+  STROKE. A sword parked through someone is a sword parked through someone.
 
 **The threshold is measured against the CARVED LEDGER, not a hit-point pool.**
 Damage is literally the clay that left your body — the same measurements
@@ -938,6 +1127,22 @@ Iteration rules of thumb:
 - `scenarios/death.journal` is the M-DEATH gate: it drops `death.threshold` to
   3% (at the shipping 50% a fighter is ~46 litres and it would be a 30-second
   journal), carves one body past it, and exits 3 if the collapse leaks clay.
+- **A HAND-WRITTEN JOURNAL'S TICKS MUST EXCEED 24.** Replay starts at
+  `--time 2.0` by default, so frame 0 is ALREADY pose tick 24 and every entry
+  numbered at or below it fires before the first render — all at once, in
+  order, so the last one wins and the scenario looks like it did nothing.
+  `carve-duel.journal` starts at tick 30 for this reason. Tick 0 is still the
+  right place for one-shot setup (`set ai.enabled 0`); anything meant to happen
+  *over time* starts at 25.
+- **To swing the sword from a journal, yaw the FIGHTER, not the sword.**
+  `resolveSword` adds the fighter's yaw to the sword's, and the guard pose is
+  VERTICAL (`sword.pitch` = pi/2) — so yawing a vertical blade barely moves its
+  tip and never passes `updateBladeCut`'s 0.012 m sweep gate. Pitch it flat
+  first, then turn the body: ~0.08 m/frame, comfortably over. This is what
+  `scenarios/bisect.journal` does, and it is the ONLY journal that drives a real
+  blade sweep — `carve-duel` does its damage with scripted `edit carve` lines,
+  so the contact and cut paths in `updateBladeCut` had no headless coverage at
+  all before it.
 - Scenario regression: `record` a journal (or hand-write one: `<poseTick>
   <ctl command>` per line, see `scenarios/`), then
   `./build/clayfray --replay scenarios/X.journal --screenshot out.png
@@ -1269,6 +1474,7 @@ reference renders — diff against them by eye after a lighting/shading change.
 | `CLAYFRAY_NO_REDIST` / `_NO_ANIM` / `_NO_PIECES` | disable redistance / animation / chunk articulation |
 | `CLAYFRAY_AO` / `_DETAIL` / `_SHADOWK` | override look params (float) |
 | `CLAYFRAY_DEBUG_PICK=1` | print world vs REST position under the cursor (trap 6) |
+| `CLAYFRAY_DEBUG_IMPACT=1` | per contact: bite, stagger factor, SOLID/light against `hitstopBite`, FREEZE when it holds the world, the live hold and the target's `invMass`; plus per glanced fist, penetration and the offset it earned. The tool for "the mechanic is wired but reads as nothing" — which looks identical to "it never fires" from outside |
 | `CLAYFRAY_DEBUG_BLADE` / `_DEBUG_PUNCH` | per-frame weapon sweep + position. A strike that visibly connects and carves nothing has four indistinguishable causes from the ledger alone (which just reads 0.0 ml): wrong brush selected, under the cutting speed, missed the target's capsules, or the rest-space edit fell outside the volume |
 | `CLAYFRAY_TOUCH=1` / `=0` | force the on-screen touch stick + swing button on/off, overriding the coarse-pointer probe (desktop layout work) |
 | `CLAYFRAY_NO_AFFINE=1` | draw the rest volume UNPOSED (pieces = 0), i.e. all three brushes side by side where they are authored. Answers "is the rig wrong or is the volume wrong?" in one keystroke. It used to select the 13-piece inverse-LBS warp; that path died with the armature, so this is no longer an A/B between two rigs |

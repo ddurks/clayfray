@@ -91,6 +91,9 @@ struct EditParamsCpu {
     float brushB[4];
     // x = capsule count, y = dent amplitude (m), z = paint strength
     float parms[4];
+    // rgb = this fighter's clay colour, linear. MUST match edit.wgsl's
+    // EditParams (trap 2): it sits between parms and caps in both.
+    float bodyColor[4];
     // capsules 1..count-1, as (A.xyz, -) (B.xyz, -) pairs. Capsule 0 stays in
     // brush/brushB so a one-capsule brush is byte-identical to the old one.
     float caps[(kMaxBrushCaps - 1) * 2][4];
@@ -183,10 +186,12 @@ bool BrickSystem::init(Gpu& gpu, BrickStore& store, int slot,
     freelist_ = makeStorage(dev, kMaxBricks * 4ull, "brick freelist");
     jfaB_ = makeStorage(dev, cells * 4ull, "jfa B");
     coarseB_ = makeStorage(dev, cells * 4ull, "coarse dist B");
-    // 80 B of scalars + parms + (kMaxBrushCaps-1) capsule pairs. The WGSL side
-    // derives its array length from MAX_BRUSH_CAPS, so the two move together —
-    // but nothing links them at compile time, hence the number here.
-    static_assert(sizeof(EditParamsCpu) == 96 + (kMaxBrushCaps - 1) * 32,
+    // 96 B of scalars + bodyColor + (kMaxBrushCaps-1) capsule pairs. The WGSL
+    // side derives its array length from MAX_BRUSH_CAPS, so the two move
+    // together — but nothing links them at compile time, hence the number here.
+    // It has already earned its keep: adding bodyColor moved it 96 -> 112 and
+    // this is what said so, rather than a black screen (trap 2).
+    static_assert(sizeof(EditParamsCpu) == 112 + (kMaxBrushCaps - 1) * 32,
                   "must match WGSL EditParams");
     for (int i = 0; i < kOpsPerFrame; i++)
         editParams_[i] = makeStorage(dev, sizeof(EditParamsCpu), "edit params", true);
@@ -603,6 +608,13 @@ std::shared_ptr<BrickSystem::MeshImport> BrickSystem::prepareImport(
     return mesh;
 }
 
+void BrickSystem::setBodyColor(const float c[3]) {
+    for (int i = 0; i < 3; i++) bodyColor_[i] = c[i];
+    if (!voxColor_ || !gpu_) return;
+    const float v[4] = {c[0], c[1], c[2], 1.f};
+    gpu_->queue.WriteBuffer(voxColor_, 0, v, sizeof(v));
+}
+
 void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
     if (!mesh) return;
     wgpu::Device& dev = gpu_->device;
@@ -619,8 +631,29 @@ void BrickSystem::requestImport(std::shared_ptr<MeshImport> mesh) {
         return makeBindGroup(dev, pipe, group, entries);
     };
     // classify's auto layout skips bindings it doesn't touch; fill uses all.
+    // Binding 3 is a UNIFORM (trap 8: meshFill already reaches 8 of the 8
+    // storage buffers core WebGPU guarantees a stage, so a ninth would fail to
+    // create the voxelizer on a conformant phone). Written here so the imported
+    // SKIN gets this fighter's colour; every later edit carries its own copy
+    // through EditParams::bodyColor.
+    if (!voxColor_) {
+        voxColor_ = makeStorage(dev, 16, "vox body color", /*uniform=*/true);
+    }
+    {
+        const float c[4] = {bodyColor_[0], bodyColor_[1], bodyColor_[2], 1.f};
+        gpu_->queue.WriteBuffer(voxColor_, 0, c, sizeof(c));
+    }
+    // NO {2, mesh_->col} HERE ANY MORE, and it is not an omission. These
+    // pipelines use AUTO layouts, so Dawn derives the layout from what the
+    // entry point STATICALLY REACHES — and meshFill stopped reading mCol when
+    // the albedo became a uniform. Listing a binding the derived layout does
+    // not contain is a hard CreateBindGroup failure ("binding index 2 not
+    // present in the bind group layout"), which cascades into an invalid
+    // command buffer and a black frame. The buffer itself is still uploaded:
+    // it is the obvious hook for an asset that wants to tint BY vertex colour
+    // rather than replace it, and it costs one WriteBuffer at startup.
     vxG0_ = bindv(vxFill_, 0,
-                  {{0, mesh_->pos}, {1, mesh_->idx}, {2, mesh_->col},
+                  {{0, mesh_->pos}, {1, mesh_->idx}, {3, voxColor_},
                    {4, mesh_->tris}, {5, vxParityBuf_}});
     vxG1_ = bindv(vxFill_, 1,
                   {{0, volume, volBase() + kIndOff, kCellBytes},
@@ -998,6 +1031,8 @@ void BrickSystem::encodeOp(wgpu::CommandEncoder& enc, const BrickEdit& e, int sl
     params.parms[1] = e.dentAmp;
     params.parms[2] = e.paint;
     params.parms[3] = 0.f;
+    for (int i = 0; i < 3; i++) params.bodyColor[i] = bodyColor_[i];
+    params.bodyColor[3] = 1.f;
     for (int c = 1; c < caps; c++) {
         for (int i = 0; i < 3; i++) {
             params.caps[(c - 1) * 2][i] = e.capA[c - 1][i];

@@ -92,6 +92,11 @@ struct Body {
     float force[3] = {0.f, 0.f, 0.f}; // THIS FRAME's contact force, m/s^2
     float stagger = 0.f;              // s of no steering left
     float rate = 1.f;                 // strike-clock multiplier, minRate..1
+    // M-MASS: 1 / (mass fraction), refreshed once a frame from the renderer's
+    // carved ledger (PhysicsParams::massKnock). It multiplies knockback and
+    // nothing else a body does for itself — losing clay makes you easier to
+    // throw, not quicker on your feet.
+    float invMass = 1.f;
     // ---- the hopper (M-SPRING; the model is documented on RigParams) ----
     // u < 0 compressed against the floor, u >= 0 feet off it. It lives HERE
     // rather than in the renderer because travel depends on it: see the
@@ -185,13 +190,18 @@ struct Body {
                    float dt) {
         stepHop(r, f.moving, dt);
         f.hopU = u;
-        for (int a = 0; a < 3; a += 2) knock[a] += force[a] * dt;
+        // M-MASS: the SAME force throws a lighter body further, and the
+        // ceiling rises with it — capping every fighter at one knockMax would
+        // put the whole mechanic back behind a constant the moment a hit was
+        // hard enough to saturate, which at 0.8 m/s is most of them.
+        for (int a = 0; a < 3; a += 2) knock[a] += force[a] * invMass * dt;
+        const float kmax = p.knockMax * invMass;
         float ks = std::sqrt(knock[0] * knock[0] + knock[2] * knock[2]);
-        if (ks > p.knockMax && ks > 1e-6f) {
-            const float s = p.knockMax / ks;
+        if (ks > kmax && ks > 1e-6f) {
+            const float s = kmax / ks;
             knock[0] *= s;
             knock[2] *= s;
-            ks = p.knockMax;
+            ks = kmax;
         }
         // ONLY WHILE AIRBORNE. `air` is set at the push-off, which happens at
         // maximum compression — mid-stance, with the foot still planted — so
@@ -450,6 +460,25 @@ struct GameState {
 
     uint64_t tickCount = 0;
 
+    // ---- hitstop (PhysicsParams::hitstop) ----
+    // Seconds the whole world is held. stepWorld eats ticks against it without
+    // stepping anything and reports back how many it really ran, so the render
+    // clock holds with the sim rather than sliding underneath a frozen picture.
+    float hold = 0.f;
+    // Seconds until ANY weapon may freeze the world again, and it is global on
+    // purpose. Two reasons, both measured:
+    //   - a plain "was it live last frame" edge does not work at all. Contact
+    //     is reported every frame a weapon ploughs through AND it flickers off
+    //     whenever a fist drops below `cutSpeed` at the apex of its arc, so an
+    //     edge test re-arms several times per punch.
+    //   - keyed per (attacker, target, weapon) it still fired twice per punch,
+    //     because the IDLE mitt is also inside the target at this range and
+    //     moves fast enough to report its own contact. That put 20 freezes in
+    //     5 seconds, which reads as the game chugging rather than as impact.
+    // Hitstop is a property of the MOMENT, not of the weapon, so one timer is
+    // also the more honest model. Drained on the sim tick, hold or no hold.
+    float hitCool = 0.f;
+
     FighterPose fighter;
 
     // M-FIST: the opponents, and the knobs they share. One AI per player slot;
@@ -677,6 +706,23 @@ struct GameState {
             d[0] /= dl;
             d[2] /= dl;
 
+            // NO SQUARENESS FACTOR HERE, and that was a mistake worth leaving
+            // a note about. Scaling the shove by -dot(travel, normal) is right
+            // for a rigid impulse and WRONG for anything measured a frame at a
+            // time: a punch reciprocates, so the instant it is deepest its
+            // radial velocity is ~0 and the frame delta is whatever the bodies
+            // happened to be doing sideways. Measured over a real AI brawl it
+            // printed 0.88, 0.00, 0.69, 0.00, 0.29 on consecutive contacts —
+            // half of every punch graded as a graze, which cut the shove, the
+            // stagger AND the hitstop to a quarter on alternating frames.
+            //
+            // `bite` already carries what squareness was meant to add. It is
+            // penetration past the surface, and a weapon skidding along the
+            // skin does not penetrate — so the two multiplied together were
+            // double-counting a quantity that was only reliable once. The
+            // normal is still carried on the contact and still used, but only
+            // where it is read at the DEEPEST sample and is therefore stable:
+            // the glance push-out and the dent axis, both renderer-side.
             const float f = phys.knockForce * c.bite;
             bodies[t].force[0] += d[0] * f;
             bodies[t].force[2] += d[2] * f;
@@ -688,7 +734,51 @@ struct GameState {
 
             const float hit =
                 std::min(1.f, c.bite / std::max(phys.staggerBite, 1e-4f));
-            bodies[t].stagger = std::max(bodies[t].stagger, phys.stagger * hit);
+            // M-MASS: a lighter body is rocked for longer by the same hit. This
+            // is the mass term you can actually SEE — the shove it also scales
+            // was cut to a nudge on purpose, so multiplying it stays subtle.
+            bodies[t].stagger =
+                std::max(bodies[t].stagger, phys.stagger * hit * bodies[t].invMass);
+
+            // ---- hitstop, on the RISING EDGE of this contact ----
+            // The animator's held pose: the world stops dead for one 12 Hz step
+            // at the moment of impact. Keyed on (attacker, target, weapon)
+            // rather than on "any contact", so a second fist landing while the
+            // first is still buried is its own hit and holds again.
+            {
+                {
+                    // A HOLD IS BINARY. It was `hitstop * hit`, which sounds
+                    // reasonable and is not: a stop-motion animator holds a
+                    // frame or does not, and a proportional hold turns every
+                    // real hit into 1-3 ticks of freeze that nobody can see.
+                    // Measured on an AI brawl it never once reached half its
+                    // nominal length. So any hit past `hitstopBite` holds for
+                    // the FULL step and anything under it holds not at all.
+                    //
+                    // The refractory is what makes that safe. Contact flickers
+                    // frame to frame — updatePunchCut drops a fist below
+                    // `cutSpeed`, so a punch reports EDGE on alternating frames
+                    // as it slows at the apex — and a full-length hold re-armed
+                    // on every one of those would lock the game solid. The
+                    // rising edge alone is not enough; it needs a floor on how
+                    // often one weapon may freeze the world.
+                    const bool edge = hitCool <= 0.f;
+                    const bool solid = c.bite >= std::max(phys.hitstopBite, 1e-4f);
+                    if (edge && solid) {
+                        hold = std::max(hold, phys.hitstop);
+                        hitCool = phys.hitstopCool;
+                    }
+                    if (std::getenv("CLAYFRAY_DEBUG_IMPACT")) {
+                        std::printf("[impact] p%d->p%d side %d bite=%.4f hit=%.2f "
+                                    "%s%s hold=%.3f invM=%.2f\n",
+                                    a, t, c.side, c.bite, hit,
+                                    solid ? "SOLID" : "light",
+                                    (edge && solid) ? " FREEZE" : "",
+                                    hold, bodies[t].invMass);
+                        std::fflush(stdout);
+                    }
+                }
+            }
 
             // M-FIST: being hit is what starts a fight (AiParams::retaliatory).
             // Any strike provokes, whoever threw it — a body does not check who
@@ -737,11 +827,19 @@ struct GameState {
                     d = 1.f;
                 }
                 const float nx = dx / d, nz = dz / d; // points i -> j
-                const float push = (minD - d) * 0.5f * phys.pushOut;
-                a.pos[0] -= nx * push;
-                a.pos[2] -= nz * push;
-                b.pos[0] += nx * push;
-                b.pos[2] += nz * push;
+                const float push = (minD - d) * phys.pushOut;
+                // M-MASS: split by weight rather than evenly. This keeps the
+                // property that mattered — the rule does not depend on player
+                // INDEX, so the hero cannot bulldoze by virtue of being first —
+                // while letting a body that has lost half its clay be the one
+                // that gives ground. Total separation is unchanged.
+                const float wi = bodies[i].invMass, wj = bodies[j].invMass;
+                const float tot = wi + wj;
+                const float fi = tot > 1e-6f ? wi / tot : 0.5f;
+                a.pos[0] -= nx * push * fi;
+                a.pos[2] -= nz * push * fi;
+                b.pos[0] += nx * push * (1.f - fi);
+                b.pos[2] += nz * push * (1.f - fi);
                 bodies[i].killApproach(-nx, -nz);
                 bodies[j].killApproach(nx, nz);
             }
@@ -792,10 +890,33 @@ struct GameState {
         }
     }
 
-    void stepWorld(Renderer& r, const LookParams& look, int ticks, bool driveHero) {
+    // Returns the number of ticks it ACTUALLY stepped, which is `ticks` minus
+    // whatever hitstop ate. Every caller advances its render clock by the
+    // return value rather than by the budget it handed in — that is what keeps
+    // the picture, the sim and the journal's pose ticks on one clock through a
+    // freeze, instead of letting the world slide underneath a held frame.
+    int stepWorld(Renderer& r, const LookParams& look, int ticks, bool driveHero) {
         const float dt = (float)kTickDt;
         adoptRespawns(r);
+        // M-MASS: re-weigh every body once per FRAME, not per tick. The number
+        // behind it is a GPU readback that lands at most once a frame, so a
+        // per-tick refresh would buy nothing but divisions.
+        for (int i = 0; i < Renderer::kMaxPlayers; i++) {
+            const float m = std::max(r.massFrac(i), std::max(phys.massMin, 0.05f));
+            const float knob = std::min(std::max(phys.massKnock, 0.f), 1.f);
+            bodies[i].invMass = 1.f + knob * (1.f / m - 1.f);
+        }
+        int stepped = 0;
         for (int k = 0; k < ticks; k++) {
+            // HITSTOP: the world holds. Nothing thinks, nothing integrates,
+            // nothing is constrained — and the tick is still CONSUMED, so the
+            // freeze lasts real seconds instead of being outrun by whatever
+            // frame rate the machine happens to be managing.
+            if (hitCool > 0.f) hitCool -= dt;
+            if (hold > 0.f) {
+                hold -= dt;
+                continue;
+            }
             // A collapsed hero has nothing to drive: no body to move, no
             // weapon to swing. It still holds its pose so the camera has
             // something to frame while it waits to come back.
@@ -820,7 +941,9 @@ struct GameState {
                 if (!liveBody(r, i)) continue;
                 confineToArena(*posePtr(r, i), bodies[i], look.motion.arenaRadius);
             }
+            stepped++;
         }
+        return stepped;
     }
 
     double timeSeconds() const { return (double)tickCount * kTickDt; }
@@ -944,7 +1067,7 @@ void applyLookEnv(LookParams& look) {
 
 std::string gCharacterPath; // --character; empty = built-in analytic fighter
 
-bool loadCharacterInto(Renderer& renderer) {
+bool loadCharacterInto(Renderer& renderer, const LookParams& look) {
     std::string path = gCharacterPath;
     if (path.empty()) {
         // the authored fighter IS the default when present; the analytic
@@ -955,6 +1078,10 @@ bool loadCharacterInto(Renderer& renderer) {
     if (path.empty()) return true;
     CharacterAsset asset;
     if (!asset.load(path)) return false;
+    // BEFORE setCharacter: the voxelizer bakes the skin's colour once, so a
+    // fighter imported with the default and recoloured afterwards would be
+    // two-tone — old skin, new core.
+    renderer.applyBodyColors(look);
     renderer.setCharacter(std::move(asset));
     return true;
 }
@@ -1023,7 +1150,15 @@ int runHeadless(const RunOpts& o) {
     if (!gpu.init(nullptr)) return 1;
     Renderer renderer;
     if (!renderer.init(gpu, o.width, o.height)) return 1;
-    if (!loadCharacterInto(renderer)) return 1;
+    // Declared HERE rather than beside the camera below because the character
+    // import reads look.bodyColor and the voxelizer bakes the skin's colour
+    // exactly once — a LookParams built after this point could only ever
+    // recolour the core.
+    LookParams look;
+    look.traceW = o.traceW;
+    look.traceH = o.traceH;
+    applyLookEnv(look);
+    if (!loadCharacterInto(renderer, look)) return 1;
     // player 2: an identical fighter standing in front, facing the hero
     addOpponents(renderer, wantedPlayers());
 
@@ -1078,10 +1213,6 @@ int runHeadless(const RunOpts& o) {
     if (!std::isnan(o.camAz)) cam.azimuth = o.camAz;
     if (!std::isnan(o.camEl)) cam.elevation = o.camEl;
     if (!std::isnan(o.camDist)) cam.distance = o.camDist;
-    LookParams look;
-    look.traceW = o.traceW;
-    look.traceH = o.traceH;
-    applyLookEnv(look);
 
     double t = o.startTime;
     SimClock clock;
@@ -1140,7 +1271,6 @@ int runHeadless(const RunOpts& o) {
                           renderer.brick().hasPendingWork();
             if (active) {
                 if (warm > 0) warm--;
-                t += n * kTickDt;
                 auto t0 = std::chrono::steady_clock::now();
                 // Opponents think here too. The AI is deterministic (fixed dt,
                 // seeded RNG) so this costs replay nothing, and a headless
@@ -1152,7 +1282,10 @@ int runHeadless(const RunOpts& o) {
                 // and collision, and handed back.
                 bobState.fighter = fighter;
                 bobState.applyContacts(renderer.contacts());
-                bobState.stepWorld(renderer, look, n, /*driveHero=*/false);
+                // The render clock advances by what the world ACTUALLY ran, not
+                // by the tick budget: hitstop holds both or neither.
+                t += bobState.stepWorld(renderer, look, n, /*driveHero=*/false) *
+                     kTickDt;
                 fighter = bobState.fighter;
                 renderer.setFighter(fighter);
                 renderer.render(cam, swordBobbed(bobState, fighter, look, t),
@@ -1189,7 +1322,16 @@ int runHeadless(const RunOpts& o) {
         total += std::max(0, (int)std::ceil((tEnd - o.startTime) * kTickRate) + 1);
     }
     int inFlight = 0;
-    for (int i = 0; i < total; i++) {
+    // Hitstop holds the render clock (stepWorld returns 0 ticks while it does),
+    // so a run that freezes on every landing hit reaches a given pose tick
+    // LATER than `total` frames assumed. Keep going while journal entries are
+    // still pending rather than dropping them: a scenario that stops firing
+    // half way through is a silently weaker gate, not a failing one. The slack
+    // is a runaway guard — 600 frames is ten seconds of held picture, far more
+    // than any journal accumulates at ~5 held ticks per landing hit.
+    const int kHoldSlack = 600;
+    for (int i = 0; i < total || (ji < journal.size() && i < total + kHoldSlack);
+         i++) {
         long tick = poseTickOf(t);
         while (ji < journal.size() && journal[ji].tick <= tick) {
             std::string resp;
@@ -1201,7 +1343,7 @@ int runHeadless(const RunOpts& o) {
         }
         bobState.fighter = fighter;
         bobState.applyContacts(renderer.contacts());
-        bobState.stepWorld(renderer, look, 1, /*driveHero=*/false);
+        const int ran = bobState.stepWorld(renderer, look, 1, /*driveHero=*/false);
         fighter = bobState.fighter;
         renderer.setFighter(fighter);
         renderer.render(cam, swordBobbed(bobState, fighter, look, t),
@@ -1217,7 +1359,7 @@ int runHeadless(const RunOpts& o) {
         // frame after its edit so reruns are bit-for-bit repeatable
         if (!journal.empty()) renderer.syncMeasurements();
         ctl.finishFrame(); // flush journal `shot` lines
-        t += kTickDt;
+        t += ran * kTickDt;
     }
     if (ji < journal.size()) {
         std::fprintf(stderr, "[replay] %zu entr(y/ies) past end of run\n",
@@ -1401,7 +1543,7 @@ bool appStartAfterGpu(AppState& s) {
     }
 
     if (!s.renderer.init(s.gpu, traceW0, traceH0)) return false;
-    if (!loadCharacterInto(s.renderer)) return false;
+    if (!loadCharacterInto(s.renderer, s.look)) return false;
     // player 2: an identical fighter standing in front, facing the hero
     addOpponents(s.renderer, wantedPlayers());
     if (!uiInit(s.window, s.gpu)) return false;
@@ -1607,9 +1749,8 @@ void frameOnce(AppState& s) {
         // contacts are resolved during render(), which is the only place the
         // posed weapons exist — and it is invisible at 60 Hz.
         game.applyContacts(renderer.contacts());
-        game.stepWorld(renderer, look, ticks, /*driveHero=*/true);
+        simT += game.stepWorld(renderer, look, ticks, /*driveHero=*/true) * kTickDt;
         renderer.setFighter(game.fighter);
-        simT += ticks * kTickDt;
         // Keep the walker framed — but on the SAME clock the body is drawn on.
         // Chasing the 60 Hz sim position while the body steps at 12 Hz slides
         // the camera against a stepping subject, which reads as jitter (worse

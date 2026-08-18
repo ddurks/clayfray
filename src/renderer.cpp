@@ -669,7 +669,8 @@ void Renderer::unarmedHand(const FighterPose& disp, const LookParams& look, int 
 
 void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
                               const FighterPose& disp, const LookParams& look,
-                              const SwordParams* grip, float poseTime) const {
+                              const SwordParams* grip, float poseTime,
+                              const float glance[2][3]) const {
     if (!brush_.valid || pieces.size() < 3) return;
     float A[16];
     bodyAffine(disp, look.rig, A);
@@ -810,6 +811,15 @@ void Renderer::updateBrushRig(std::vector<AffinePiece>& pieces, const int handPo
         matIdentity(T);
         T[12] = pre[0]; T[13] = pre[1]; T[14] = pre[2];
         matMul(M, T, ap.xform);
+        // R22: the glance is a WORLD-space push-out, so it lands straight on
+        // the translation column — pre-multiplying T(glance) would be the same
+        // three adds through a 4x4. It moves the WHOLE piece, which is what
+        // makes it correct rather than convenient: the brush's rest AABB is
+        // clipped after the inverse transform, so box and clay travel together,
+        // posedCapsule reads the same matrix so the shadow proxy follows, and
+        // updatePunchCut reads the fist's world position off it too — which is
+        // the feedback that keeps the deflection from running away.
+        for (int k = 0; k < 3; k++) ap.xform[12 + k] += glance[side][k];
     }
 }
 
@@ -1328,6 +1338,16 @@ void Renderer::swordGeometry(const SwordParams& s, float hilt[3], float tip[3],
         tip[i] = s.pos[i] + dir[i] * s.length;
         gripA[i] = s.pos[i] + dir[i] * s.grip0; // near hilt (one hand)
         gripB[i] = s.pos[i] + dir[i] * s.grip1; // stacked (other hand)
+    }
+}
+
+void Renderer::applyBodyColors(const LookParams& look) {
+    // LookParams::bodyColor is sized 4 and does not include renderer.h, so this
+    // is the link between the two. Raising the fighter cap past 4 without
+    // widening that array would silently reuse the last colour.
+    static_assert(kMaxPlayers <= 4, "LookParams::bodyColor has 4 rows");
+    for (int i = 0; i < kMaxPlayers; i++) {
+        fighters_[i].vol.setBodyColor(look.bodyColor[i]);
     }
 }
 
@@ -1943,18 +1963,22 @@ void Renderer::absorbMeasured() {
 }
 
 void Renderer::reportContact(int attacker, int target, int side, float bite,
-                             const float dir[3], float speed) {
+                             const float dir[3], float speed, const float nrm[3]) {
     if (!(bite > 0.f)) return;
     for (StrikeContact& c : contacts_) {
         if (c.attacker != attacker || c.target != target || c.side != side) continue;
         // Deepest wins. Keeping the deepest sample's direction with it matters:
         // a blade's sweep direction barely changes across one frame's substeps,
         // but a fist's does at the turnaround, and pairing a deep bite with a
-        // retreating direction would knock the target TOWARD the puncher.
+        // retreating direction would knock the target TOWARD the puncher. The
+        // normal travels with them for the same reason — squareness is a
+        // relation between the two, so a direction from one substep and a
+        // normal from another describes a hit that never happened.
         if (bite > c.bite) {
             c.bite = bite;
             c.speed = speed;
             for (int k = 0; k < 3; k++) c.dir[k] = dir[k];
+            for (int k = 0; k < 3; k++) c.nrm[k] = nrm[k];
         }
         return;
     }
@@ -1965,6 +1989,7 @@ void Renderer::reportContact(int attacker, int target, int side, float bite,
     c.bite = bite;
     c.speed = speed;
     for (int k = 0; k < 3; k++) c.dir[k] = dir[k];
+    for (int k = 0; k < 3; k++) c.nrm[k] = nrm[k];
     contacts_.push_back(c);
 }
 
@@ -2103,7 +2128,6 @@ void Renderer::updatePunchCut(const LookParams& look) {
                 // the span of this frame's fist path that lies inside the target
                 float tIn = 2.f, tOut = -1.f, nrm[3] = {0, 1, 0};
                 int hitPiece = -1;
-                bool haveNrm = false;
                 // M-PHYS: deepest penetration of the fist past the surface,
                 // over the whole swept path. NOT the swept span (tOut - tIn) —
                 // that is how far the fist TRAVELLED while inside, which for a
@@ -2142,19 +2166,79 @@ void Renderer::updatePunchCut(const LookParams& look) {
                         if ((cr + fistR) - dist > maxPen) {
                             maxPen = (cr + fistR) - dist;
                             std::memcpy(deepP, p, sizeof(deepP));
+                            // THE NORMAL BELONGS TO THE DEEPEST SAMPLE, not to
+                            // the first one that touched. contactW below is
+                            // deepP walked back along it, and the dent's whole
+                            // volume argument rests on that axis being the
+                            // surface normal THERE — pairing the deepest point
+                            // with the ENTRY normal tilted the dent by however
+                            // far the fist had travelled around the body since
+                            // it made contact, and R22 now reads squareness off
+                            // the same vector, so an entry normal would grade a
+                            // punch by how it arrived rather than how it landed.
+                            const float ninv = dist > 1e-6f ? 1.f / dist : 0.f;
+                            for (int k = 0; k < 3; k++) nrm[k] = d[k] * ninv;
                         }
                         tIn = std::min(tIn, t);
                         tOut = std::max(tOut, t);
                         if (hitPiece < 0) hitPiece = c.bone;
-                        if (!haveNrm) {
-                            const float inv = dist > 1e-6f ? 1.f / dist : 0.f;
-                            for (int k = 0; k < 3; k++) nrm[k] = d[k] * inv;
-                            haveNrm = true;
-                        }
                         break;
                     }
                 }
                 if (tOut < tIn) continue; // missed
+
+                const ImpactParams& imp = look.impact;
+                const float invSweep = sweep > 1e-6f ? 1.f / sweep : 0.f;
+                const float travel[3] = {(cur[side][0] - pv[0]) * invSweep,
+                                         (cur[side][1] - pv[1]) * invSweep,
+                                         (cur[side][2] - pv[2]) * invSweep};
+                // HOW SQUARE THE HIT IS: 1 driven straight down the normal, 0
+                // skidding along the skin. Everything R22 does is graded by it.
+                float square = 0.f;
+                for (int k = 0; k < 3; k++) square -= travel[k] * nrm[k];
+                square = std::min(std::max(square, 0.f), 1.f);
+
+                // ---- R22: the fist skids, it does not bore ----
+                // Push the mitt back out along the surface normal by
+                // `glance * penetration`. The punch arc keeps moving it
+                // TANGENTIALLY, so what was a fist driving through a body
+                // becomes a fist riding its surface.
+                //
+                // SET, NOT ACCUMULATED, and that distinction is the whole
+                // stability of it. Adding a displacement per frame is a
+                // velocity wearing a length's clothes: it would grow without
+                // bound while a fist stayed buried and it would grow FASTER at
+                // a higher frame rate. Assigned instead, the offset is a
+                // positional response with a fixed point — `cur` is read off a
+                // piece this offset already moved, so an animated drive of p0
+                // settles at o = glance*p0/(1 + glance) and the fist really
+                // penetrates p0/(1 + glance), whatever the frame rate.
+                //
+                // No push-out is applied to the carve below. The mitt itself
+                // has moved, so the fist path IS the glanced path and the wound
+                // follows it for free; adding the offset a second time at the
+                // edit would count it twice and cut a wound shallower than the
+                // fist that made it.
+                if (imp.glance > 0.f) {
+                    const float want = imp.glance * maxPen;
+                    float have = 0.f;
+                    for (int k = 0; k < 3; k++) {
+                        have += att.glance[side][k] * att.glance[side][k];
+                    }
+                    // Deepest contact of the frame wins the deflection, the
+                    // same rule reportContact applies to the shove: two targets
+                    // must not push one mitt twice.
+                    if (want * want > have) {
+                        for (int k = 0; k < 3; k++) att.glance[side][k] = nrm[k] * want;
+                    }
+                    if (std::getenv("CLAYFRAY_DEBUG_IMPACT")) {
+                        std::printf("[glance] p%d side %d pen=%.4f square=%.2f "
+                                    "offset=%.4f had=%.4f\n",
+                                    atk, side, maxPen, square, want,
+                                    std::sqrt(have));
+                        std::fflush(stdout);
+                    }
+                }
 
                 // M-PHYS. Reported BEFORE the bounds test below, and that is
                 // deliberate: the fist is physically inside the target whether
@@ -2162,13 +2246,7 @@ void Renderer::updatePunchCut(const LookParams& look) {
                 // volume boundary (trap 5) must not also silently drop the
                 // knockback. Contact is about the capsules; the edit is about
                 // the volume.
-                {
-                    const float inv = sweep > 1e-6f ? 1.f / sweep : 0.f;
-                    const float d[3] = {(cur[side][0] - pv[0]) * inv,
-                                        (cur[side][1] - pv[1]) * inv,
-                                        (cur[side][2] - pv[2]) * inv};
-                    reportContact(atk, ti, side, maxPen, d, sweep * 60.f);
-                }
+                reportContact(atk, ti, side, maxPen, travel, sweep * 60.f, nrm);
 
                 float wA[3], wB[3];
                 for (int k = 0; k < 3; k++) {
@@ -2186,7 +2264,6 @@ void Renderer::updatePunchCut(const LookParams& look) {
                 // The point on the SKIN under the deepest part of the fist: the
                 // fist centre, walked back along the outward normal by the part
                 // of it that is still outside.
-                const ImpactParams& imp = look.impact;
                 float contactW[3];
                 for (int k = 0; k < 3; k++) {
                     contactW[k] = deepP[k] - nrm[k] * (fistR - maxPen);
@@ -2228,7 +2305,16 @@ void Renderer::updatePunchCut(const LookParams& look) {
                     }
                     restLen = std::sqrt(restLen);
                     const float scale = halfLen > 1e-6f ? restLen / (2.f * halfLen) : 1.f;
-                    d.dentAmp = imp.dentDepth * scale;
+                    // Graded by PENETRATION, not by squareness. A fist barely
+                    // grazing the skin presses shallowly; one buried to its
+                    // equator presses all the way. maxPen/fistR is the stable
+                    // form of that — the per-frame -dot(travel, normal) version
+                    // collapsed to zero at the apex of every punch, which is
+                    // exactly where the deepest dent belongs. Scaling the
+                    // AMPLITUDE is safe for conservation: the profile's shape is
+                    // untouched and its integral was zero at every amplitude.
+                    const float press = std::min(1.f, maxPen / std::max(fistR, 1e-4f));
+                    d.dentAmp = imp.dentDepth * scale * press;
                     std::memcpy(d.worldPos, contactW, sizeof(d.worldPos));
                     std::memcpy(d.outDir, nrm, sizeof(d.outDir));
                     if (tgt.vol.editInBounds(d)) tgt.vol.queueEdit(d);
@@ -2259,8 +2345,28 @@ void Renderer::updatePunchCut(const LookParams& look) {
                     b.player = tgt.vol.slot();
                     b.radius = std::max(fistR * imp.bruiseRadius, 1e-4f);
                     b.paint = imp.bruise;
-                    matTransformPoint(invPiece, contactW, b.pos);
-                    std::memcpy(b.posB, b.pos, sizeof(b.posB));
+                    // A SEGMENT, not a spot: the fist skidded, so the stain
+                    // it leaves is a streak along the skin. The slide is the
+                    // travel over the contact span with the normal component
+                    // taken out — i.e. what actually rubbed — and it costs
+                    // nothing, because mode 4 already carries two endpoints and
+                    // paint allocates nothing, moves no field and never reaches
+                    // the JFA. A dead-square punch has no tangential component
+                    // and degenerates back to the spot it always was.
+                    float slide[3];
+                    for (int k = 0; k < 3; k++) {
+                        slide[k] = (cur[side][k] - pv[k]) * (tOut - tIn);
+                    }
+                    float sn = 0.f;
+                    for (int k = 0; k < 3; k++) sn += slide[k] * nrm[k];
+                    float skidA[3], skidB[3];
+                    for (int k = 0; k < 3; k++) {
+                        slide[k] -= nrm[k] * sn;
+                        skidA[k] = contactW[k] - slide[k] * 0.5f;
+                        skidB[k] = contactW[k] + slide[k] * 0.5f;
+                    }
+                    matTransformPoint(invPiece, skidA, b.pos);
+                    matTransformPoint(invPiece, skidB, b.posB);
                     std::memcpy(b.color, imp.bruiseColor, sizeof(b.color));
                     std::memcpy(b.worldPos, contactW, sizeof(b.worldPos));
                     if (tgt.vol.editInBounds(b)) tgt.vol.queueEdit(b);
@@ -2273,10 +2379,7 @@ void Renderer::updatePunchCut(const LookParams& look) {
                 std::memcpy(sliceExit_, wB, sizeof(sliceExit_));
                 std::memcpy(sliceNrm_, nrm, sizeof(sliceNrm_));
                 std::memcpy(sliceCol_, e.srcColor, sizeof(sliceCol_));
-                const float inv = sweep > 1e-6f ? 1.f / sweep : 0.f;
-                for (int k = 0; k < 3; k++) {
-                    sliceSweep_[k] = (cur[side][k] - pv[k]) * inv;
-                }
+                std::memcpy(sliceSweep_, travel, sizeof(sliceSweep_));
                 sliceOpen_ = true;
                 sliceCutStep_ = true;
                 slicePending_++;
@@ -2345,6 +2448,60 @@ void Renderer::updateBladeCut(const LookParams& look) {
     // cannot exhaust the frame's edit budget the way six-substeps-per-target
     // could.
     auto cut = [&](Fighter& tgt) {
+    // ---- M-DEATH: cut clean through the middle and you are done ----
+    // Runs before the carve and inside the sweep gate above, so it takes a
+    // real cutting STROKE — a sword parked through someone is not a bisection,
+    // it is a sword parked through someone. Tested against the BODY capsule
+    // only: severing a mitt is a wound, not a bisection.
+    if (look.death.enabled && look.death.bisect && !tgt.dead && !tgt.bisected) {
+        for (const BoneCapsule& bc : capsules_) {
+            if (bc.bone != 0) continue; // piece 0 is the body
+            float a2[3], b2[3], cr;
+            posedCapsule(tgt, bc, a2, b2, cr);
+            const int kS = 32;
+            int firstIn = -1, lastIn = -1;
+            float minAxis = 1e9f;
+            for (int i = 0; i <= kS; i++) {
+                const float t = (float)i / (float)kS;
+                float p[3];
+                for (int k = 0; k < 3; k++) p[k] = hilt[k] + (tip[k] - hilt[k]) * t;
+                float ab[3] = {b2[0] - a2[0], b2[1] - a2[1], b2[2] - a2[2]};
+                float ap[3] = {p[0] - a2[0], p[1] - a2[1], p[2] - a2[2]};
+                const float len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                float u = len2 > 1e-9f ? (ap[0] * ab[0] + ap[1] * ab[1] +
+                                          ap[2] * ab[2]) / len2
+                                       : 0.f;
+                u = std::min(std::max(u, 0.f), 1.f);
+                const float q[3] = {a2[0] + ab[0] * u, a2[1] + ab[1] * u,
+                                    a2[2] + ab[2] * u};
+                const float d[3] = {p[0] - q[0], p[1] - q[1], p[2] - q[2]};
+                // distance to the AXIS, not to the surface: "through the centre
+                // of mass" is a statement about the spine, and the surface
+                // distance is zero anywhere inside.
+                const float dist =
+                    std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                if (dist < cr) {
+                    if (firstIn < 0) firstIn = i;
+                    lastIn = i;
+                }
+                minAxis = std::min(minAxis, dist);
+            }
+            // BOTH ends outside. firstIn > 0 puts the hilt end in clear air and
+            // lastIn < kS the tip, so the blade genuinely spans the body rather
+            // than being buried in it — a sword whose hilt is inside the target
+            // has not passed through, it has been shoved in.
+            const bool spans = firstIn > 0 && lastIn >= 0 && lastIn < kS;
+            const float rad = std::min(std::max(look.death.bisectRadius, 0.f), 1.f);
+            if (spans && minAxis <= cr * rad) {
+                tgt.bisected = true;
+                std::printf("[death] player %d BISECTED (blade passed %.0f mm "
+                            "from the axis, body r=%.0f mm)\n",
+                            tgt.vol.slot(), minAxis * 1e3f, cr * 1e3f);
+                std::fflush(stdout);
+            }
+            break;
+        }
+    }
     // Sweep in TIME as well as along the blade, and emit ONE CAPSULE PER
     // SUBSTEP rather than collapsing the whole sweep into a single capsule.
     // Testing only the current hilt->tip segment samples an instant: at swing
@@ -2430,7 +2587,7 @@ void Renderer::updateBladeCut(const LookParams& look) {
             const float sweepDir[3] = {(tip[0] - pT[0]) * inv, (tip[1] - pT[1]) * inv,
                                        (tip[2] - pT[2]) * inv};
             reportContact(0, tgt.vol.slot(), -1, (tOut - tIn) * bladeLen, sweepDir,
-                          sweep * 60.f);
+                          sweep * 60.f, nrm);
         }
         // push past entry and exit so the cut breaks the surface both sides
         float over = bladeLen > 1e-6f ? (e.radius * 0.9f) / bladeLen : 0.f;
@@ -2640,10 +2797,10 @@ void Renderer::collapseFighter(int i, const LookParams& look) {
         loose_.push_back(lm);
     }
 
-    std::printf("[death] player %d collapsed (%.0f of %.0f ml carved), %.0f ml "
+    std::printf("[death] player %d collapsed%s (%.0f of %.0f ml carved), %.0f ml "
                 "sploots, respawn in %.1fs\n",
-                i, f.carved * 1e6f, fighterVolume_ * 1e6f, remaining * 1e6f,
-                f.respawnT);
+                i, f.bisected ? " BISECTED" : "", f.carved * 1e6f,
+                fighterVolume_ * 1e6f, remaining * 1e6f, f.respawnT);
 }
 
 void Renderer::respawnFighter(int i, const LookParams& look) {
@@ -2654,6 +2811,7 @@ void Renderer::respawnFighter(int i, const LookParams& look) {
     f.vol.requestBake();
     f.carved = 0.f;
     f.dead = false;
+    f.bisected = false; // or it dies again on its first frame back
     f.respawnT = 0.f;
 
     // Come back at a distance. An opponent reappears on the far side of the
@@ -2699,6 +2857,21 @@ void Renderer::respawnFighter(int i, const LookParams& look) {
                 f.pose.pos[2]);
 }
 
+// M-MASS: what is LEFT of a fighter, as a fraction of the clay it imported
+// with. The damage side of this is M-DEATH's own number — `carved`, billed off
+// the same measurements that feed the arena ledger — so a body's weight and its
+// death threshold can never disagree about how hurt it is.
+//
+// 1 when there is nothing to be a fraction of (the analytic blob has no mesh
+// volume) and 1 for a corpse, which has no body to shove.
+float Renderer::massFrac(int i) const {
+    if (i < 0 || i >= kMaxPlayers || fighterVolume_ <= 0.f) return 1.f;
+    const Fighter& f = fighters_[i];
+    if (f.dead) return 1.f;
+    const float lost = std::min(std::max(f.carved / fighterVolume_, 0.f), 1.f);
+    return 1.f - lost;
+}
+
 void Renderer::updateDeaths(const LookParams& look, const FrameInfo& frame, float dt) {
     (void)frame;
     if (!look.death.enabled || fighterVolume_ <= 0.f) return;
@@ -2711,7 +2884,13 @@ void Renderer::updateDeaths(const LookParams& look, const FrameInfo& frame, floa
             if (f.respawnT <= 0.f) respawnFighter(i, look);
             continue;
         }
-        if (f.carved >= fighterVolume_ * thresh) collapseFighter(i, look);
+        // Two ways to die, one collapse. A bisection skips the ledger test
+        // entirely — that is the point of it — but everything downstream is the
+        // same path, so the remaining mass is conserved identically whether a
+        // fighter went at 50% or at 2%.
+        if (f.bisected || f.carved >= fighterVolume_ * thresh) {
+            collapseFighter(i, look);
+        }
     }
 }
 
@@ -2789,6 +2968,33 @@ void Renderer::updateConservation(const LookParams& look, const FrameInfo& frame
     lastSimTime_ = frame.time;
     bool poseStep = frame.poseTime != lastPoseTime_;
     lastPoseTime_ = frame.poseTime;
+
+    // R22: the mitts' deflection bleeds back toward the pose the rig wants.
+    // Runs before updateBrushRig below, so a hand that is no longer touching
+    // anything is already on its way home this frame.
+    //
+    // LINEAR, in m/s, like Body::knock and for the same reason: an exponential
+    // return asymptotes and never quite arrives, and a mitt that never quite
+    // comes back is a fighter whose idle pose drifts for the rest of the match.
+    // It is deliberately NOT quantized to the pose grid — the punch arc it
+    // rides is not either (a strike is carved between consecutive frames, so a
+    // display that jumped 12 times a second would cut in stripes).
+    if (dt > 0.f) {
+        const float drop = std::max(look.impact.glanceDecay, 0.f) * dt;
+        for (Fighter& f : fighters_) {
+            for (int side = 0; side < 2; side++) {
+                float* g = f.glance[side];
+                const float len =
+                    std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+                if (len <= drop || len < 1e-6f) {
+                    g[0] = g[1] = g[2] = 0.f;
+                } else {
+                    const float sc = (len - drop) / len;
+                    for (int k = 0; k < 3; k++) g[k] *= sc;
+                }
+            }
+        }
+    }
 
     // M-DEATH, and it must run HERE — after absorbMeasured, before the dribble.
     // A collapse works by handing the remaining mass to `debt`, so it has to
@@ -3132,7 +3338,7 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                 (i == 0 && swordWorld_.enabled && look.hands.ik) ? &swordWorld_
                                                                  : nullptr;
             updateBrushRig(f.pieces, f.handPose, f.disp, look,
-                           grip, frame.poseTime);
+                           grip, frame.poseTime, f.glance);
         }
     }
 
@@ -3312,6 +3518,10 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
     // the weapons run rather than after the sim reads them. A stale contact
     // surviving one frame is a shove that keeps pushing after the fist has
     // withdrawn, which reads as the target being magnetically repelled.
+    // Cheap, and it keeps a `set look.bodyColor...` from ctl reaching the clay
+    // a carve exposes without a re-import.
+    applyBodyColors(look);
+
     contacts_.clear();
     updateBladeCut(look);
     updatePunchCut(look);

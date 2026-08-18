@@ -222,6 +222,12 @@ void CtlServer::buildRegistry() {
     addF("impact.bruiseColor", l->impact.bruiseColor, 3);
     addF("impact.smear", &l->impact.smear);
     addF("impact.smearRadius", &l->impact.smearRadius);
+    addF("impact.glance", &l->impact.glance);
+    addF("impact.glanceDecay", &l->impact.glanceDecay);
+    addB("death.bisect", &l->death.bisect);
+    addF("death.bisectRadius", &l->death.bisectRadius);
+    addF("look.bodyColor0", l->bodyColor[0], 3);
+    addF("look.bodyColor1", l->bodyColor[1], 3);
     if (refs_.ai) {
         AiParams* a = refs_.ai;
         addB("ai.enabled", &a->enabled);
@@ -250,6 +256,11 @@ void CtlServer::buildRegistry() {
         addF("phys.knockMax", &ph->knockMax);
         addF("phys.knockDamp", &ph->knockDamp);
         addF("phys.recoil", &ph->recoil);
+        addF("phys.massKnock", &ph->massKnock);
+        addF("phys.massMin", &ph->massMin);
+        addF("phys.hitstop", &ph->hitstop);
+        addF("phys.hitstopBite", &ph->hitstopBite);
+        addF("phys.hitstopCool", &ph->hitstopCool);
         addF("phys.stagger", &ph->stagger);
         addF("phys.staggerBite", &ph->staggerBite);
         addF("phys.staggerControl", &ph->staggerControl);

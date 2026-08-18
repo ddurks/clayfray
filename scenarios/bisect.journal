@@ -1,0 +1,35 @@
+# clayfray scenario: a real BLADE SWEEP, and the M-DEATH bisection kill.
+# Replay: ./build/clayfray --replay scenarios/bisect.journal \
+#   --screenshot out.png --frames 160 --size 320x180 --aa 1
+# Exit 3 = conservation violation.
+#
+# This is the ONLY journal that drives an actual blade sweep, and it was worth
+# writing for that alone: carve-duel does its damage with scripted `edit carve`
+# lines, so updateBladeCut's contact + cut path had no headless coverage at all.
+#
+# Three things about it are load-bearing and none are obvious:
+#   - TICKS MUST EXCEED 24. Replay starts at --time 2.0 by default, so frame 0
+#     is already pose tick 24 and every entry at or below it fires before the
+#     first render. A journal numbered from 0 looks like it does nothing.
+#   - THE SWING IS A HERO YAW, not sword.yaw. resolveSword adds the fighter's
+#     yaw to the sword's, and the guard pose is VERTICAL (pitch = pi/2), so
+#     yawing a vertical blade barely moves its tip. Pitch it flat first, then
+#     turn the body: that sweeps ~0.08 m per frame, well past the 0.012 m gate.
+#   - THE HILT MUST START SHORT OF THE TARGET AND THE TIP FINISH PAST IT. The
+#     body capsule is r=0.221 at z=0.75, i.e. z in 0.529..0.971, and the blade
+#     is 0.85 long — so a hilt at z=0.15 puts the tip at 1.00 and the blade
+#     spans it with clay outside both ends. That is exactly what the bisection
+#     test asks for; a hilt inside the body is a sword shoved in, not through.
+0 set ai.enabled 0
+0 set fighter.pos 0 0 0
+0 set fighter.yaw -0.7
+0 set sword.enabled 1
+0 set sword.pos 0 0.35 0.15
+0 set sword.pitch 0
+0 set p1.pos 0 0 0.75
+27 set fighter.yaw -0.35
+28 set fighter.yaw -0.12
+29 set fighter.yaw 0
+30 set fighter.yaw 0.12
+31 set fighter.yaw 0.35
+32 set fighter.yaw 0.7

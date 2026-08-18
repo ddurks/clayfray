@@ -401,6 +401,10 @@ class BrickSystem {
     static std::shared_ptr<MeshImport> prepareImport(Gpu& gpu,
                                                      const CharacterAsset& asset);
     void requestImport(std::shared_ptr<MeshImport> mesh);
+    // Cheap and idempotent: stores the colour, and refreshes the voxelizer's
+    // uniform if one exists yet. Call it BEFORE requestImport for it to reach
+    // the imported skin.
+    void setBodyColor(const float c[3]);
     // Drops edits that would cross the volume boundary (a clipped blob
     // renders as corruption).
     void queueEdit(const BrickEdit& e);
@@ -519,6 +523,13 @@ class BrickSystem {
     wgpu::BindGroup vxG0_, vxG1_, vxG2_;
     // Mesh inputs, shared with every other fighter of the same character.
     std::shared_ptr<MeshImport> mesh_;
+    // This fighter's clay colour, linear rgb. Read by BOTH write paths — the
+    // voxelizer through voxColor_ at import, and every edit through
+    // EditParams::bodyColor — which is what makes a wound the same colour as
+    // the body around it. Defaults to the old hardcoded cyan so a caller that
+    // never sets one still gets clay rather than black.
+    float bodyColor_[3] = {0.024f, 0.19f, 0.25f};
+    wgpu::Buffer voxColor_; // 16 B uniform; see trap 8 in voxelize.wgsl
     // Per-fighter scratch: the voxel parity lattice is written by this
     // volume's own import pass, so it is NOT shared.
     wgpu::Buffer vxParityBuf_;

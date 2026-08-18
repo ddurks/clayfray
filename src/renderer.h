@@ -78,6 +78,12 @@ class Renderer {
     BrickSystem& brick() { return fighters_[0].vol; }
     BrickSystem& playerBrick(int i) { return fighters_[clampPlayer(i)].vol; }
     void setCharacter(CharacterAsset asset);
+    // Push LookParams::bodyColor into every fighter's BrickSystem. MUST be
+    // called before setCharacter for the colours to reach the imported SKIN —
+    // the voxelizer runs once and bakes what it is given. render() calls it
+    // every frame as well, which costs three float stores and keeps freshly
+    // exposed interior following the ctl param even after import.
+    void applyBodyColors(const LookParams& look);
     const SplootStats& sploot() const { return sploot_; }
 
     // Sim-state snapshots (M-DEV): body volume + ground field + ledger +
@@ -139,6 +145,12 @@ class Renderer {
         float bite = 0.f; // m
         float dir[3] = {0.f, 0.f, 1.f}; // weapon travel, unit
         float speed = 0.f;              // m/s
+        // Outward surface normal where the weapon is DEEPEST, unit. Paired
+        // with `dir` it says how square the hit was: a strike driven straight
+        // in has dot(dir, -nrm) == 1, one skidding along the skin has 0. The
+        // sim scales the shove, the stagger and the hitstop by that, so a
+        // graze cannot do what a clean hit does (PhysicsParams::grazeKnock).
+        float nrm[3] = {0.f, 1.f, 0.f};
     };
     const std::vector<StrikeContact>& contacts() const { return contacts_; }
 
@@ -325,6 +337,13 @@ class Renderer {
         // now leaves a wound made of disconnected bites.
         float handPrev[2][3] = {{0, 0, 0}, {0, 0, 0}};
         bool haveHandPrev = false;
+        // R22: where each mitt has been pushed OUT to by the clay it hit,
+        // world metres, decaying back to zero. A fist that would drive through
+        // a body rides its surface instead, and since updatePunchCut reads the
+        // fist off the piece this offset moves, the deflection feeds back into
+        // the next frame's penetration. Transient by construction (it is gone
+        // in ~0.2 s), so it is deliberately not serialized.
+        float glance[2][3] = {{0, 0, 0}, {0, 0, 0}};
         // Its own clip clock, so two identical bodies don't breathe in
         // lockstep — that reads as one puppet duplicated, not two actors.
         float animT = 0.f;
@@ -341,6 +360,11 @@ class Renderer {
         // from `enabled`, which means "this player slot is in play at all" and
         // is permanently true for the hero — the hero has to be able to die.
         bool dead = false;
+        // Cut clean through the middle by a blade this frame. Latched rather
+        // than tested in updateDeaths because the geometry that proves it only
+        // exists inside updateBladeCut, and cleared by respawnFighter — a body
+        // that comes back carrying it would die again on its first frame.
+        bool bisected = false;
         float respawnT = 0.f; // s left face-down
     };
 
@@ -373,7 +397,8 @@ class Renderer {
     // `poseTime` is the 12 Hz clock the hand bob steps on.
     void updateBrushRig(std::vector<AffinePiece>& pieces, const int handPose[2],
                         const FighterPose& disp, const LookParams& look,
-                        const SwordParams* grip, float poseTime) const;
+                        const SwordParams* grip, float poseTime,
+                        const float glance[2][3]) const;
     // Palm position and orientation for ONE unarmed mitt, in CHARACTER space
     // (before the body affine and the per-side mirror). Split out because the
     // punch cut needs the same answer the rig draws, and re-deriving it would
@@ -441,6 +466,11 @@ class Renderer {
     bool playerAlive(int i) const {
         return playerEnabled(i) && i >= 0 && i < kMaxPlayers && !fighters_[i].dead;
     }
+    // M-MASS: how much of this fighter's clay is still on it, 1 = untouched.
+    // The SAME number M-DEATH thresholds on, expressed the other way up, so a
+    // body cannot be visibly whole and secretly light. 1 for the analytic blob
+    // (no mesh volume, so nothing to be a fraction of) and for a dead one.
+    float massFrac(int i) const;
     // Consumes a one-shot "this fighter just respawned" flag.
     //
     // It exists because a respawn TELEPORTS a body, and for the hero that body
@@ -537,7 +567,7 @@ class Renderer {
     // kOpsPerFrame capsule carves as it sweeps, and six separate shoves off one
     // swing would multiply knockback by the substep count.
     void reportContact(int attacker, int target, int side, float bite,
-                       const float dir[3], float speed);
+                       const float dir[3], float speed, const float nrm[3]);
 
     // ---- sword slice sploot ----
     // A slice is a CONTIGUOUS RUN OF CUTTING POSE STEPS: it opens on the first

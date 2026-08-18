@@ -240,6 +240,81 @@ struct PhysicsParams {
     float stagger = 0.20f;        // s of reduced steering on a full-strength hit
     float staggerBite = 0.05f;    // m of bite that earns all of it
     float staggerControl = 0.45f; // authority kept while staggered; never 0
+
+    // ---- M-MASS: a fighter weighs what is left of it ----
+    // Damage here is the clay that LEFT the body — M-DEATH's carved ledger,
+    // measured against the brushes' own mesh volume — so the mass is already
+    // measured and there is no second number to keep in step. Feeding it back
+    // into knockback is Smash's percentage mechanic with the percentage
+    // DERIVED instead of invented: a fresh 91-litre fighter barely rocks, one
+    // near the collapse threshold gets thrown, and the end of a fight
+    // accelerates on its own without a scripted stage.
+    //
+    // Reading the ledger — a GPU readback landing a frame or two late — is
+    // legal here for exactly the reason it is legal for the death threshold
+    // and illegal for resistance (see the note at the top of this struct):
+    // mass is SLOW-VARYING. A frame of lag on a number that moves by a
+    // fraction of a percent per hit is invisible; a frame of lag on a strike's
+    // own clock is not.
+    //
+    // It scales COLLISION response only — knockback and the body push-out —
+    // and never locomotion. A hurt fighter is easier to shove, not faster on
+    // its feet: self-driven acceleration is muscle, not inertia, and making
+    // the loser more mobile is a comeback mechanic somebody should choose
+    // deliberately rather than a side effect of losing clay.
+    float massKnock = 1.f; // 0 = the old constant shove, 1 = fully 1/mass
+    // Floor under the mass fraction so 1/m cannot run away. The shipping death
+    // threshold is 0.5, so mass only ever reaches 0.5 and this never binds —
+    // it is here for `set death.threshold 0.9`, which otherwise makes the last
+    // hit of a fight a ten-fold shove.
+    float massMin = 0.4f;
+
+    // ---- hitstop: the animator's held pose ----
+    // The world stops dead for one 12 Hz pose step when a hit lands. This is
+    // not a fighting-game trick borrowed and dressed up as clay — holding a
+    // pose on the impact frame is what a stop-motion animator DOES, and every
+    // visible thing in this game is already quantized to that grid.
+    //
+    // It freezes the SIM, not just the display. stepWorld consumes its ticks
+    // without stepping anything and returns how many it actually ran, and its
+    // three callers advance the render clock by that instead of by the tick
+    // budget — so nothing slides underneath a frozen picture, and the journal's
+    // pose ticks stay pinned to the world they describe. A held frame changes
+    // no traced input, so frame reuse skips the trace: hitstop is CHEAPER than
+    // motion, not more expensive.
+    //
+    // IT FIRES ON THE RISING EDGE OF A CONTACT, and that is load-bearing.
+    // Contact is reported for every frame a weapon ploughs through, so a hold
+    // re-armed off a live contact would freeze the game for as long as a fist
+    // stayed buried — the exact shape of the bug that `staggerControl` above
+    // exists to document, one mechanic over.
+    // A HOLD IS BINARY — hold the frame or don't. It was `hitstop * hit`,
+    // which sounds reasonable and measured 0.006..0.051 s over a real AI
+    // brawl: never once even half its nominal length, i.e. one to three ticks,
+    // i.e. nothing anybody can see. A stop-motion animator does not hold a
+    // pose 40% of the way.
+    float hitstop = 0.085f;     // s of dead freeze; 0 = off. One pose step is 1/12.
+    float hitstopBite = 0.02f;  // m of bite a hit needs before it holds at all
+    // Seconds before the SAME (attacker, target, weapon) may freeze the world
+    // again, and it is what makes a full-length hold safe. Contact flickers:
+    // updatePunchCut drops a fist below `cutSpeed`, so one punch reports a
+    // rising edge on alternating frames as it slows at the apex of its arc. A
+    // rising-edge test alone re-armed several times per punch, which at 1-3
+    // ticks was merely invisible and at a full step would lock the game solid.
+    // Sits between the AI's punchDur (0.30) and its punchCooldown (0.75), so a
+    // jab freezes the world once.
+    float hitstopCool = 0.35f;
+
+    // THERE IS NO `grazeKnock`, AND THERE WAS. Scaling the shove by
+    // -dot(travel, normal) is correct for a rigid impulse and wrong for
+    // anything sampled a frame at a time: a punch reciprocates, so at the
+    // instant it is deepest its radial velocity is ~0 and the frame delta is
+    // whatever the two bodies happened to be doing sideways. It printed
+    // 0.88, 0.00, 0.69, 0.00, 0.29 on consecutive contacts of one brawl.
+    // `bite` is the stable version of the same idea — a weapon skidding along
+    // the skin does not penetrate — so the two were double-counting a quantity
+    // that was only trustworthy once. The contact normal survives, but only
+    // where it is read at the DEEPEST sample: the glance and the dent axis.
 };
 
 // R20/R21: what a landing strike does to the CLAY, as opposed to what it does
@@ -301,6 +376,58 @@ struct ImpactParams {
     float bruiseColor[3] = {0.030f, 0.012f, 0.020f};
     float smear = 0.35f;       // 0..1 opacity of a blade's contamination trail
     float smearRadius = 1.6f;  // x the cut radius: the slot, plus its lips
+
+    // ---- the glance (FISTS ONLY) ----
+    // A fist does not punch cleanly through clay, it skids off it. Every frame
+    // a mitt is inside a body, `glance` is the fraction of that penetration
+    // REFUSED: the piece is pushed back out along the surface normal, and the
+    // punch arc's remaining — tangential — motion drags it across the skin.
+    //
+    // The wound falls out of that for free, which is why there is no separate
+    // "scrape" mode. The rupture is already carved along the fist's own path
+    // between two frames, so a fist held at the surface cuts a shallow furrow
+    // exactly where a fist driven through cut a bore. Same edit, same ledger,
+    // different geometry.
+    //
+    // IT FEEDS BACK, and that is what makes it a ratio rather than a rate.
+    // The offset moves the mitt's piece; updatePunchCut reads the fist's world
+    // position off that same piece, so next frame the penetration it measures
+    // is already smaller. The loop has a fixed point: an animated drive that
+    // WANTED to bury the fist p0 deep settles at an offset of
+    // glance*p0/(1 + glance) and a real penetration of
+    //
+    //     p = p0 / (1 + glance)
+    //
+    // frame rate independent, no clamp required. So 0.8 means a punch lands at
+    // ~55% of the depth the arc asked for; 1 is half; 3 is a quarter. The AI
+    // closes to a standoff tuned for a ~0.13 m jab, which at the default lands
+    // ~0.072 m in — still well past the ~0.015 m the rupture needs to break the
+    // skin, but a visibly shallower wound.
+    //
+    // IT COSTS DAMAGE, so measure before re-tuning it away. Total carved over
+    // scenarios/carve-duel.journal (426 frames, 640x360 aa1), which is mostly
+    // BLADE work — the blade does not glance, so the cost per PUNCH is steeper
+    // than the scenario total:
+    //
+    //   | glance | hitstop | carved  |
+    //   |--------|---------|---------|
+    //   |    0   |    0    | 7441 ml |
+    //   |   0.8  |    0    | 6112 ml  (-18%)
+    //   |    0   |   on    | 6993 ml  (-6%, hitstop simply runs less world)
+    //   |   0.8  |   on    | 5210 ml  (-30%, shipping)
+    //
+    // `punchCarve` is the dial if you want the old damage back at the new
+    // shape.
+    //
+    // A BLADE DOES NOT GLANCE, and the asymmetry is the point — cutting
+    // through is what a blade is for. The sword opens you; the fist skids and
+    // scrapes. `set impact.glance 0` restores the old drive-straight-through
+    // fist.
+    float glance = 0.8f;
+    // m/s, not a half-life: the deflection is a LENGTH, and the linear return
+    // is the one that actually reaches zero. A typical ~50 mm push-out is home
+    // in ~0.4 s, which is the follow-through after a fist has skidded clear.
+    float glanceDecay = 0.12f;
 };
 
 // M-FIST: the opponent's behaviour. Deterministic by the house rules — fixed
@@ -632,6 +759,29 @@ struct DeathParams {
     float threshold = 0.5f;
     float respawn = 2.6f;     // s face-down before coming back
 
+    // ---- cut clean in half, and it does not matter how full you are ----
+    // A blade that enters one side of the body and leaves the other, close
+    // enough to the central axis, kills on the spot — through the SAME collapse
+    // the threshold uses, so the ledger, the burst, the heap and the loose eyes
+    // are all exactly as they are for a fighter that bled out.
+    //
+    // It is not connectivity analysis. Asking the field whether the solid is in
+    // two pieces means a GPU pass and a blocking readback (illegal on web,
+    // trap 9), so this asks the CAPSULE test everything else here already runs
+    // a different question: did the blade span the body capsule with clay
+    // outside it at BOTH ends, and did it pass near the axis? A 0.85 m blade
+    // against a 0.44 m body has room to do that with plenty sticking out.
+    //
+    // BLADE ONLY, by construction rather than by a flag: a fist is a ball and a
+    // ball cannot bisect anything. Same asymmetry the R22 glance draws — the
+    // sword opens you, the fist skids off.
+    bool bisect = true;
+    // How close to the body's central axis the cut must pass, as a fraction of
+    // the capsule radius (0.221 m on this asset, so 0.4 is within ~88 mm of the
+    // spine). 1.0 makes any complete pass count, including one that shaves the
+    // shoulder, which is a decapitation rather than a bisection.
+    float bisectRadius = 0.4f;
+
     // ---- how the leftover mass leaves ----
     // A collapsing fighter sheds ~46 litres at the shipping threshold, and the
     // dribble spawner cannot carry that: it moves at most twelve 35 ml gobs per
@@ -696,6 +846,35 @@ struct LookParams {
 
     float ambient[3] = {0.016f, 0.012f, 0.009f};
     float aoStrength = 1.15f;
+
+    // ---- what each fighter is MADE OF (linear rgb, one per player slot) ----
+    // IT IS THE COLOUR ALL THE WAY THROUGH, and that is why it lives here
+    // rather than in the .glb. The asset ships near-white vertex colours, and
+    // the volume used to take its SURFACE albedo from those while any brick
+    // allocated later took a hardcoded clay cyan — so a fighter read light grey
+    // until you cut it open and found a different clay underneath. Both sources
+    // read this now: the voxelizer paints the imported skin with it and
+    // edit.wgsl paints every freshly allocated brick with it, both through the
+    // same rest-space mottle at the same frequency, so the mottle is CONTINUOUS
+    // across a cut instead of being a surface texture that stops at the wound.
+    //
+    // Sized 4 so raising BrickSystem::kMaxFighters does not have to touch this;
+    // a static_assert in renderer.cpp catches it if the cap ever passes 4.
+    //
+    // The SKIN is fixed at import. Setting this later still repaints newly
+    // exposed clay — it rides every edit's uniform — but the already-voxelized
+    // surface keeps what it imported with, because repainting that means
+    // re-voxelizing. So set it in a journal's tick 0, or accept a two-tone body.
+    float bodyColor[4][3] = {
+        // Pushed bluer than a naive "light blue" because the key is WARM
+        // (1.0, 0.70, 0.40) and desaturates it on the way to the eye — the
+        // first pass at sRGB 0.55/0.78/0.92 rendered as pale grey next to the
+        // green. Judge these in the app, not in the numbers.
+        {0.196f, 0.507f, 0.869f}, // p0 light blue   (sRGB 0.48 0.74 0.94)
+        {0.319f, 0.748f, 0.319f}, // p1 light green  (sRGB 0.60 0.88 0.60)
+        {0.828f, 0.640f, 0.263f}, // p2 light amber
+        {0.720f, 0.330f, 0.640f}, // p3 light violet
+    };
 
     float detailAmount = 0.8f; // thumbprint/tool-mark normal perturbation
     float boilAmount = 0.5f;   // per-pose-step detail reseed (stop-motion boil)
