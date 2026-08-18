@@ -906,6 +906,23 @@ struct LookParams {
     float keyIntensity = 19.0f;
     float keyColor[3] = {1.0f, 0.70f, 0.40f};
     float keyFalloff = 1.4f; // attenuation = intensity / (1 + falloff * d^2)
+    // ---- the pool of light follows the hero ----
+    // The key has always been a SPOTLIGHT — trace.wgsl raises dot(-lk, spotDir)
+    // to the 7th power — but it aimed at a hardcoded world point, the arena
+    // centre at chest height. So the lit pool sat where the fighter happened to
+    // start and he walked out of it into the dark. Now the aim point is a
+    // uniform and it tracks him, which is what a theatre follow-spot does.
+    //
+    // Both halves are separately dialable because they do different jobs:
+    //   aim   moves the POOL, and is what actually keeps him lit
+    //   track slides the LAMP, which decides whether the light on him changes
+    //         as he crosses the arena (0) or stays constant (1)
+    // At track 0 the lamp is fixed and the spot swings across the floor, so
+    // his modelling changes with position and his shadow sweeps around — more
+    // dramatic, and the reason it is not simply hardwired to 1.
+    bool keyFollow = true;
+    float keyAimHeight = 0.55f; // aim this far above his feet, metres
+    float keyLampTrack = 0.85f; // 0 = lamp stays put, 1 = lamp rides along
 
     // Rim light: a cool Fresnel edge from the UNLIT side. `rim` peaks where
     // the surface turns away from the camera (pow(1 + dot(n, rd), 2.5) in

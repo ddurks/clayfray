@@ -535,6 +535,7 @@ const char* Renderer::uniformSlotName(int s) {
     if (s == kSlotSwordA + 2) return "swordCol";
     if (s == kSlotFocus) return "focus (foveation centre/size)";
     if (s == kSlotFocusMeta) return "focusMeta (foveation)";
+    if (s == kSlotKeyAim) return "keyAim (follow-spot target)";
     // One name per fighter block, so CLAYFRAY_DEBUG_REUSE blames the body that
     // actually moved rather than a bare slot number.
     static char buf[48];
@@ -1025,13 +1026,33 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     Vec3 pos = cam.pos();
     float aspect = (float)width_ / (float)height_;
 
+    // ---- follow-spot: where the lamp is, and where it points ----
+    // Off the hero's DISPLAY pose, not the sim pose: it is the position the
+    // frame is drawn at, so the light cannot lead or lag the body it is lighting
+    // by a frame. It is also what keeps this free for frame reuse — a standing
+    // fighter's display root does not move, so neither does the light.
+    float keyP[3] = {look.keyPos[0], look.keyPos[1], look.keyPos[2]};
+    float keyAim[3] = {0.f, 0.55f, 0.f}; // the old hardcoded aim, as the default
+    if (look.keyFollow) {
+        const FighterPose& hero = fighters_[0].disp;
+        keyAim[0] = hero.pos[0];
+        keyAim[1] = hero.pos[1] + look.keyAimHeight;
+        keyAim[2] = hero.pos[2];
+        // The lamp slides with him in XZ only. Not in Y: the hopper bounces at
+        // 2.3 Hz, and a lamp riding that would pulse the brightness of the
+        // whole arena in time with his stride.
+        const float t = std::min(std::max(look.keyLampTrack, 0.f), 1.f);
+        keyP[0] += (hero.pos[0] - 0.f) * t;
+        keyP[2] += (hero.pos[2] - 0.f) * t;
+    }
+
     float packed[14][4] = {
         {pos.x, pos.y, pos.z, cam.fovY},
         {right.x, right.y, right.z, aspect},
         {up.x, up.y, up.z, frame.time},
         {fwd.x, fwd.y, fwd.z, frame.poseTime},
         {(float)width_, (float)height_, frame.grainFrame, (float)frame.aaSamples},
-        {look.keyPos[0], look.keyPos[1], look.keyPos[2], look.keyIntensity},
+        {keyP[0], keyP[1], keyP[2], look.keyIntensity},
         {look.keyColor[0], look.keyColor[1], look.keyColor[2], look.keyFalloff},
         {look.rimDir[0], look.rimDir[1], look.rimDir[2], look.rimIntensity},
         {look.rimColor[0], look.rimColor[1], look.rimColor[2], 0.f},
@@ -1379,6 +1400,10 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
         out[kSlotFocusMeta][1] = (float)coarseFactor(look);
         out[kSlotFocusMeta][2] = std::max(fp.blur, 0.f); // 0 = no post defocus
     }
+
+    out[kSlotKeyAim][0] = keyAim[0];
+    out[kSlotKeyAim][1] = keyAim[1];
+    out[kSlotKeyAim][2] = keyAim[2];
     out[kSlotSceneMeta][0] = (float)live;
     // joint smin k: with disjoint brush regions the blend only bridges
     // hairline handoff cracks; ~2 voxels seals them without re-introducing
@@ -1394,13 +1419,12 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // ground field's clay top bound (0 disables the field in the tracer).
     // These slots are hand-mirrored in trace.wgsl AND pick.wgsl (trap 2);
     // this static_assert catches only the C++ side overrunning the buffer.
-    static_assert(kSlotFocusMeta + 1 == kUniformSlots &&
+    static_assert(kSlotKeyAim + 1 == kUniformSlots &&
                       kSlotFocus == kSlotFighters + kFighterSlots * kMaxPlayers,
                   "the fighter blocks must end exactly where the focus pair "
-                  "begins, and the focus pair must end exactly at "
-                  "kUniformSlots; keep the Uniforms struct in trace.wgsl + "
-                  "pick.wgsl + post.wgsl (whose pad is FOCUS_PAD, generated "
-                  "from kSlotFocus) in sync");
+                  "begins, and keyAim must end exactly at kUniformSlots; keep "
+                  "the Uniforms struct in trace.wgsl + pick.wgsl + post.wgsl "
+                  "(whose pad is FOCUS_PAD, generated from kSlotFocus) in sync");
     int gn = std::min((int)gobs_.size(), kMaxGobs);
     for (int i = 0; i < gn; i++) {
         const Gob& g = gobs_[i];

@@ -202,7 +202,10 @@ class Renderer {
     // wgslConstants() rather than hand-counted the way the spike did it.
     static constexpr int kSlotFocus = kSlotFighters + kFighterSlots * kMaxPlayers;
     static constexpr int kSlotFocusMeta = kSlotFocus + 1;
-    static constexpr int kUniformSlots = kSlotFocusMeta + 1;
+    // Where the key SPOTLIGHT points. It was a literal in trace.wgsl — the
+    // arena centre — which is why the lit pool never followed anyone.
+    static constexpr int kSlotKeyAim = kSlotFocusMeta + 1;
+    static constexpr int kUniformSlots = kSlotKeyAim + 1;
     void packUniforms(const OrbitCamera& cam, const LookParams& look,
                       const FrameInfo& frame, float out[kUniformSlots][4]) const;
     // First slot of fighter i's block.

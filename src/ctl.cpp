@@ -121,6 +121,9 @@ void CtlServer::buildRegistry() {
     addF("look.keyIntensity", &l->keyIntensity);
     addF("look.keyColor", l->keyColor, 3);
     addF("look.keyFalloff", &l->keyFalloff);
+    addB("look.keyFollow", &l->keyFollow);
+    addF("look.keyAimHeight", &l->keyAimHeight);
+    addF("look.keyLampTrack", &l->keyLampTrack);
     addF("look.rimDir", l->rimDir, 3);
     addF("look.rimIntensity", &l->rimIntensity);
     addF("look.rimColor", l->rimColor, 3);

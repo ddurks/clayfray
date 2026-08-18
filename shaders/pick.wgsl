@@ -55,6 +55,7 @@ struct Uniforms {
   // clean, and renders black.
   focus: vec4f,
   focusMeta: vec4f,
+  keyAim: vec4f,   // xyz = where the key SPOTLIGHT points
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read_write> pickOut: array<vec4f>;

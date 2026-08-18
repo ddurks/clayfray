@@ -77,6 +77,7 @@ struct Uniforms {
                      // full-res boundary, w = ellipse x/y aspect
   focusMeta: vec4f,  // x = defocus ramp width INSIDE that boundary,
                      // y = coarse block N (1 = off), z = post defocus radius
+  keyAim: vec4f,   // xyz = where the key SPOTLIGHT points
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var hdrOut: texture_storage_2d<rgba16float, write>;
@@ -410,7 +411,10 @@ fn shade(p: vec3f, rd: vec3f, m: f32) -> vec3f {
   let toKey = u.keyPos.xyz - p;
   let dk = length(toKey);
   let lk = toKey / dk;
-  let spotDir = normalize(vec3f(0.0, 0.55, 0.0) - u.keyPos.xyz);
+  // The aim point is a UNIFORM now, not this literal. It was the arena centre
+  // at chest height, so the lit pool sat where the fighter happened to start
+  // and he walked out of it — the spot never followed anybody.
+  let spotDir = normalize(u.keyAim.xyz - u.keyPos.xyz);
   let cone = pow(clamp(dot(-lk, spotDir), 0.0, 1.0), 7.0);
   let att = cone * u.keyPos.w / (1.0 + u.keyColor.w * dk * dk);
   // Shadow-ray origin bias. Must clear ONE CELL, not one voxel: an
