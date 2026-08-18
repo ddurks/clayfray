@@ -379,6 +379,23 @@ class Renderer {
         // exists inside updateBladeCut, and cleared by respawnFighter — a body
         // that comes back carrying it would die again on its first frame.
         bool bisected = false;
+        // ---- the two halves of a cut body, falling as SOLIDS ----
+        // Not a new volume and not a new brush: the body brush is drawn TWICE,
+        // clipped to opposite sides of the cut by the rest AABB the piece
+        // already carries (brick_read.wgsl's `max(field, boxDist)`), with a
+        // rigid world motion post-multiplied onto each. The sliced face is the
+        // box plane itself — flat, exact, and free.
+        struct Severed {
+            float vel[3] = {0, 0, 0};
+            float pos[3] = {0, 0, 0};   // world translation since the cut
+            float axis[3] = {1, 0, 0};  // tumble axis, world
+            float pivot[3] = {0, 0, 0}; // world point the tumble turns about
+            float ang = 0.f, angVel = 0.f;
+            bool landed = false;
+        };
+        Severed sev[2];          // 0 = below the cut, 1 = above it
+        float bisectRestY = 0.f; // the cut plane, in the volume's REST space
+        float bisectT = 0.f;     // seconds left before the halves sploot
         float respawnT = 0.f; // s left face-down
     };
 
@@ -547,6 +564,14 @@ class Renderer {
     void updateDeaths(const LookParams& look, const FrameInfo& frame, float dt);
     bool respawned_[kMaxPlayers] = {}; // one-shot, drained by takeRespawn
     void collapseFighter(int i, const LookParams& look);
+    // B-SEVER: set the two halves in motion, integrate them, and rewrite the
+    // frame's pieces as two clipped copies of the body brush.
+    void beginSever(Fighter& f, const float cutWorld[3], const float tip[3],
+                    const float hilt[3], const LookParams& look);
+    void stepSevered(Fighter& f, const LookParams& look, float dt);
+    void applySever(Fighter& f) const;
+    // Which half a rest-space point rides. Null only when there are no pieces.
+    const float* bodyXformFor(const Fighter& f, const float rest[3]) const;
     void respawnFighter(int i, const LookParams& look);
     // The eyes, once nothing is wearing them. Four beads per collapse, and a
     // dead fighter frees exactly the four marble slots its corpse used to

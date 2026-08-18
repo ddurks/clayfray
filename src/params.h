@@ -822,6 +822,19 @@ struct DeathParams {
     // spine). 1.0 makes any complete pass count, including one that shaves the
     // shoulder, which is a decapitation rather than a bisection.
     float bisectRadius = 0.4f;
+    // ---- and then the halves FALL, instead of bursting ----
+    // A bisection that instantly splooted read as "the fighter exploded", not
+    // as "the fighter was cut in half" — the evidence of the cut was gone in
+    // the same frame it was made. So the two halves stay solid, drop, and lie
+    // there for `bisectLinger` seconds with the sliced faces showing; only
+    // then does the ordinary collapse run. Conservation is untouched by the
+    // delay: no clay has left the body while it is in one (well, two) pieces,
+    // so the ledger simply resolves later.
+    bool bisectFall = true;
+    float bisectLinger = 2.2f; // s the halves lie there before splooting
+    float bisectPush = 1.4f;   // m/s the top half is thrown along the blade
+    float bisectSpin = 1.8f;   // rad/s tumble, so it lands on its cut face
+    float bisectGravity = 6.0f; // m/s^2; lighter than real, it reads heavier
 
     // ---- how the leftover mass leaves ----
     // A collapsing fighter sheds ~46 litres at the shipping threshold, and the

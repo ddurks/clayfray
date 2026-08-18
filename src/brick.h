@@ -148,7 +148,18 @@ class BrickSystem {
     // hand-mirrored. The dead 13-piece inverse-LBS path wanted 16; a rigged
     // asset would have to raise this (and pay 12 uniform slots per piece per
     // fighter) before it could pose more than three.
-    static constexpr int kPiecesPerFighter = 3;
+    // FOUR is a CAPACITY, not a live count. The brush rig is three (body +
+    // two mitts) and a standing fighter still reports three, so the march loop
+    // — `for i < gPieceCount`, the hottest loop in the frame — does exactly the
+    // work it always did. The fourth slot exists for the moment a body is cut
+    // in half: the body brush becomes two pieces with the same volume clipped
+    // to opposite sides of the cut, each carrying its own rigid fall. Raising
+    // this costs kPieceSlots uniform slots per fighter and nothing per step.
+    static constexpr int kPiecesPerFighter = 4;
+    // What the brush rig itself uses. Kept separate so `pieces` is sized by
+    // the rig rather than by the capacity — sizing it by the capacity would
+    // hand the tracer a fourth piece to march through on every standing body.
+    static constexpr int kBrushPieces = 3;
 
     // ---- volume geometry: THE one place these are authored ----
     // kGrid is the only free knob; everything below derives from it, and

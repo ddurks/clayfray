@@ -1066,7 +1066,9 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
             if (m.bone >= 0 && (size_t)(m.bone * 16 + 16) <= f.skinMats.size()) {
                 matTransformPoint(&f.skinMats[m.bone * 16], m.pos, pos);
             } else if (brushRig && !f.pieces.empty()) {
-                matTransformPoint(f.pieces[0].xform, m.pos, pos);
+                if (const float* bx = bodyXformFor(f, m.pos)) {
+                    matTransformPoint(bx, m.pos, pos);
+                }
             }
             slotA[0] = pos[0]; slotA[1] = pos[1]; slotA[2] = pos[2];
             slotA[3] = m.radius;
@@ -1554,7 +1556,7 @@ void Renderer::setCharacter(CharacterAsset asset) {
         // Every fighter gets its own copy: same three brushes, but each
         // fighter's own pose writes its own `xform` per frame.
         for (Fighter& f : fighters_) {
-            f.pieces.resize(BrickSystem::kPiecesPerFighter);
+            f.pieces.resize(BrickSystem::kBrushPieces);
             for (AffinePiece& ap : f.pieces) ap.srcBone = -1;
         }
 
@@ -2593,6 +2595,7 @@ void Renderer::updateBladeCut(const LookParams& look) {
             const int kS = 32;
             int firstIn = -1, lastIn = -1;
             float minAxis = 1e9f;
+            float cutW[3] = {0, 0, 0};
             for (int i = 0; i <= kS; i++) {
                 const float t = (float)i / (float)kS;
                 float p[3];
@@ -2616,7 +2619,13 @@ void Renderer::updateBladeCut(const LookParams& look) {
                     if (firstIn < 0) firstIn = i;
                     lastIn = i;
                 }
-                minAxis = std::min(minAxis, dist);
+                if (dist < minAxis) {
+                    minAxis = dist;
+                    // the point ON THE SPINE the blade passed closest to: that
+                    // is the cut plane's height, and the only sample of it we
+                    // will get — the blade has moved on by the next frame.
+                    std::memcpy(cutW, q, sizeof(cutW));
+                }
             }
             // BOTH ends outside. firstIn > 0 puts the hilt end in clear air and
             // lastIn < kS the tip, so the blade genuinely spans the body rather
@@ -2626,6 +2635,7 @@ void Renderer::updateBladeCut(const LookParams& look) {
             const float rad = std::min(std::max(look.death.bisectRadius, 0.f), 1.f);
             if (spans && minAxis <= cr * rad) {
                 tgt.bisected = true;
+                beginSever(tgt, cutW, tip, hilt, look);
                 std::printf("[death] player %d BISECTED (blade passed %.0f mm "
                             "from the axis, body r=%.0f mm)\n",
                             tgt.vol.slot(), minAxis * 1e3f, cr * 1e3f);
@@ -2822,6 +2832,182 @@ void Renderer::updateBladeCut(const LookParams& look) {
 // left of it is handed to the ledger as debt, the eyes come off, and the slot
 // goes quiet until it respawns.
 //
+// Which piece a rest-space point rides once the body is in two. Everything
+// that is CARRIED by the body — the eye beads, and the loose beads the
+// collapse throws — has to ask this, or it follows the wrong half: the beads
+// sit at the crown, and piece 0 is the half below the cut.
+const float* Renderer::bodyXformFor(const Fighter& f, const float rest[3]) const {
+    if (f.pieces.empty()) return nullptr;
+    if (f.bisected && (int)f.pieces.size() > BrickSystem::kBrushPieces &&
+        rest[1] >= f.bisectRestY) {
+        return f.pieces[BrickSystem::kPiecesPerFighter - 1].xform;
+    }
+    return f.pieces[0].xform;
+}
+
+// ---- B-SEVER: a body cut in two falls as two solids ----
+//
+// The whole feature is three numbers per half (a translation, a tumble, and a
+// pivot) and ONE extra piece. It creates no volume, no brush and no gob: the
+// body brush is simply drawn twice, each copy clipped to one side of the cut
+// by the rest AABB every piece already carries. brick_read.wgsl computes
+// `max(charDistRest(q), boxDist)`, so the sliced face IS the box plane —
+// perfectly flat, exactly at the cut, and costing nothing to produce.
+//
+// The cut plane is AXIS-ALIGNED IN REST SPACE, which is the one approximation
+// here and it is deliberate. The flourish sweeps horizontally at chest height,
+// so a horizontal plane is what the blade actually made; an oblique cut would
+// need the clip to be a half-space rather than a box, and that is a shader
+// change for a case the sword does not currently produce.
+void Renderer::beginSever(Fighter& f, const float cutWorld[3], const float tip[3],
+                          const float hilt[3], const LookParams& look) {
+    f.bisectT = std::max(look.death.bisectLinger, 0.f);
+    f.sev[0] = Fighter::Severed{};
+    f.sev[1] = Fighter::Severed{};
+    if (f.pieces.empty()) return;
+
+    // World cut point -> REST, through the body piece's own transform. It has
+    // to go through the affine and not just subtract the root: the body is
+    // squished, sheared and yawed, so a world height is not a rest height.
+    float inv[16];
+    matInvAffine(f.pieces[0].xform, inv);
+    float rest[3];
+    matTransformPoint(inv, cutWorld, rest);
+    const float lo = f.pieces[0].lo[1], hi = f.pieces[0].hi[1];
+    // Keep both halves non-degenerate: a cut at the very crown produces an
+    // empty top piece that still costs a march step at every sample.
+    const float pad = (hi - lo) * 0.12f;
+    f.bisectRestY = std::min(std::max(rest[1], lo + pad), hi - pad);
+
+    // The blade's own direction decides which way the top half goes, so the
+    // half travels the way the sword was travelling rather than in some
+    // arbitrary authored direction.
+    float dir[3] = {tip[0] - hilt[0], 0.f, tip[2] - hilt[2]};
+    float dl = std::sqrt(dir[0] * dir[0] + dir[2] * dir[2]);
+    if (dl < 1e-4f) {
+        dir[0] = 1.f;
+        dir[2] = 0.f;
+        dl = 1.f;
+    }
+    dir[0] /= dl;
+    dir[2] /= dl;
+    // Push the top half along the blade and tumble it about the horizontal
+    // axis perpendicular to that push — which is what topples it onto its cut
+    // face, the whole point of the exercise.
+    Fighter::Severed& top = f.sev[1];
+    top.vel[0] = dir[0] * look.death.bisectPush;
+    top.vel[1] = 0.f;
+    top.vel[2] = dir[2] * look.death.bisectPush;
+    top.axis[0] = -dir[2];
+    top.axis[1] = 0.f;
+    top.axis[2] = dir[0];
+    top.angVel = look.death.bisectSpin;
+    // Turn about the cut itself, not the body origin, or the top half swings
+    // through the bottom one on its way over.
+    std::memcpy(top.pivot, cutWorld, sizeof(top.pivot));
+
+    // The bottom half keeps its feet: it only sags the other way, which reads
+    // as the legs buckling rather than as a second projectile.
+    Fighter::Severed& bot = f.sev[0];
+    bot.axis[0] = dir[2];
+    bot.axis[1] = 0.f;
+    bot.axis[2] = -dir[0];
+    bot.angVel = look.death.bisectSpin * 0.22f;
+    std::memcpy(bot.pivot, f.disp.pos, sizeof(bot.pivot));
+    bot.pivot[1] = f.disp.pos[1];
+}
+
+// Ballistic, then it lies there. Same shape as the loose eyes above, and for
+// the same reason: this runs inside the deterministic tick, so no RNG and no
+// wall clock — a replay has to cut the same body into the same two halves and
+// land them in the same place.
+void Renderer::stepSevered(Fighter& f, const LookParams& look, float dt) {
+    if (f.pieces.empty()) return;
+    const float g = std::max(look.death.bisectGravity, 0.f);
+    // How far each half's own centre sits above the body's feet, so a half
+    // stops when IT touches the floor rather than when the root does.
+    const float lo = f.pieces[0].lo[1], hi = f.pieces[0].hi[1];
+    const float mid[2] = {(lo + f.bisectRestY) * 0.5f, (f.bisectRestY + hi) * 0.5f};
+    for (int h = 0; h < 2; h++) {
+        Fighter::Severed& sv = f.sev[h];
+        if (sv.landed) continue;
+        sv.vel[1] -= g * dt;
+        for (int k = 0; k < 3; k++) sv.pos[k] += sv.vel[k] * dt;
+        sv.ang += sv.angVel * dt;
+        // Floor contact on the half's own centre height. Approximate on
+        // purpose — the halves are tumbling blobs, and a real contact solve
+        // would be a rigid-body engine for two objects that exist for two
+        // seconds.
+        const float restH = mid[h] * 0.45f;
+        if (f.disp.pos[1] + mid[h] + sv.pos[1] <= restH) {
+            sv.pos[1] = restH - f.disp.pos[1] - mid[h];
+            sv.vel[0] *= 0.25f;
+            sv.vel[1] = 0.f;
+            sv.vel[2] *= 0.25f;
+            sv.angVel *= 0.25f;
+            if (std::fabs(sv.angVel) < 0.25f) {
+                sv.angVel = 0.f;
+                sv.landed = true;
+            }
+        }
+    }
+}
+
+// Rewrite this frame's pieces as two clipped halves plus the mitts, each
+// carrying its half's motion. Called AFTER updateBrushRig, so the rig stays
+// one code path and knows nothing about any of this.
+void Renderer::applySever(Fighter& f) const {
+    if (!f.bisected || f.pieces.size() < BrickSystem::kBrushPieces) return;
+    // The fourth slot is the upper half. It is appended only while a body is
+    // in two pieces, so a standing fighter still reports three and the march
+    // loop does exactly the work it always did (brick.h kBrushPieces).
+    if ((int)f.pieces.size() < BrickSystem::kPiecesPerFighter) {
+        f.pieces.push_back(f.pieces[0]);
+    }
+    AffinePiece& bot = f.pieces[0];
+    AffinePiece& top = f.pieces[BrickSystem::kPiecesPerFighter - 1];
+    top = bot; // same brush, same volume region — only the clip differs
+    bot.hi[1] = f.bisectRestY;
+    top.lo[1] = f.bisectRestY;
+
+    auto rigid = [](const Fighter::Severed& sv, float out[16]) {
+        // T(pos) * T(pivot) * R(axis, ang) * T(-pivot)
+        const float c = std::cos(sv.ang), s1 = std::sin(sv.ang), t = 1.f - c;
+        const float x = sv.axis[0], y = sv.axis[1], z = sv.axis[2];
+        float R[16] = {t * x * x + c,     t * x * y + s1 * z, t * x * z - s1 * y, 0,
+                       t * x * y - s1 * z, t * y * y + c,     t * y * z + s1 * x, 0,
+                       t * x * z + s1 * y, t * y * z - s1 * x, t * z * z + c,     0,
+                       0,                  0,                  0,                 1};
+        // column-major, matching matMul/matTransformPoint in anim.cpp
+        float pre[16], post[16], tmp[16];
+        matIdentity(pre);
+        matIdentity(post);
+        for (int k = 0; k < 3; k++) {
+            pre[12 + k] = -sv.pivot[k];
+            post[12 + k] = sv.pivot[k] + sv.pos[k];
+        }
+        matMul(R, pre, tmp);
+        matMul(post, tmp, out);
+    };
+    float M[16], composed[16];
+    rigid(f.sev[0], M);
+    matMul(M, bot.xform, composed);
+    std::memcpy(bot.xform, composed, sizeof(composed));
+    rigid(f.sev[1], M);
+    matMul(M, top.xform, composed);
+    std::memcpy(top.xform, composed, sizeof(composed));
+
+    // The mitts ride whichever half they were attached to, by their own
+    // height. A hand left hanging in the air where the body used to be is the
+    // one thing that would give the trick away.
+    for (int i = 1; i <= 2 && i < (int)f.pieces.size() - 1; i++) {
+        const float cy = (f.pieces[i].lo[1] + f.pieces[i].hi[1]) * 0.5f;
+        rigid(f.sev[cy >= f.bisectRestY ? 1 : 0], M);
+        matMul(M, f.pieces[i].xform, composed);
+        std::memcpy(f.pieces[i].xform, composed, sizeof(composed));
+    }
+}
+
 // The collapse deliberately spawns NO gobs itself. Adding the remaining mass to
 // carved+debt in the same breath leaves `carved == deposited + inFlight + debt`
 // true at that instant, and the dribble spawner in updateConservation then
@@ -2912,7 +3098,7 @@ void Renderer::collapseFighter(int i, const LookParams& look) {
         if ((int)loose_.size() >= kMaxMarbles) break;
         LooseMarble lm;
         float p[3] = {m.pos[0], m.pos[1], m.pos[2]};
-        if (!f.pieces.empty()) matTransformPoint(f.pieces[0].xform, m.pos, p);
+        if (const float* bx = bodyXformFor(f, m.pos)) matTransformPoint(bx, m.pos, p);
         std::memcpy(lm.pos, p, sizeof(lm.pos));
         std::memcpy(lm.disp, p, sizeof(lm.disp));
         lm.radius = m.radius;
@@ -2948,6 +3134,9 @@ void Renderer::respawnFighter(int i, const LookParams& look) {
     f.carved = 0.f;
     f.dead = false;
     f.bisected = false; // or it dies again on its first frame back
+    f.bisectT = 0.f;
+    f.sev[0] = Fighter::Severed{};
+    f.sev[1] = Fighter::Severed{};
     f.respawnT = 0.f;
 
     // Come back at a distance. An opponent reappears on the far side of the
@@ -3029,6 +3218,15 @@ void Renderer::updateDeaths(const LookParams& look, const FrameInfo& frame, floa
         // entirely — that is the point of it — but everything downstream is the
         // same path, so the remaining mass is conserved identically whether a
         // fighter went at 50% or at 2%.
+        // A bisected body does not sploot on the frame it was cut: it falls in
+        // two solid halves first, and only when that has played out does the
+        // ordinary collapse run. Conservation does not care about the delay —
+        // nothing has left the body yet, so the ledger just resolves later.
+        if (f.bisected && look.death.bisectFall && f.bisectT > 0.f) {
+            f.bisectT -= dt;
+            stepSevered(f, look, dt);
+            continue;
+        }
         if (f.bisected || f.carved >= fighterVolume_ * thresh) {
             collapseFighter(i, look);
         }
@@ -3480,6 +3678,9 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
                                                                  : nullptr;
             updateBrushRig(f.pieces, f.handPose, f.disp, look,
                            grip, frame.poseTime, f.glance);
+            // After the rig, never inside it: a cut body is the rig's output
+            // with a rigid motion laid over it, so the rig stays one path.
+            if (f.bisected && look.death.bisectFall) applySever(f);
         }
     }
 

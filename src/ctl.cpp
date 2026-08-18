@@ -237,6 +237,11 @@ void CtlServer::buildRegistry() {
     addF("impact.glanceDecay", &l->impact.glanceDecay);
     addB("death.bisect", &l->death.bisect);
     addF("death.bisectRadius", &l->death.bisectRadius);
+    addB("death.bisectFall", &l->death.bisectFall);
+    addF("death.bisectLinger", &l->death.bisectLinger);
+    addF("death.bisectPush", &l->death.bisectPush);
+    addF("death.bisectSpin", &l->death.bisectSpin);
+    addF("death.bisectGravity", &l->death.bisectGravity);
     addF("look.bodyColor0", l->bodyColor[0], 3);
     addF("look.bodyColor1", l->bodyColor[1], 3);
     if (refs_.ai) {
