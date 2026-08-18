@@ -20,7 +20,7 @@ struct Layout {
     float stickR, knobR, btnR, margin;
     float homeX, homeY; // idle ring centre, bottom-left
     float btnX, btnY;   // action button centre, bottom-right
-    float zoneX1, zoneY0;
+    float splitY;       // above it the finger looks, below it the finger walks
 };
 
 Layout layoutFor(float w, float h) {
@@ -34,11 +34,13 @@ Layout layoutFor(float w, float h) {
     L.homeY = h - L.margin - L.stickR;
     L.btnX = w - L.margin - L.btnR;
     L.btnY = h - L.margin - L.btnR;
-    // The stick zone is the bottom-LEFT region rather than the whole left half:
-    // drag-orbit has to survive somewhere, and the top of the screen is the
-    // part of the arena a thumb is not already sitting on.
-    L.zoneX1 = 0.52f * w;
-    L.zoneY0 = 0.42f * h;
+    // ONE horizontal split, and it is the whole layout: the bottom half is
+    // the stick (plus the swing button, tested first), the top half orbits.
+    // It used to be a bottom-LEFT quadrant with the rest of the screen left to
+    // the synthetic mouse, which meant the walk zone and the look zone
+    // overlapped along the right edge and the camera could jerk when a thumb
+    // strayed. A half is also the thing a thumb can find without looking.
+    L.splitY = 0.5f * h;
     return L;
 }
 
@@ -61,7 +63,11 @@ bool hitButton(const Layout& L, float px, float py) {
 }
 
 bool inStickZone(const Layout& L, float px, float py) {
-    return px < L.zoneX1 && py > L.zoneY0 && !overPanel(px, py);
+    return py >= L.splitY && !overPanel(px, py);
+}
+
+bool inLookZone(const Layout& L, float px, float py) {
+    return py < L.splitY && !overPanel(px, py);
 }
 
 constexpr ImU32 kInk = IM_COL32(238, 231, 216, 255); // bone, matches the film
@@ -117,6 +123,15 @@ bool TouchControls::handleEvent(const SDL_Event& ev, float winW, float winH) {
             stickY_ = py;
             return true;
         }
+        if (!lookHeld_ && inLookZone(L, px, py)) {
+            lookHeld_ = true;
+            lookFinger_ = id;
+            lookX_ = px;
+            lookY_ = py;
+            // No accumulation on the press itself: a tap must not nudge the
+            // camera, only a drag may.
+            return true;
+        }
         return false;
     }
 
@@ -124,6 +139,13 @@ bool TouchControls::handleEvent(const SDL_Event& ev, float winW, float winH) {
         if (stickHeld_ && id == stickFinger_) {
             stickX_ = px;
             stickY_ = py;
+            return true;
+        }
+        if (lookHeld_ && id == lookFinger_) {
+            lookAccumX_ += px - lookX_;
+            lookAccumY_ += py - lookY_;
+            lookX_ = px;
+            lookY_ = py;
             return true;
         }
         // Swallowed, not ignored: the swing already fired on the press, but the
@@ -142,7 +164,20 @@ bool TouchControls::handleEvent(const SDL_Event& ev, float winW, float winH) {
         btnHeld_ = false;
         return true;
     }
+    if (lookHeld_ && id == lookFinger_) {
+        lookHeld_ = false;
+        return true;
+    }
     return false;
+}
+
+bool TouchControls::takeLook(float& dx, float& dy) {
+    if (lookAccumX_ == 0.f && lookAccumY_ == 0.f) return false;
+    dx = lookAccumX_;
+    dy = lookAccumY_;
+    lookAccumX_ = 0.f;
+    lookAccumY_ = 0.f;
+    return true;
 }
 
 void TouchControls::addMovement(float camAzimuth, float& moveX, float& moveZ) const {

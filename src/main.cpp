@@ -1210,6 +1210,7 @@ int runHeadless(const RunOpts& o) {
     }
 
     OrbitCamera cam;
+    cam.distance = look.cam.distance; // params own the default framing
     if (!std::isnan(o.camAz)) cam.azimuth = o.camAz;
     if (!std::isnan(o.camEl)) cam.elevation = o.camEl;
     if (!std::isnan(o.camDist)) cam.distance = o.camDist;
@@ -1692,9 +1693,16 @@ void frameOnce(AppState& s) {
                 if (!uiWantsMouse() && !s.touch.engaged() && brush.mode == 0 &&
                     (ev.motion.state & SDL_BUTTON_LMASK)) {
                     cam.azimuth -= ev.motion.xrel * 0.005f;
-                    cam.elevation += ev.motion.yrel * 0.005f;
-                    if (cam.elevation < -0.35f) cam.elevation = -0.35f;
-                    if (cam.elevation > 1.2f) cam.elevation = 1.2f;
+                    if (look.cam.lockHeight) {
+                        // Elevation is derived, so dragging it directly would
+                        // be overwritten on the next frame and read as a dead
+                        // control. Move the thing that is actually authoritative.
+                        look.cam.height += ev.motion.yrel * 0.005f * cam.distance;
+                    } else {
+                        cam.elevation += ev.motion.yrel * 0.005f;
+                        if (cam.elevation < -0.35f) cam.elevation = -0.35f;
+                        if (cam.elevation > 1.2f) cam.elevation = 1.2f;
+                    }
                 }
                 break;
             case SDL_EVENT_MOUSE_WHEEL:
@@ -1727,6 +1735,21 @@ void frameOnce(AppState& s) {
             // there is no touch "mode" to be in and no second code path for the
             // sim to disagree with.
             s.touch.addMovement(cam.azimuth, mx, mz);
+        // Look drag from the top half of the screen. Same sensitivity and the
+        // same sign as the mouse, and the same height-vs-elevation split — the
+        // camera must not behave differently depending on which pointer moved it.
+        {
+            float ldx = 0.f, ldy = 0.f;
+            if (s.touch.takeLook(ldx, ldy)) {
+                cam.azimuth -= ldx * 0.005f;
+                if (look.cam.lockHeight) {
+                    look.cam.height += ldy * 0.005f * cam.distance;
+                } else {
+                    cam.elevation += ldy * 0.005f;
+                    cam.elevation = std::min(std::max(cam.elevation, -0.35f), 1.2f);
+                }
+            }
+        }
             game.moveX = mx;
             game.moveZ = mz;
         }
@@ -1768,6 +1791,15 @@ void frameOnce(AppState& s) {
                 cam.target.x += (game.fighter.pos[0] - cam.target.x) * k;
                 cam.target.y += (game.fighter.pos[1] + 0.45f - cam.target.y) * k;
                 cam.target.z += (game.fighter.pos[2] - cam.target.z) * k;
+            }
+            // Height is the authority, elevation the derived quantity — every
+            // frame, not just on a pose step, because `distance` can change
+            // between them (scroll wheel) and the eye must not dip when it does.
+            if (look.cam.lockHeight && cam.distance > 1e-3f) {
+                look.cam.height =
+                    std::min(std::max(look.cam.height, look.cam.minHeight),
+                             cam.distance * look.cam.maxHeightFrac);
+                cam.elevation = std::asin(look.cam.height / cam.distance);
             }
         }
         fps = fpsMeter.tick(frameDt);

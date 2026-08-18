@@ -872,6 +872,30 @@ struct DeathParams {
     float spawnRadius = 2.15f;
 };
 
+// How the chase camera frames the fight.
+//
+// The default used to be a 2.7 m orbit at a free-floating elevation, which put
+// the eye about 0.7 m off the floor — near enough eye level with a 0.69 m
+// fighter. That is a dramatic angle and a bad playing one: the far fighter
+// hides behind the near one, and it is the angle that made B3EE420's black
+// wash-out worst, because a grazing ray crosses the most floor.
+//
+// So the camera pulls back and sits UP, and its height is LOCKED rather than
+// free: elevation is derived, sin(elev) = height / distance. Zooming therefore
+// swings the eye along an arc at constant altitude instead of diving toward
+// the floor, and the framing a player set does not quietly change every time
+// they scroll.
+struct CamParams {
+    bool lockHeight = true;
+    float height = 2.6f;   // metres above cam.target (the fighter + 0.45)
+    float distance = 5.4f; // orbit radius, twice the old 2.7
+    // Vertical drag retargets the HEIGHT when locked, so looking around still
+    // does something; clamped off the floor and short of straight down, where
+    // the derived elevation would go singular.
+    float minHeight = 0.35f;
+    float maxHeightFrac = 0.95f; // of `distance`
+};
+
 // Look-dev parameters, exposed in the ImGui panel and packed into the
 // uniform buffer by the renderer. Defaults target the Trap Door "day
 // dungeon" rig: warm amber key pooling to black, faint cool rim.
@@ -987,6 +1011,7 @@ struct LookParams {
     GazeParams gaze;
     MotionParams motion;
     FocusParams focus;
+    CamParams cam;
     RigParams rig;
     // M-DEATH lives here rather than beside AiParams because the renderer is
     // what owns the carved ledger and the volumes, and LookParams is the only

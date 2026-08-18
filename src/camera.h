@@ -18,8 +18,8 @@ inline Vec3 v3norm(Vec3 a) {
 // gently down at the character, ~40 degree vertical FOV (50mm-ish).
 struct OrbitCamera {
     float azimuth = 0.30f;
-    float elevation = 0.10f;
-    float distance = 2.7f;
+    float elevation = 0.50f; // derived every frame when cam.lockHeight
+    float distance = 5.4f; // LookParams::cam.distance is the authority
     Vec3 target = {0.f, 0.50f, 0.f};
     float fovY = 0.62f;
 
