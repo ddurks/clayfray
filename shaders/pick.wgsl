@@ -49,6 +49,12 @@ struct Uniforms {
   swordB: vec4f,
   swordCol: vec4f,
   fighters: array<Fighter, MAX_FIGHTERS>,
+  // B5 foveation. Pick never READS these, but the struct is hand-mirrored
+  // (trap 2) and a shorter struct here means a smaller minBindingSize than the
+  // CPU buffer — which fails every bind group against this layout, boots
+  // clean, and renders black.
+  focus: vec4f,
+  focusMeta: vec4f,
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read_write> pickOut: array<vec4f>;

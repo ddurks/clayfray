@@ -196,14 +196,28 @@ class Renderer {
     // slots — which this is by construction.
     static constexpr int kFighterSlots =
         2 + kPieceSlots * BrickSystem::kPiecesPerFighter;
-    static constexpr int kUniformSlots =
-        kSlotFighters + kFighterSlots * kMaxPlayers;
+    // B5 foveation, APPENDED after the fighter array (trap 2: append, never
+    // insert). post.wgsl reaches these past a generated pad, so a slot added
+    // anywhere before them moves them — which is why the pad is emitted from
+    // wgslConstants() rather than hand-counted the way the spike did it.
+    static constexpr int kSlotFocus = kSlotFighters + kFighterSlots * kMaxPlayers;
+    static constexpr int kSlotFocusMeta = kSlotFocus + 1;
+    static constexpr int kUniformSlots = kSlotFocusMeta + 1;
     void packUniforms(const OrbitCamera& cam, const LookParams& look,
                       const FrameInfo& frame, float out[kUniformSlots][4]) const;
     // First slot of fighter i's block.
     static constexpr int fighterSlot(int i) {
         return kSlotFighters + i * kFighterSlots;
     }
+    // Foveation stays OFF for the debug isolation renders: normals and the
+    // |grad| heatmap are per-texel diagnostics, and a resampled periphery under
+    // a defocus blur lies to them.
+    static bool focusActive(const LookParams& look);
+    // Periphery block edge actually used this frame: 1 whenever foveation is
+    // off, so the full-res pass covers the frame on its own. packUniforms and
+    // the dispatch MUST agree, hence one accessor rather than two reads of the
+    // param — disagreeing would leave untraced texels holding the last frame.
+    static int coarseFactor(const LookParams& look);
     std::vector<MarbleProp> marbles_;
     // ---- CHARACTER-level: one copy, shared by every fighter ----
     // These come off the ASSET and are identical for all bodies: the skeleton
@@ -613,11 +627,20 @@ class Renderer {
     wgpu::Sampler sampler_;
     wgpu::Buffer uniformBuf_;
 
-    wgpu::ComputePipeline tracePipeline_, pickPipeline_;
+    // Two entry points off ONE trace module: `cs` (a ray per texel, the focus
+    // region) and `csCoarse` (a ray per NxN block, the periphery). Two
+    // pipelines because WebGPU has no push constants, so the mode cannot be a
+    // uniform written twice within a frame. Neither adds a storage binding, so
+    // trace stays at 7 of the 8 core WebGPU guarantees (trap 8).
+    wgpu::ComputePipeline tracePipeline_, traceCoarsePipeline_, pickPipeline_;
     wgpu::RenderPipeline postPipeline_, blitPipeline_;
     // group(1) is now the WHOLE store plus the ground — one bind group for
     // every fighter, where M5 needed a second group per extra body.
     wgpu::BindGroup traceBind_, traceBrickBind_, postBind_, blitBind_;
+    // A bind group is validated against the layout of the pipeline it was made
+    // from, and a layout is derived PER PIPELINE — so the coarse pass gets its
+    // own set rather than a bet on Dawn deduplicating two identical layouts.
+    wgpu::BindGroup traceCoarseBind_, traceCoarseBrickBind_;
     wgpu::BindGroup pickBind_, pickBrickBind_;
     wgpu::Buffer pickOut_, pickRead_;
     bool pickMapPending_ = false;

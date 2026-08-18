@@ -154,8 +154,19 @@ std::string Renderer::wgslConstants() {
                                    "// GENERATED from Renderer in src/renderer.h — "
                                    "do not hand-copy into a shader.\n"
                                    "const MAX_CAPSULES: u32 = %uu;\n"
-                                   "const MAX_GOBS: u32 = %uu;\n",
-                                   (uint32_t)kMaxCapsules, (uint32_t)kMaxGobs);
+                                   "const MAX_GOBS: u32 = %uu;\n"
+                                   // post.wgsl shares this one uniform buffer
+                                   // but reads only the first 13 slots and the
+                                   // focus pair at the very end, so it declares
+                                   // one pad between them. GENERATED because
+                                   // hand-counting it is trap 2 with no
+                                   // validation error to catch it: a stale pad
+                                   // still FITS the buffer and simply reads the
+                                   // wrong 32 bytes, putting the defocus
+                                   // ellipse somewhere the tracer never used.
+                                   "const FOCUS_PAD: u32 = %uu;\n",
+                                   (uint32_t)kMaxCapsules, (uint32_t)kMaxGobs,
+                                   (uint32_t)(kSlotFocus - 13));
     wgslConstantsFit(need, sizeof(buf), "Renderer");
     return buf;
 }
@@ -303,6 +314,16 @@ bool Renderer::buildPipelines() {
             tracePipeline_ = dev.CreateComputePipeline(&desc);
         }
         lap("trace");
+        // B5: the periphery. Same module, same map()/shade(), same bindings —
+        // it differs only in what it is dispatched over and how many texels
+        // one result covers.
+        desc.label = "traceCoarse";
+        desc.compute.entryPoint = "csCoarse";
+        {
+            GpuPipelineScope scope(dev, "traceCoarse");
+            traceCoarsePipeline_ = dev.CreateComputePipeline(&desc);
+        }
+        lap("traceCoarse");
     }
     {
         wgpu::ShaderModule mod = makeModule(dev, pickSrc, "pick");
@@ -352,49 +373,60 @@ bool Renderer::buildPipelines() {
         GpuPipelineScope scope(dev, "blit");
         blitPipeline_ = dev.CreateRenderPipeline(&desc);
     }
-    return tracePipeline_ && postPipeline_ && pickPipeline_;
+    return tracePipeline_ && traceCoarsePipeline_ && postPipeline_ && pickPipeline_;
 }
 
 void Renderer::buildBindGroups() {
     wgpu::Device& dev = gpu_->device;
-    {
-        wgpu::BindGroupEntry entries[2] = {};
-        entries[0].binding = 0;
-        entries[0].buffer = uniformBuf_;
-        entries[1].binding = 1;
-        entries[1].textureView = hdrView_;
-        wgpu::BindGroupDescriptor desc{};
-        desc.layout = tracePipeline_.GetBindGroupLayout(0);
-        desc.entryCount = 2;
-        desc.entries = entries;
-        traceBind_ = dev.CreateBindGroup(&desc);
-    }
-    {
-        // FOUR storage buffers for the whole scene, at ANY number of fighters.
-        // Three levels of packing get it there (CLAUDE.md trap 8: core WebGPU
-        // guarantees a stage only EIGHT, which is the limit that governs
-        // mobile):
-        //   - indirection + seeds + coarse are regions of one `volume` buffer
-        //   - the ground's base + height + colour are regions of `field`
-        //   - and every FIGHTER is a slice of the same three store buffers,
-        //     which is what this bind group being fighter-independent means.
-        // M5 bound fighter 0 here and fighter 1 in a second group, for 7 of 8
-        // and no room for a third body. This is 4 of 8 with four to spare.
-        wgpu::BindGroupEntry entries[4] = {};
-        entries[0].binding = 0;
-        entries[0].buffer = store_.volume;
-        entries[1].binding = 1;
-        entries[1].buffer = store_.distPool;
-        entries[2].binding = 2;
-        entries[2].buffer = store_.albedoPool;
-        entries[3].binding = 7;
-        entries[3].buffer = ground_.field;
-        wgpu::BindGroupDescriptor desc{};
-        desc.layout = tracePipeline_.GetBindGroupLayout(1);
-        desc.entryCount = 4;
-        desc.entries = entries;
-        traceBrickBind_ = dev.CreateBindGroup(&desc);
-    }
+    // The focus pass and the periphery pass are two entry points off one
+    // module reaching the same code, so their auto-derived layouts hold the
+    // same bindings — but a bind group is validated against the layout of the
+    // pipeline it was created from, so each gets its own pair rather than a
+    // bet on Dawn deduplicating them. Neither adds a binding (trap 8).
+    auto traceBinds = [&](const wgpu::ComputePipeline& pipe, wgpu::BindGroup& g0,
+                          wgpu::BindGroup& g1) {
+        {
+            wgpu::BindGroupEntry entries[2] = {};
+            entries[0].binding = 0;
+            entries[0].buffer = uniformBuf_;
+            entries[1].binding = 1;
+            entries[1].textureView = hdrView_;
+            wgpu::BindGroupDescriptor desc{};
+            desc.layout = pipe.GetBindGroupLayout(0);
+            desc.entryCount = 2;
+            desc.entries = entries;
+            g0 = dev.CreateBindGroup(&desc);
+        }
+        {
+            // FOUR storage buffers for the whole scene, at ANY number of
+            // fighters. Three levels of packing get it there (CLAUDE.md trap 8:
+            // core WebGPU guarantees a stage only EIGHT, which is the limit
+            // that governs mobile):
+            //   - indirection + seeds + coarse are regions of one `volume`
+            //   - the ground's base + height + colour are regions of `field`
+            //   - and every FIGHTER is a slice of the same three store buffers,
+            //     which is what this bind group being fighter-independent means.
+            // M5 bound fighter 0 here and fighter 1 in a second group, for 7 of
+            // 8 and no room for a third body. This is 4 of 8 with four to
+            // spare — and B5's second entry point spends none of them.
+            wgpu::BindGroupEntry entries[4] = {};
+            entries[0].binding = 0;
+            entries[0].buffer = store_.volume;
+            entries[1].binding = 1;
+            entries[1].buffer = store_.distPool;
+            entries[2].binding = 2;
+            entries[2].buffer = store_.albedoPool;
+            entries[3].binding = 7;
+            entries[3].buffer = ground_.field;
+            wgpu::BindGroupDescriptor desc{};
+            desc.layout = pipe.GetBindGroupLayout(1);
+            desc.entryCount = 4;
+            desc.entries = entries;
+            g1 = dev.CreateBindGroup(&desc);
+        }
+    };
+    traceBinds(tracePipeline_, traceBind_, traceBrickBind_);
+    traceBinds(traceCoarsePipeline_, traceCoarseBind_, traceCoarseBrickBind_);
     {
         wgpu::BindGroupEntry entries[2] = {};
         entries[0].binding = 0;
@@ -501,6 +533,8 @@ const char* Renderer::uniformSlotName(int s) {
     if (s == kSlotSwordA) return "swordA (hilt)";
     if (s == kSlotSwordA + 1) return "swordB (tip)";
     if (s == kSlotSwordA + 2) return "swordCol";
+    if (s == kSlotFocus) return "focus (foveation centre/size)";
+    if (s == kSlotFocusMeta) return "focusMeta (foveation)";
     // One name per fighter block, so CLAYFRAY_DEBUG_REUSE blames the body that
     // actually moved rather than a bare slot number.
     static char buf[48];
@@ -520,6 +554,10 @@ bool Renderer::digestIncludes(int s, int c) {
     if (s == 2 && c == 3) return false;      // frame.time
     if (s == 4 && c == 2) return false;      // grainFrame
     if (s == 12 && c != 3) return false;     // post2: keep only debugMode
+    // focusMeta.z is the POST defocus radius. The rest of the focus block IS
+    // traced — it decides which texels get a ray of their own — so only this
+    // one component is excused, exactly like grainFrame above.
+    if (s == kSlotFocusMeta && c == 2) return false;
     return true;
 }
 
@@ -891,6 +929,20 @@ void Renderer::bodyAffine(const FighterPose& disp, const RigParams& r,
     out[15] = 1.f;
 }
 
+bool Renderer::focusActive(const LookParams& look) {
+    // debugMode != 0 is an isolation render (normals, |grad| heatmap, flat
+    // albedo). Those are per-texel diagnostics and a block-replicated
+    // periphery under a defocus blur lies to every one of them.
+    return look.focus.enabled && look.debugMode == 0.f;
+}
+
+int Renderer::coarseFactor(const LookParams& look) {
+    if (!focusActive(look)) return 1;
+    // 16 texels is already a caricature; the clamp is here so a fat-fingered
+    // `set focus.coarse` cannot dispatch a one-thread grid over the frame.
+    return std::clamp(look.focus.coarse, 1, 16);
+}
+
 int Renderer::packAffinePieces(float out[kUniformSlots][4], int idx,
                                const std::vector<AffinePiece>& pieces,
                                const std::vector<float>& mats) const {
@@ -1250,6 +1302,81 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
         out[base + 1][1] = c[1];
         out[base + 1][2] = c[2];
     }
+
+    // B5 foveation / tilt-shift: where the sharp region sits, in TRACED texels
+    // (so nothing here has to know about resScale). Inactive leaves both slots
+    // at the memset zero, which means `focus.enabled 0` is bit-for-bit the
+    // pre-foveation renderer rather than an approximation of it, and the reuse
+    // digest sees a constant.
+    //
+    // NOT quantised to the pose grid, and that is deliberate against trap 4:
+    // the centre is a pure function of the camera and the fighters' DISPLAY
+    // roots, and all three are already traced inputs in the digest — so it can
+    // only move on a frame that was re-tracing anyway. Quantising would buy no
+    // reuse and would make the defocus boundary lag a subject that slides at
+    // 60 Hz.
+    if (focusActive(look)) {
+        const FocusParams& fp = look.focus;
+        const float th = std::tan(cam.fovY * 0.5f);
+        // world -> traced-texel coordinates, on the same basis tracePixel
+        // builds its rays from. A point behind the eye reports a miss and
+        // leaves the caller on the frame centre.
+        auto project = [&](const float w[3], float& sx, float& sy) {
+            const float v[3] = {w[0] - pos.x, w[1] - pos.y, w[2] - pos.z};
+            const float z = v[0] * fwd.x + v[1] * fwd.y + v[2] * fwd.z;
+            if (!(z > 1e-3f)) return false;
+            const float xr = (v[0] * right.x + v[1] * right.y + v[2] * right.z) /
+                             (z * th * aspect);
+            const float yu = (v[0] * up.x + v[1] * up.y + v[2] * up.z) / (z * th);
+            sx = (xr * 0.5f + 0.5f) * (float)width_;
+            sy = (0.5f - yu * 0.5f) * (float)height_;
+            return true;
+        };
+        float cx = (float)width_ * 0.5f, cy = (float)height_ * 0.5f;
+        float spanX = 0.f, spanY = 0.f;
+        // Aim at the HERO first — it is the one the player is watching, and it
+        // is the one guaranteed to exist.
+        const FighterPose& hero = fighters_[0].disp;
+        const float aimH[3] = {hero.pos[0], hero.pos[1] + fp.height, hero.pos[2]};
+        float hx = 0.f, hy = 0.f;
+        if (project(aimH, hx, hy)) {
+            cx = hx;
+            cy = hy;
+            // Both fighters sharp: centre between them and grow the core by
+            // half their separation, per axis. Duelling across the arena
+            // therefore trades the saving back for the framing, which is the
+            // right way round — that is exactly when both bodies matter.
+            if (fp.pair) {
+                for (int i = 1; i < kMaxPlayers; i++) {
+                    if (!playerAlive(i)) continue;
+                    const FighterPose& o = fighters_[i].disp;
+                    const float aimF[3] = {o.pos[0], o.pos[1] + fp.height, o.pos[2]};
+                    float ox = 0.f, oy = 0.f;
+                    if (!project(aimF, ox, oy)) continue;
+                    cx = (hx + ox) * 0.5f;
+                    cy = (hy + oy) * 0.5f;
+                    spanX = std::max(spanX, std::fabs(hx - ox) * 0.5f);
+                    spanY = std::max(spanY, std::fabs(hy - oy) * 0.5f);
+                }
+            }
+        }
+        // A fighter far off frame must not push the ellipse out to absurd
+        // coordinates; one frame of slack is plenty for the feather to reach in
+        cx = std::clamp(cx, -(float)width_, 2.f * (float)width_);
+        cy = std::clamp(cy, -(float)height_, 2.f * (float)height_);
+        // Radii are fractions of frame HEIGHT so the framing survives a resize
+        // or a resScale change. The ellipse is carried as (vertical radius,
+        // x/y aspect) because that is the metric both shaders compare against.
+        const float ry = std::max(fp.radius * (float)height_ + spanY, 1.f);
+        const float rx = std::max(fp.radius * fp.aspect * (float)height_ + spanX, 1.f);
+        out[kSlotFocus][0] = cx;
+        out[kSlotFocus][1] = cy;
+        out[kSlotFocus][2] = ry;
+        out[kSlotFocus][3] = rx / ry;
+        out[kSlotFocusMeta][0] = std::max(fp.feather * (float)height_, 0.f);
+        out[kSlotFocusMeta][1] = (float)coarseFactor(look);
+        out[kSlotFocusMeta][2] = std::max(fp.blur, 0.f); // 0 = no post defocus
+    }
     out[kSlotSceneMeta][0] = (float)live;
     // joint smin k: with disjoint brush regions the blend only bridges
     // hairline handoff cracks; ~2 voxels seals them without re-introducing
@@ -1265,9 +1392,13 @@ void Renderer::packUniforms(const OrbitCamera& cam, const LookParams& look,
     // ground field's clay top bound (0 disables the field in the tracer).
     // These slots are hand-mirrored in trace.wgsl AND pick.wgsl (trap 2);
     // this static_assert catches only the C++ side overrunning the buffer.
-    static_assert(kSlotFighters + kFighterSlots * kMaxPlayers == kUniformSlots,
-                  "fighter blocks must end exactly at kUniformSlots; keep the "
-                  "Uniforms struct in trace.wgsl + pick.wgsl in sync");
+    static_assert(kSlotFocusMeta + 1 == kUniformSlots &&
+                      kSlotFocus == kSlotFighters + kFighterSlots * kMaxPlayers,
+                  "the fighter blocks must end exactly where the focus pair "
+                  "begins, and the focus pair must end exactly at "
+                  "kUniformSlots; keep the Uniforms struct in trace.wgsl + "
+                  "pick.wgsl + post.wgsl (whose pad is FOCUS_PAD, generated "
+                  "from kSlotFocus) in sync");
     int gn = std::min((int)gobs_.size(), kMaxGobs);
     for (int i = 0; i < gn; i++) {
         const Gob& g = gobs_[i];
@@ -3629,6 +3760,20 @@ void Renderer::render(const OrbitCamera& cam, const LookParams& look,
             passDesc.timestampWrites = &tsw;
         }
         wgpu::ComputePassEncoder pass = encoder.BeginComputePass(&passDesc);
+        // B5, in the order the two passes MUST run: the periphery over the
+        // whole frame first (a ray per NxN block, block-replicated), then the
+        // focus region per texel on top. Dispatches inside one compute pass
+        // are ordered, so the second overwrites the first rather than racing
+        // it. n == 1 means foveation is off and the full-res pass owns the
+        // frame alone — the untouched pre-foveation path.
+        const int n = coarseFactor(look);
+        if (n > 1) {
+            const int cw = (width_ + n - 1) / n, ch = (height_ + n - 1) / n;
+            pass.SetPipeline(traceCoarsePipeline_);
+            pass.SetBindGroup(0, traceCoarseBind_);
+            pass.SetBindGroup(1, traceCoarseBrickBind_);
+            pass.DispatchWorkgroups((cw + 7) / 8, (ch + 7) / 8);
+        }
         pass.SetPipeline(tracePipeline_);
         pass.SetBindGroup(0, traceBind_);
         pass.SetBindGroup(1, traceBrickBind_);

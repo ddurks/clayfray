@@ -163,6 +163,17 @@ void CtlServer::buildRegistry() {
     addB("motion.stepRoot", &l->motion.stepRoot);
     // The invisible wall. 0 = no boundary, walk off into the dark.
     addF("motion.arenaRadius", &l->motion.arenaRadius);
+    // B5 foveated trace / tilt-shift. Live-tunable because it is a LOOK as
+    // much as a saving — `set focus.coarse 4` then `shot` is the whole loop,
+    // and the focus boundary is a judgement call nothing can measure for you.
+    addB("focus.enabled", &l->focus.enabled);
+    addI("focus.coarse", &l->focus.coarse);
+    addF("focus.radius", &l->focus.radius);
+    addF("focus.aspect", &l->focus.aspect);
+    addF("focus.feather", &l->focus.feather);
+    addF("focus.blur", &l->focus.blur);
+    addB("focus.pair", &l->focus.pair);
+    addF("focus.height", &l->focus.height);
     // M-PERF: affine body + two rigid mitts vs the 13-piece inverse-LBS warp.
     // CLAYFRAY_NO_AFFINE=1 pins it off for a benchmark run.
     addB("look.affineRig", &l->affineRig);

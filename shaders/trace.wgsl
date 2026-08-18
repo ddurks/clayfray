@@ -70,6 +70,13 @@ struct Uniforms {
   swordB: vec4f,         // tip xyz
   swordCol: vec4f,       // emissive rgb
   fighters: array<Fighter, MAX_FIGHTERS>,
+  // B5 foveation / tilt-shift, APPENDED (trap 2: never inserted — post.wgsl
+  // reaches these past a generated pad, so anything inserted above moves them).
+  // All in TRACED texels, so nothing here knows about resScale.
+  focus: vec4f,      // xy = core centre, z = core radius (vertical) = the
+                     // full-res boundary, w = ellipse x/y aspect
+  focusMeta: vec4f,  // x = defocus ramp width INSIDE that boundary,
+                     // y = coarse block N (1 = off), z = post defocus radius
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var hdrOut: texture_storage_2d<rgba16float, write>;
@@ -435,17 +442,27 @@ fn background(rd: vec3f) -> vec3f {
   return mix(vec3f(0.004, 0.003, 0.0025), vec3f(0.035, 0.022, 0.012), pow(glow, 3.0));
 }
 
-@compute @workgroup_size(8, 8)
-fn cs(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x >= u32(u.res.x) || gid.y >= u32(u.res.y)) {
-    return;
-  }
+// ---------- B5 foveation ----------
+// Distance from the focus centre in the ellipse's OWN metric: it equals the
+// vertical radius on the core boundary whatever the aspect, so ONE scalar
+// compares against focus.z. post.wgsl runs this same metric on the same
+// uniforms — the defocus ramp and the coarse/fine boundary must not be able to
+// drift apart, because a ramp that finished early would show the blocks.
+fn focusQ(px: vec2f) -> f32 {
+  let d = px - u.focus.xy;
+  return length(vec2f(d.x / max(u.focus.w, 1e-3), d.y));
+}
+
+// One traced pixel. `origin` is its top-left texel and `size` how many texels
+// it covers — (1,1) for the full-res pass, (N,N) for a coarse block, so the AA
+// samples spread over the WHOLE block instead of oversampling one texel of it.
+fn tracePixel(origin: vec2f, size: vec2f) -> vec3f {
   let aa = max(i32(u.res.w), 1);
   var col = vec3f(0.0);
   for (var sy = 0; sy < aa; sy++) {
     for (var sx = 0; sx < aa; sx++) {
       let off = (vec2f(f32(sx), f32(sy)) + 0.5) / f32(aa);
-      let uv = (vec2f(f32(gid.x), f32(gid.y)) + off) / u.res.xy;
+      let uv = (origin + size * off) / u.res.xy;
       let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
       let th = tan(u.camPos.w * 0.5);
       let rd = normalize(u.camFwd.xyz + ndc.x * th * u.camRight.w * u.camRight.xyz +
@@ -486,6 +503,55 @@ fn cs(@builtin(global_invocation_id) gid: vec3u) {
       col += c;
     }
   }
-  col /= f32(aa * aa);
+  return col / f32(aa * aa);
+}
+
+// Full-resolution pass, one ray per texel. With foveation on it runs ONLY
+// inside the focus ellipse and csCoarse below owns the rest; with it off
+// (focusMeta.y = 1) this is the whole frame, exactly as before — the same
+// rays, in the same order, writing the same texels. Threads outside the
+// ellipse retire on the first compare, which is why the dispatch can stay
+// whole-frame: a bounding-rect dispatch would need the C++ and the WGSL to
+// agree on the rect origin texel-for-texel, and retiring costs microseconds.
+@compute @workgroup_size(8, 8)
+fn cs(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= u32(u.res.x) || gid.y >= u32(u.res.y)) {
+    return;
+  }
+  if (u.focusMeta.y > 1.5 && focusQ(vec2f(gid.xy) + 0.5) > u.focus.z) {
+    return;
+  }
+  let col = tracePixel(vec2f(gid.xy), vec2f(1.0, 1.0));
   textureStore(hdrOut, vec2i(gid.xy), vec4f(col, 1.0));
+}
+
+// Periphery pass: ONE ray per NxN block, replicated over the texels it covers,
+// dispatched over the block grid — 1/N^2 of the rays, which is the whole
+// saving. It runs BEFORE cs in the same compute pass; dispatches within a pass
+// are ordered, so the focus pass overwrites these blocks rather than racing
+// them.
+@compute @workgroup_size(8, 8)
+fn csCoarse(@builtin(global_invocation_id) gid: vec3u) {
+  let n = max(i32(u.focusMeta.y), 1);
+  let res = vec2i(u.res.xy);
+  let o = vec2i(gid.xy) * n;
+  if (o.x >= res.x || o.y >= res.y) {
+    return;
+  }
+  let sz = min(vec2i(n, n), res - o); // edge blocks cover fewer texels
+  // Blocks cs will overwrite IN FULL are pure waste — skip them. The test is
+  // deliberately CONSERVATIVE (farthest corner, plus a texel of margin each
+  // way): a block skipped here that cs then declines to write would leave its
+  // texels holding whatever the last frame put there.
+  let far = max(abs(vec2f(o) - 0.5 - u.focus.xy),
+                abs(vec2f(o + sz) + 0.5 - u.focus.xy));
+  if (focusQ(u.focus.xy + far) <= u.focus.z) {
+    return;
+  }
+  let col = tracePixel(vec2f(o), vec2f(sz));
+  for (var dy = 0; dy < sz.y; dy++) {
+    for (var dx = 0; dx < sz.x; dx++) {
+      textureStore(hdrOut, o + vec2i(dx, dy), vec4f(col, 1.0));
+    }
+  }
 }

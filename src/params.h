@@ -540,6 +540,47 @@ struct GazeParams {
     float maxAngle = 1.5708f;  // clamp cone off the forward direction, radians
 };
 
+// B5 — foveated tracing, which IS the tilt-shift lens: one mechanism, two jobs.
+// The periphery is traced one ray per NxN block and block-replicated; an
+// ellipse tracking the fighters is re-traced per texel; post blurs the
+// periphery so the resolution drop reads as DEFOCUS (miniature photography,
+// which is the same grammar as 12 Hz stop-motion) rather than as pixels.
+//
+// It is the only lever left that attacks what AUDIT.md's B1 measured. The
+// trace kernel is register-limited to 384 threads per threadgroup against 1024
+// for almost every other kernel in the tree, i.e. occupancy-bound, so making a
+// SAMPLE cheaper cannot pay — the machine is short of resident warps, not of
+// arithmetic. This makes samples FEWER, which is orthogonal to that.
+//
+// Priced in advance off B2's measured slope, ~60 ns per traced pixel over a
+// ~1.35 ms fixed floor: a quarter-frame core at coarse=2 is ~0.44x the rays.
+// Judge it on the HEADLESS harness in motion, never on reuse %.
+struct FocusParams {
+    // OFF by default. This changes the image, so it ships dark until a human
+    // has looked at the focus boundary — CLAUDE.md is explicit that a pixel
+    // diff cannot see shape, and a resolution seam is exactly a shape.
+    bool enabled = false;
+    // Periphery block edge in texels. 1 = trace every texel, i.e. the exact
+    // pre-foveation renderer and the A/B baseline.
+    int coarse = 2;
+    // Where the full-res region ends: half-HEIGHT as a fraction of frame
+    // height. The only size here that costs rays; everything below is free.
+    float radius = 0.34f;
+    // Ellipse width/height. 1 = a circle on the subject; crank it and the core
+    // flattens into the horizontal band of a classic tilt-shift.
+    float aspect = 1.6f;
+    // Defocus ramp width, measured INWARD from `radius`. Inward on purpose:
+    // the blur is then already at full strength where the resolution drops, so
+    // the two cannot disagree, and the ramp costs no rays.
+    float feather = 0.13f;
+    // Max periphery defocus radius, in TRACED texels. Keep it >= `coarse` or
+    // the NxN blocks survive the blur and read as chunky pixels instead of as
+    // out of focus.
+    float blur = 2.6f;
+    bool pair = true;      // stretch the core so BOTH fighters stay sharp
+    float height = 0.45f;  // aim this far above a fighter's feet, metres
+};
+
 // M-PERF: the affine body's procedural motion.
 //
 // This IS the blob's shape animation — there is nothing else. The motion the
@@ -932,6 +973,7 @@ struct LookParams {
     ImpactParams impact;
     GazeParams gaze;
     MotionParams motion;
+    FocusParams focus;
     RigParams rig;
     // M-DEATH lives here rather than beside AiParams because the renderer is
     // what owns the carved ledger and the volumes, and LookParams is the only
