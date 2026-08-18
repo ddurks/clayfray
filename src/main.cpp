@@ -1693,7 +1693,9 @@ void frameOnce(AppState& s) {
                 if (!uiWantsMouse() && !s.touch.engaged() && brush.mode == 0 &&
                     (ev.motion.state & SDL_BUTTON_LMASK)) {
                     cam.azimuth -= ev.motion.xrel * 0.005f;
-                    if (look.cam.lockHeight) {
+                    if (look.cam.lockPitch) {
+                        // horizontal orbit only
+                    } else if (look.cam.lockHeight) {
                         // Elevation is derived, so dragging it directly would
                         // be overwritten on the next frame and read as a dead
                         // control. Move the thing that is actually authoritative.
@@ -1742,7 +1744,10 @@ void frameOnce(AppState& s) {
             float ldx = 0.f, ldy = 0.f;
             if (s.touch.takeLook(ldx, ldy)) {
                 cam.azimuth -= ldx * 0.005f;
-                if (look.cam.lockHeight) {
+                if (look.cam.lockPitch) {
+                    // horizontal orbit only — a thumb arcs, and letting that
+                    // through would tilt the camera every time you turned
+                } else if (look.cam.lockHeight) {
                     look.cam.height += ldy * 0.005f * cam.distance;
                 } else {
                     cam.elevation += ldy * 0.005f;

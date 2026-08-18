@@ -893,6 +893,12 @@ struct DeathParams {
 // they scroll.
 struct CamParams {
     bool lockHeight = true;
+    // Vertical drag does NOTHING. The height above the subject is a framing
+    // decision, not a per-swipe one: on a phone the look zone is the top half
+    // of the screen and a thumb arcs as it swipes, so any vertical response at
+    // all means the pitch drifts every time you turn. Orbit stays horizontal;
+    // cam.height is still the dial, it is just set rather than dragged.
+    bool lockPitch = true;
     float height = 2.6f;   // metres above cam.target (the fighter + 0.45)
     float distance = 5.4f; // orbit radius, twice the old 2.7
     // Vertical drag retargets the HEIGHT when locked, so looking around still

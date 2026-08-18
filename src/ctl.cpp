@@ -303,6 +303,7 @@ void CtlServer::buildRegistry() {
     addF("gaze.maxAngle", &l->gaze.maxAngle);
     OrbitCamera* c = refs_.cam;
     addB("cam.lockHeight", &l->cam.lockHeight);
+    addB("cam.lockPitch", &l->cam.lockPitch);
     addF("cam.height", &l->cam.height);
     addF("cam.followDist", &l->cam.distance);
     addF("cam.azimuth", &c->azimuth);
