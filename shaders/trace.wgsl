@@ -397,7 +397,14 @@ fn shade(p: vec3f, rd: vec3f, m: f32) -> vec3f {
   let ao = calcAO(p, nGeo);
   var alb = albedoFor(p, m);
   if (u.post2.w > 1.5 && m > 2.5 && m < 3.5) {
-    alb = toLinear(vec3f(0.15, 0.47, 0.53)); // debug 2: flat body albedo
+    // debug 2: flatten clay albedo so shading can be judged without the
+    // per-voxel mottle. DELIBERATELY NEUTRAL GREY. It used to be the old
+    // hardcoded body cyan, which stopped being any fighter's colour when
+    // look.bodyColor landed — so this view showed a teal body whatever the
+    // fighter actually was, and it cost a debugging session reading that as
+    // evidence the interior albedo was wrong. A flat reference has no business
+    // resembling a real body colour.
+    alb = vec3f(0.35);
   }
 
   let toKey = u.keyPos.xyz - p;

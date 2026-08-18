@@ -1996,7 +1996,8 @@ BrickEdit Renderer::queueBrickEdit(BrickEdit e) {
         std::memcpy(e.outDir, pickNormal_, sizeof(e.outDir));
         std::memcpy(e.worldPos, pickPos_, sizeof(e.worldPos));
         if (pickMat_ > 2.5f && pickMat_ < 3.5f) {
-            std::memcpy(e.srcColor, pickAlbedo_, sizeof(e.srcColor));
+            // (srcColor is stamped by queueEdit from the fighter's own clay
+            // colour; pickAlbedo_ would carry bruise stains into the gob)
         }
     } else if (e.worldPos[0] == 0.f && e.worldPos[1] == 0.f && e.worldPos[2] == 0.f) {
         // scripted edit (ctl/replay/carve-test): authored in rest space, so
@@ -2845,7 +2846,11 @@ void Renderer::collapseFighter(int i, const LookParams& look) {
         sploot_.carved += remaining;
         sploot_.debt += remaining;
 
-        const float* col = haveWound_ ? woundCol_ : sliceCol_;
+        // THIS FIGHTER'S clay, not the last wound's. It used to take
+        // woundCol_/sliceCol_, which is whatever was cut most recently
+        // ANYWHERE — so a green fighter collapsing after the blue one was hit
+        // shed 46 litres of blue.
+        const float* col = bodyColorFor(look, i);
         const float cx = f.disp.pos[0], cz = f.disp.pos[2];
 
         // 1. the burst: a few chunky gobs thrown clear
@@ -2995,6 +3000,11 @@ void Renderer::respawnFighter(int i, const LookParams& look) {
 //
 // 1 when there is nothing to be a fraction of (the analytic blob has no mesh
 // volume) and 1 for a corpse, which has no body to shove.
+const float* Renderer::bodyColorFor(const LookParams& look, int player) {
+    const int p = player < 0 ? 0 : (player > 3 ? 3 : player);
+    return look.bodyColor[p];
+}
+
 float Renderer::massFrac(int i) const {
     if (i < 0 || i >= kMaxPlayers || fighterVolume_ <= 0.f) return 1.f;
     const Fighter& f = fighters_[i];

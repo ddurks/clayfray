@@ -485,6 +485,13 @@ class Renderer {
     // body cannot be visibly whole and secretly light. 1 for the analytic blob
     // (no mesh volume, so nothing to be a fraction of) and for a dead one.
     float massFrac(int i) const;
+    // The clay a fighter is MADE OF, for anything that LEAVES it — gobs,
+    // sploots, ground splats. Same source as the volume's own albedo, so a
+    // chunk knocked off a green fighter lands green. Without this the ejected
+    // clay took BrickEdit::srcColor's fallback, which is a hardcoded cyan that
+    // predates fighters having colours at all: the bodies were recoloured and
+    // everything that came out of them stayed blue.
+    static const float* bodyColorFor(const LookParams& look, int player);
     // Consumes a one-shot "this fighter just respawned" flag.
     //
     // It exists because a respawn TELEPORTS a body, and for the hero that body

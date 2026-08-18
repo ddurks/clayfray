@@ -732,6 +732,19 @@ bool BrickSystem::editInBounds(const BrickEdit& e) const {
 void BrickSystem::queueEdit(const BrickEdit& e) {
     if (!editInBounds(e)) return;
     pending_.push_back(e);
+    // WHAT COMES OFF IS MADE OF WHAT IT CAME OFF, stamped here rather than at
+    // each call site because there are five and they kept being missed: the
+    // blade slice, the fist rupture, the ctl `edit` verb, the death collapse
+    // and the dribble all end up reading srcColor for a gob's colour, and only
+    // the mouse-pick path ever set it. Everything else took BrickEdit's
+    // fallback — a hardcoded cyan older than fighters having colours at all —
+    // so recoloured bodies still bled blue.
+    //
+    // Unconditional, and that is the point: sampling the SURFACE albedo
+    // instead (which the pick path did) picks up bruise stains, so a chunk
+    // knocked off a bruise would fly dark. A gob is body clay; a bruise is a
+    // mark on the skin.
+    std::memcpy(pending_.back().srcColor, bodyColor_, sizeof(bodyColor_));
 }
 
 void BrickSystem::pollVolumes() {
