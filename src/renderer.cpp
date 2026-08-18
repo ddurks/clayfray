@@ -1506,6 +1506,14 @@ void Renderer::applyBodyColors(const LookParams& look) {
     for (int i = 0; i < kMaxPlayers; i++) {
         fighters_[i].vol.setBodyColor(look.bodyColor[i]);
     }
+    // Until something has actually been cut, the "last wound" colours have
+    // never been written — and their initialiser is a cyan that predates
+    // fighters having colours at all. Seed them off the hero so no path can
+    // emit it, rather than trusting that none reads them early.
+    if (!haveWound_) {
+        std::memcpy(woundCol_, look.bodyColor[0], sizeof(woundCol_));
+        std::memcpy(sliceCol_, look.bodyColor[0], sizeof(sliceCol_));
+    }
 }
 
 void Renderer::setCharacter(CharacterAsset asset) {
@@ -2536,7 +2544,11 @@ void Renderer::updatePunchCut(const LookParams& look) {
                 // punch — clay knocked off the far side of the impact
                 std::memcpy(sliceExit_, wB, sizeof(sliceExit_));
                 std::memcpy(sliceNrm_, nrm, sizeof(sliceNrm_));
-                std::memcpy(sliceCol_, e.srcColor, sizeof(sliceCol_));
+                // NOT e.srcColor: queueEdit stamps the copy it keeps, so
+                // this local still holds BrickEdit's fallback and the chunk
+                // flew the wrong colour. Measured 5 of 96 gobs in carve-duel.
+                std::memcpy(sliceCol_, fighters_[clampPlayer(e.player)].vol.bodyColor(),
+                            sizeof(sliceCol_));
                 std::memcpy(sliceSweep_, travel, sizeof(sliceSweep_));
                 sliceOpen_ = true;
                 sliceCutStep_ = true;
@@ -2812,7 +2824,10 @@ void Renderer::updateBladeCut(const LookParams& look) {
     // carries for the dribble path.
     std::memcpy(sliceExit_, exitW, sizeof(sliceExit_));
     std::memcpy(sliceNrm_, lastNrm, sizeof(sliceNrm_));
-    std::memcpy(sliceCol_, e.srcColor, sizeof(sliceCol_));
+    // Same as the rupture path: the fighter's clay, not this local edit's
+    // fallback — see the note there.
+    std::memcpy(sliceCol_, fighters_[clampPlayer(e.player)].vol.bodyColor(),
+                sizeof(sliceCol_));
     // blade travel this frame, unit — `sweep` is exactly |tip - pT|
     const float invSweep = sweep > 1e-6f ? 1.f / sweep : 0.f;
     for (int k = 0; k < 3; k++) sliceSweep_[k] = (tip[k] - pT[k]) * invSweep;

@@ -416,6 +416,10 @@ class BrickSystem {
     // uniform if one exists yet. Call it BEFORE requestImport for it to reach
     // the imported skin.
     void setBodyColor(const float c[3]);
+    // The colour of THIS fighter's clay. queueEdit stamps it onto the copy it
+    // keeps, so a caller holding its own BrickEdit still sees the struct's
+    // fallback — read it from here instead of from an edit you just queued.
+    const float* bodyColor() const { return bodyColor_; }
     // Drops edits that would cross the volume boundary (a clipped blob
     // renders as corruption).
     void queueEdit(const BrickEdit& e);

@@ -370,11 +370,17 @@ struct ImpactParams {
     // smear the wound's OWN colour instead is a one-line change
     // (BrickEdit::srcColor) — it just reads as nothing on a uniformly coloured
     // body, which is what this asset is.
-    float bruise = 0.5f;       // 0..1 opacity at the impact core; 0 = off
+    // OFF. The stain read as grubby rather than as damage — a dark smudge
+    // appearing on clay that has just been hit looks like dirt, not injury,
+    // and the wound itself (the dent, the rupture, the exposed interior) is
+    // what actually sells a hit. The paint machinery stays: edit.wgsl mode 4
+    // is still there, still the cheapest edit in the tree, and both of these
+    // are ctl-live if the effect is ever wanted back.
+    float bruise = 0.f;        // 0..1 opacity at the impact core; 0 = off
     float bruiseRadius = 1.5f; // x the weapon radius
     // Linear RGB, dark and slightly warm against the body's cyan.
     float bruiseColor[3] = {0.030f, 0.012f, 0.020f};
-    float smear = 0.35f;       // 0..1 opacity of a blade's contamination trail
+    float smear = 0.f;         // 0..1 opacity of a blade's contamination trail
     float smearRadius = 1.6f;  // x the cut radius: the slot, plus its lips
 
     // ---- the glance (FISTS ONLY) ----
